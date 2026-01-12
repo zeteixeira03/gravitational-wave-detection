@@ -46,7 +46,6 @@ The dataset is perfectly balanced (50% signal, 50% noise-only), but the difficul
 │   │   └── download_data.py  # Dataset download helper
 │   ├── models/
 │   │   ├── diy_model.py      # Custom neural network implementation
-│   │   ├── cnn_model.py      # CNN-based approach
 │   │   └── base_model.py     # Base model utilities
 │   ├── model_runs.py         # Main training pipeline
 │   └── visualization.py      # Plotting utilities
