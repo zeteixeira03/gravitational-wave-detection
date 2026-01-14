@@ -428,7 +428,7 @@ def plot_all_metrics(
     ax_pr.legend(loc='lower left')
     ax_pr.grid(True, alpha=0.3)
 
-    # Confusion matrix
+    # confusion matrix
     cm = np.array([[cm_data['TN'], cm_data['FP']],
                    [cm_data['FN'], cm_data['TP']]])
     im = ax_cm.imshow(cm, cmap='Blues')
@@ -444,7 +444,7 @@ def plot_all_metrics(
             ax_cm.text(j, i, str(cm[i, j]), ha='center', va='center',
                       color='white' if cm[i, j] > cm.max()/2 else 'black', fontsize=12)
 
-    # Prediction distribution
+    # prediction distribution
     proba_noise = y_proba[y == 0]
     proba_signal = y_proba[y == 1]
     ax_dist.hist(proba_noise, bins=50, alpha=0.6, label='Noise', color='blue', density=True)

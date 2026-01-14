@@ -28,7 +28,7 @@ def download_g2net_dataset(output_dir: Path | str | None = None, unzip: bool = T
         Directory to download the dataset to.
         If None, downloads to project_root/data/g2net-gravitational-wave-detection
     unzip : bool
-        Whether to automatically unzip the downloaded files (default: True)
+        Whether to automatically unzip the downloaded files
 
     Returns
     -------
@@ -136,5 +136,5 @@ def main():
         sys.exit(1)
 
 
-if __name__ == "__main__":
-    main()
+#if __name__ == "__main__":
+    #main()
