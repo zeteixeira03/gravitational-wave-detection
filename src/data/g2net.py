@@ -9,7 +9,7 @@ import pandas as pd
 
 
 # ---------------------------------------------------------------------
-# Project / dataset discovery
+#                   project / dataset discovery
 # ---------------------------------------------------------------------
 
 def find_project_root(start: Optional[Path] = None) -> Path:
@@ -83,7 +83,7 @@ def find_dataset_dir(project_root: Optional[Path] = None) -> Path:
     legacy_path = Path(r"D:\Programming\g2net-gravitational-wave-detection")
     if legacy_path.exists():
         search_paths.append(legacy_path)
-
+    print(search_paths)
     # Find first valid path (must contain a 'train' file)
     for candidate_path in search_paths:
         if candidate_path.exists() and (candidate_path / "train").is_dir():
@@ -102,7 +102,7 @@ def find_dataset_dir(project_root: Optional[Path] = None) -> Path:
 
 
 # ---------------------------------------------------------------------
-# Labels and samples
+#                       labels and samples
 # ---------------------------------------------------------------------
 
 def load_labels(dataset_dir: Optional[Path] = None) -> pd.DataFrame:
@@ -134,7 +134,6 @@ def load_labels(dataset_dir: Optional[Path] = None) -> pd.DataFrame:
     df = pd.read_csv(labels_path, dtype={"id": str})
     return df
 
-
 def sample_path(sample_id: str, split_dir: Path) -> Path:
     """
     Build the path to a .npy sample for the G2Net dataset.
@@ -156,7 +155,6 @@ def sample_path(sample_id: str, split_dir: Path) -> Path:
         / sample_id[2]
         / f"{sample_id}.npy"
     )
-
 
 def load_sample(
     sample_id: str,
@@ -184,4 +182,3 @@ def load_sample(
         raise FileNotFoundError(f"Sample not found for id={sample_id}. Expected: {p}")
 
     return np.load(p)
-

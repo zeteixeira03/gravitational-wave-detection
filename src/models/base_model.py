@@ -14,12 +14,12 @@ from sklearn.linear_model import LogisticRegression
 # Import feature computation from the features module
 from src.data.features import compute_features
 
-# Re-export for backwards compatibility
+# re-export for backwards compatibility
 __all__ = ['LogRegBaseline', 'compute_features']
 
 
 # ---------------------------------------------------------------------
-# Logistic regression baseline
+# logistic regression baseline
 # ---------------------------------------------------------------------
 
 @dataclass

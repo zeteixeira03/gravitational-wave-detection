@@ -1,9 +1,9 @@
 """
-DIY Model Training Pipeline
+DIY 1D CNN Model Training Pipeline
 
 Complete training cycle for the DIY neural network model:
-1. Load and precompute features
-2. Initialize model with hyperparameters
+1. Load and preprocess signals (whitening)
+2. Initialize 1D CNN model with hyperparameters
 3. Train with validation split
 4. Evaluate performance
 5. Save weights and metrics
@@ -16,18 +16,17 @@ from datetime import datetime
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
-from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 import tensorflow as tf
 
-# Add project root to path
+# add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from data.g2net import find_dataset_dir, load_labels, load_sample
-from data.features import compute_features
+from data.preprocessing import preprocess_sample, load_psd
 from models.diy_model import DIYModel
 from visualization import (
     plot_learning_curves,
@@ -41,26 +40,28 @@ from visualization import (
 tf.random.set_seed(426425)
 
 # =====================================================================
-# SECTION 1: FEATURE COMPUTATION
+# SECTION 1: SIGNAL PREPROCESSING
 # =====================================================================
 
-def precompute_features(df, batch_size=1000, save_path=None):
+def precompute_signals(df, avg_psd, batch_size=1000, save_path=None):
     """
-    Precompute features for all samples in batches.
+    Precompute whitened signals for all samples in batches.
 
     Parameters
     ----------
     df : pd.DataFrame
         DataFrame with 'id' and 'target' columns
+    avg_psd : np.ndarray
+        Average PSD for whitening, shape (3, N_FREQ)
     batch_size : int
         Number of samples to process per batch
     save_path : Path, optional
-        Path to save precomputed features
+        Path to save precomputed signals
 
     Returns
     -------
     X : np.ndarray
-        Feature matrix of shape (n_samples, n_features)
+        Preprocessed signals of shape (n_samples, 3, 4096)
     y : np.ndarray
         Labels of shape (n_samples,)
     """
@@ -68,7 +69,7 @@ def precompute_features(df, batch_size=1000, save_path=None):
     targets = df["target"].values
     n_samples = len(df)
 
-    print(f"Precomputing features for {n_samples} samples...")
+    print(f"Preprocessing signals for {n_samples} samples...")
     print(f"Processing in batches of {batch_size}")
 
     X_batches = []
@@ -84,8 +85,9 @@ def precompute_features(df, batch_size=1000, save_path=None):
         for sample_id, target in zip(batch_ids, batch_targets):
             try:
                 sample = load_sample(sample_id)
-                feats = compute_features(sample)
-                X_batch.append(feats)
+                # Apply whitening and preprocessing
+                processed = preprocess_sample(sample, avg_psd)
+                X_batch.append(processed)
                 y_batch.append(target)
             except Exception as e:
                 print(f"\nError processing {sample_id}: {e}")
@@ -99,21 +101,21 @@ def precompute_features(df, batch_size=1000, save_path=None):
     X = np.vstack(X_batches).astype(np.float32)
     y = np.concatenate(y_batches).astype(np.int64)
 
-    print(f"\nFeature matrix shape: {X.shape}")
+    print(f"\nSignal matrix shape: {X.shape}")
     print(f"Target shape: {y.shape}")
     print(f"Class balance: {y.sum()} positive / {len(y)} total ({100*y.mean():.2f}%)")
 
     if save_path:
-        print(f"Saving features to: {save_path}")
+        print(f"Saving preprocessed signals to: {save_path}")
         np.savez_compressed(save_path, X=X, y=y, ids=ids[:len(y)])
-        print("Features saved.")
+        print("Signals saved.")
 
     return X, y
 
 
-def load_precomputed_features(path):
-    """Load precomputed features from disk."""
-    print(f"Loading precomputed features from: {path}")
+def load_precomputed_signals(path):
+    """Load precomputed preprocessed signals from disk."""
+    print(f"Loading preprocessed signals from: {path}")
     data = np.load(path)
     X = data['X']
     y = data['y']
@@ -127,16 +129,16 @@ def load_precomputed_features(path):
 
 def train_diy_model(X, y, hyperparameters, test_size=0.2, random_state=42):
     """
-    Train DIY model with specified hyperparameters.
+    Train DIY 1D CNN model with specified hyperparameters.
 
     Parameters
     ----------
     X : np.ndarray
-        Feature matrix
+        Preprocessed signals of shape (n_samples, 3, 4096)
     y : np.ndarray
         Labels
     hyperparameters : dict
-        Model hyperparameters (input_dim, hidden_dim, learning_rate, epochs)
+        Model hyperparameters (n_samples, learning_rate, epochs, etc.)
     test_size : float
         Validation split ratio
     random_state : int
@@ -148,21 +150,17 @@ def train_diy_model(X, y, hyperparameters, test_size=0.2, random_state=42):
         Training results including model, metrics, and split data
     """
     print("\n" + "="*60)
-    print("INITIALIZING MODEL")
+    print("INITIALIZING 1D CNN MODEL")
     print("="*60)
 
     # Extract hyperparameters
-    input_dim = hyperparameters.get('input_dim', 30)
-    hidden_dim = hyperparameters.get('hidden_dim', 64)
-    hidden_dim2 = hyperparameters.get('hidden_dim2', 32)
+    n_samples = hyperparameters.get('n_samples', 4096)
     learning_rate = hyperparameters.get('learning_rate', 0.001)
     dropout_rate = hyperparameters.get('dropout_rate', 0.3)
-    epochs = hyperparameters.get('epochs', 100)
-    batch_size = hyperparameters.get('batch_size', 256)
+    epochs = hyperparameters.get('epochs', 50)
+    batch_size = hyperparameters.get('batch_size', 32)
 
-    print(f"Input dimension: {input_dim}")
-    print(f"Hidden layer 1: {hidden_dim}")
-    print(f"Hidden layer 2: {hidden_dim2}")
+    print(f"Signal length: {n_samples}")
     print(f"Learning rate: {learning_rate}")
     print(f"Dropout rate: {dropout_rate}")
     print(f"Epochs: {epochs}")
@@ -180,24 +178,17 @@ def train_diy_model(X, y, hyperparameters, test_size=0.2, random_state=42):
     print(f"Train set: {X_train.shape[0]} samples ({y_train.sum()} positive, {100*y_train.mean():.2f}%)")
     print(f"Val set: {X_val.shape[0]} samples ({y_val.sum()} positive, {100*y_val.mean():.2f}%)")
 
-    # Standardize features (fit on train, transform both)
+    # Signal statistics (already normalized by preprocessing)
     print("\n" + "="*60)
-    print("STANDARDIZING FEATURES")
+    print("SIGNAL STATISTICS")
     print("="*60)
 
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_val = scaler.transform(X_val)
+    print(f"Train signals: mean={X_train.mean():.4f}, std={X_train.std():.4f}")
+    print(f"Val signals:   mean={X_val.mean():.4f}, std={X_val.std():.4f}")
 
-    print(f"Scaler fitted on training data")
-    print(f"Train features: mean={X_train.mean():.4f}, std={X_train.std():.4f}")
-    print(f"Val features:   mean={X_val.mean():.4f}, std={X_val.std():.4f}")
-
-    # Initialize model
+    # Initialize 1D CNN model
     model = DIYModel(
-        input_dim=input_dim,
-        hidden_dim=hidden_dim,
-        hidden_dim2=hidden_dim2,
+        n_samples=n_samples,
         learning_rate=learning_rate,
         dropout_rate=dropout_rate
     )
@@ -250,7 +241,6 @@ def train_diy_model(X, y, hyperparameters, test_size=0.2, random_state=42):
 
     return {
         'model': model,
-        'scaler': scaler,
         'history': history,
         'X_train': X_train,
         'X_val': X_val,
@@ -306,15 +296,6 @@ def save_model_and_metrics(results, hyperparameters, save_dir):
     results['model'].save_weights(str(weights_path))
     print(f"Weights saved to: {weights_path}")
 
-    # Save scaler parameters
-    scaler_path = save_dir / f"{base_name}_scaler.npz"
-    np.savez(
-        scaler_path,
-        mean=results['scaler'].mean_,
-        scale=results['scaler'].scale_
-    )
-    print(f"Scaler saved to: {scaler_path}")
-
     # Save hyperparameters
     config_path = save_dir / f"{base_name}_config.json"
     with open(config_path, 'w') as f:
@@ -338,7 +319,6 @@ def save_model_and_metrics(results, hyperparameters, save_dir):
 
     return {
         'weights': weights_path,
-        'scaler': scaler_path,
         'config': config_path,
         'metrics': metrics_path,
         'base_name': base_name
@@ -432,21 +412,19 @@ def generate_plots(results, save_dir, base_name):
 def main():
     """
     Main execution flow:
-    1. Load/precompute features
-    2. Initialize and train DIY model
+    1. Load PSD and preprocess signals (whitening)
+    2. Initialize and train DIY 1D CNN model
     3. Evaluate performance and save weights/metrics
     4. Generate and save performance plots
     """
 
     # ========== HYPERPARAMETERS ==========
     HYPERPARAMETERS = {
-        'input_dim': 39,         
-        'hidden_dim': 64,        
-        'hidden_dim2': 32,       
-        'learning_rate': 0.001,  
-        'dropout_rate': 0.3,     
-        'epochs': 100,           
-        'batch_size': 256,       
+        'n_samples': 4096,       # Signal length (2s at 2048Hz)
+        'learning_rate': 0.001,  # Learning rate for Adam
+        'dropout_rate': 0.3,     # Dropout rate
+        'epochs': 50,            # Training epochs
+        'batch_size': 32,        # Smaller batch size for CNN
     }
 
     # ========== SETUP PATHS ==========
@@ -457,30 +435,46 @@ def main():
     dataset_dir = find_dataset_dir()
     print(f"Dataset directory: {dataset_dir}")
 
-    features_path = dataset_dir / "features_full.npz"
+    psd_path = dataset_dir / "avg_psd.npz"
+    signals_path = dataset_dir / "signals_whitened.npz"
     models_dir = PROJECT_ROOT / "models" / "saved"
 
     print(f"Models directory: {models_dir}")
 
-    # ========== STAGE 1: PRECOMPUTE FEATURES ==========
-    if not features_path.exists():
+    # ========== LOAD PSD ==========
+    print("\n" + "="*60)
+    print("LOADING AVERAGE PSD")
+    print("="*60 + "\n")
+
+    if not psd_path.exists():
+        raise FileNotFoundError(
+            f"Average PSD not found at {psd_path}. "
+            "Please run 'python src/data/compute_psd.py' first."
+        )
+
+    avg_psd = load_psd(psd_path)
+    print(f"Loaded PSD shape: {avg_psd.shape}")
+
+    # ========== STAGE 1: PREPROCESS SIGNALS ==========
+    if not signals_path.exists():
         print("\n" + "="*60)
-        print("STAGE 1: PRECOMPUTING FEATURES")
+        print("STAGE 1: PREPROCESSING SIGNALS (WHITENING)")
         print("="*60 + "\n")
 
         df = load_labels(dataset_dir)
         print(f"Total samples: {len(df)}")
 
-        X, y = precompute_features(
+        X, y = precompute_signals(
             df,
+            avg_psd,
             batch_size=1000,
-            save_path=features_path
+            save_path=signals_path
         )
     else:
         print("\n" + "="*60)
-        print("STAGE 1: LOADING PRECOMPUTED FEATURES")
+        print("STAGE 1: LOADING PREPROCESSED SIGNALS")
         print("="*60 + "\n")
-        X, y = load_precomputed_features(features_path)
+        X, y = load_precomputed_signals(signals_path)
 
     # ========== STAGE 2: TRAIN MODEL ==========
     print("\n" + "="*60)
@@ -529,13 +523,12 @@ def main():
     print(f"  Specificity: {results['val_metrics']['specificity']:.4f}")
     print(f"\nFiles saved:")
     print(f"  Weights: {saved_paths['weights'].name}")
-    print(f"  Scaler:  {saved_paths['scaler'].name}")
     print(f"  Config:  {saved_paths['config'].name}")
     print(f"  Metrics: {saved_paths['metrics'].name}")
     print(f"\nPlots saved:")
     for name, path in saved_plots.items():
         print(f"  {name}: {path.name}")
-    print(f"\nFeatures cached at: {features_path}")
+    print(f"\nPreprocessed signals cached at: {signals_path}")
 
 
 if __name__ == "__main__":
