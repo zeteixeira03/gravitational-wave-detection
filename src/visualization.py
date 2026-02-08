@@ -102,6 +102,7 @@ def plot_learning_curves(
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
 
     return fig
 
@@ -149,6 +150,7 @@ def plot_roc_curve(
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
 
     return fig
 
@@ -202,6 +204,7 @@ def plot_precision_recall_curve(
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
 
     return fig
 
@@ -277,6 +280,7 @@ def plot_confusion_matrix(
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
 
     return fig
 
@@ -333,6 +337,7 @@ def plot_prediction_distribution(
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
 
     return fig
 
@@ -468,5 +473,6 @@ def plot_all_metrics(
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
 
     return fig

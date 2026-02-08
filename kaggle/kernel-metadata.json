@@ -1,0 +1,10 @@
+{
+  "id": "zeteixeira/gw-training",
+  "title": "GW Training",
+  "code_file": "train.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "dataset_sources": ["zeteixeira/gw-src-code", "zeteixeira/g2net-preprocessed-tfrecords"]
+}
