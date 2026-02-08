@@ -7,7 +7,7 @@ For the physics of gravitational wave detection and how the neural network works
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt 
 ```
 
 Requires Python 3.8+.
@@ -57,8 +57,7 @@ For data exploration, see the notebooks in `notebooks/`.
 │   └── visualization.py          # Plotting utilities
 ├── notebooks/
 │   ├── 01_data_exploration.ipynb
-│   ├── 02_baseline_model.ipynb
-│   └── 03_model_explorer.ipynb
+│   ├── 02_model_explorer.ipynb
 ├── models/saved/                  # Trained model weights
 └── requirements.txt
 ```
