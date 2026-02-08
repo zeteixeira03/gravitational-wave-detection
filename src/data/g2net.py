@@ -9,6 +9,26 @@ import pandas as pd
 
 
 # ---------------------------------------------------------------------
+#                        environment detection
+# ---------------------------------------------------------------------
+
+def is_kaggle() -> bool:
+    """Check if running in Kaggle environment."""
+    return Path("/kaggle").exists()
+
+
+def get_output_dir() -> Path:
+    """
+    Get the appropriate output directory for the current environment.
+
+    Returns /kaggle/working on Kaggle, or project_root locally.
+    """
+    if is_kaggle():
+        return Path("/kaggle/working")
+    return find_project_root()
+
+
+# ---------------------------------------------------------------------
 #                   project / dataset discovery
 # ---------------------------------------------------------------------
 
@@ -65,31 +85,30 @@ def find_dataset_dir(project_root: Optional[Path] = None) -> Path:
     if project_root is None:
         project_root = find_project_root()
 
-    # Search order for dataset directory
+    # search order for dataset directory
     search_paths = []
 
-    # 1. Environment variable (highest priority)
+    # 1. Kaggle input directory - no need to keep the dataset locally
+    if is_kaggle():
+        search_paths.append(Path("/kaggle/input/g2net-gravitational-wave-detection"))
+
+    # 2. Environment variable - for custom use
     env_path = os.getenv("G2NET_DATASET_PATH")
     if env_path:
         search_paths.append(Path(env_path))
 
-    # 2. Project data directory
+    # 3. External drive (local development)
+    search_paths.append(Path("D:/Programming/g2net-gravitational-wave-detection"))
+
+    # 4. Project data directory - if you're a madman and want to keep the dataset in your machine
     search_paths.append(project_root / "data" / "g2net-gravitational-wave-detection")
 
-    # 3. Current directory
-    search_paths.append(Path.cwd() / "g2net-gravitational-wave-detection")
-
-    # 4. Legacy hardcoded path
-    legacy_path = Path(r"D:\Programming\g2net-gravitational-wave-detection")
-    if legacy_path.exists():
-        search_paths.append(legacy_path)
-    print(search_paths)
     # Find first valid path (must contain a 'train' file)
     for candidate_path in search_paths:
         if candidate_path.exists() and (candidate_path / "train").is_dir():
             return candidate_path
 
-    # If no valid path found, provide helpful error message
+    # If no valid path found,
     error_msg = (
         "G2Net dataset directory not found. Tried the following locations:\n" +
         "\n".join(f"  - {p}" for p in search_paths) +
@@ -138,10 +157,9 @@ def sample_path(sample_id: str, split_dir: Path) -> Path:
     """
     Build the path to a .npy sample for the G2Net dataset.
 
-    Expected layout (always):
-        split/<id[0]>/<id[1]>/<id[2]>/<id>.npy
+    Layout:split/<id[0]>/<id[1]>/<id[2]>/<id>.npy
     """
-    sample_id = str(sample_id).strip()
+    sample_id = str(sample_id).strip()      # just in case
 
     if len(sample_id) < 3:
         raise ValueError(
@@ -156,11 +174,7 @@ def sample_path(sample_id: str, split_dir: Path) -> Path:
         / f"{sample_id}.npy"
     )
 
-def load_sample(
-    sample_id: str,
-    split: str = "train",
-    dataset_dir: Optional[Path] = None,
-) -> np.ndarray:
+def load_sample(sample_id: str, split: str = "train", dataset_dir: Optional[Path] = None) -> np.ndarray:
     """
     Load a waveform sample from the G2Net dataset.
     """

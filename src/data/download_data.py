@@ -1,6 +1,10 @@
 """
 Download G2Net dataset from Kaggle.
 
+NOTE: This script is for LOCAL use only. On Kaggle, the dataset is
+pre-loaded at /kaggle/input/g2net-gravitational-wave-detection/ and
+this script is not needed.
+
 Requires kaggle API credentials configured (~/.kaggle/kaggle.json on Unix,
 or %USERPROFILE%\.kaggle\kaggle.json on Windows).
 
@@ -12,7 +16,6 @@ To set up Kaggle API:
 """
 
 from __future__ import annotations
-import os
 import sys
 from pathlib import Path
 import zipfile
@@ -136,5 +139,5 @@ def main():
         sys.exit(1)
 
 
-#if __name__ == "__main__":
-    #main()
+if __name__ == "__main__":
+    main()

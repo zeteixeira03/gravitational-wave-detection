@@ -21,7 +21,7 @@ class DIYModel:
     - Shared 1D conv layers process each detector independently
     - Features concatenated and passed through dense classifier
     - Loss: Binary Cross-Entropy
-    - Optimizer: Adam
+    - Optimizer: AdamW
 
     Input shape: (batch_size, 3, 4096) - 3 detectors, 4096 time samples
     """
@@ -30,7 +30,8 @@ class DIYModel:
         self,
         n_samples: int = 4096,
         learning_rate: float = 0.001,
-        dropout_rate: float = 0.3
+        dropout_rate: float = 0.3,
+        weight_decay: float = 1e-4
     ):
         """
         Initialize the DIY 1D CNN model.
@@ -43,12 +44,18 @@ class DIYModel:
             Learning rate for Adam optimizer.
         dropout_rate : float
             Dropout rate for regularization.
+        weight_decay : float
+            L2 regularization strength for AdamW optimizer.
         """
         self.n_samples = n_samples
         self.learning_rate = learning_rate
         self.dropout_rate = dropout_rate
+        self.weight_decay = weight_decay
 
-        # Conv layer parameters: (filters, kernel_size, pool_size)
+        # convolutional layer parameters: (no. filters, kernel_size, pool_size)
+        # no.filters: how many convolutional blocks are in this particular layer
+        # kernel_size: how many different values does each block have
+        # pool_size: time dimension is shrunk by this factor, picking up the most active weight in each iteration
         self.conv_config = [
             (32, 64, 4),   # large kernel to capture low-freq patterns
             (64, 32, 4),
@@ -56,11 +63,11 @@ class DIYModel:
             (256, 8, 4),
         ]
 
-        # Initialize convolutional layers (shared across detectors)
+        # initialize convolutional layers
         self.conv_layers = []
         self.bn_layers = []
         for i, (filters, kernel_size, _) in enumerate(self.conv_config):
-            # Conv1D weights: (kernel_size, in_channels, out_channels)
+            # Conv1D weights: (kernel_size, in_channels, out_channels) - randomly assign
             in_ch = 1 if i == 0 else self.conv_config[i-1][0]
             W = tf.Variable(
                 tf.random.normal([kernel_size, in_ch, filters], stddev=np.sqrt(2.0 / (kernel_size * in_ch))),
@@ -87,7 +94,7 @@ class DIYModel:
             tf.Variable(tf.zeros([256]), name='fc1_bn_beta'),
             tf.Variable(tf.zeros([256]), trainable=False, name='fc1_bn_mean'),
             tf.Variable(tf.ones([256]), trainable=False, name='fc1_bn_var')
-        )
+        ) #output size: (batch, 256)
 
         self.fc2_W = tf.Variable(tf.random.normal([256, 64], stddev=np.sqrt(2.0 / 256)), name='fc2_W')
         self.fc2_b = tf.Variable(tf.zeros([64]), name='fc2_b')
@@ -96,12 +103,12 @@ class DIYModel:
             tf.Variable(tf.zeros([64]), name='fc2_bn_beta'),
             tf.Variable(tf.zeros([64]), trainable=False, name='fc2_bn_mean'),
             tf.Variable(tf.ones([64]), trainable=False, name='fc2_bn_var')
-        )
+        ) # output size: (batch, 64)
 
         self.out_W = tf.Variable(tf.random.normal([64, 1], stddev=np.sqrt(2.0 / 64)), name='out_W')
-        self.out_b = tf.Variable(tf.zeros([1]), name='out_b')
+        self.out_b = tf.Variable(tf.zeros([1]), name='out_b') # output size: (batch, 1)
 
-        # Collect all trainable variables
+        # collect all trainable variables
         self.variables = []
         for W, b in self.conv_layers:
             self.variables.extend([W, b])
@@ -112,8 +119,8 @@ class DIYModel:
         self.variables.extend([self.fc2_W, self.fc2_b, self.fc2_bn[0], self.fc2_bn[1]])
         self.variables.extend([self.out_W, self.out_b])
 
-        # Adam optimizer state
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        # AdamW optimizer state
+        self.optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=weight_decay)
 
     def _batch_norm(self, x, bn_params, training):
         """Apply batch normalization."""
@@ -140,7 +147,7 @@ class DIYModel:
         x = tf.nn.conv1d(x, W, stride=1, padding='SAME') + b
         # BatchNorm
         x = self._batch_norm(x, self.bn_layers[layer_idx], training)
-        # SiLU activation (swish)
+        # SiLU
         x = x * tf.nn.sigmoid(x)
         # MaxPool
         x = tf.nn.max_pool1d(x, ksize=pool_size, strides=pool_size, padding='SAME')
@@ -150,15 +157,14 @@ class DIYModel:
         """Generalized Mean Pooling."""
         p = tf.clip_by_value(self.gem_p, 1.0, 10.0)
         eps = 1e-6
-        x = tf.clip_by_value(x, eps, tf.float32.max)
+        x = tf.clip_by_value(x, eps, 1e10)
         x_pow = tf.pow(x, p)
         mean_pow = tf.reduce_mean(x_pow, axis=1)
         return tf.pow(mean_pow, 1.0 / p)
 
     def _process_detector(self, x, training):
         """Process a single detector through conv layers."""
-        # x shape: (batch, time_steps)
-        # Add channel dimension: (batch, time, 1)
+        # x shape: (batch, time_steps), but must be (batch, time, 1) for tf
         x = tf.expand_dims(x, axis=-1)
 
         # Apply conv blocks
@@ -185,22 +191,22 @@ class DIYModel:
         tf.Tensor
             Output predictions of shape (batch_size, 1) with sigmoid applied.
         """
-        # Split detectors: X shape is (batch, 3, 4096)
+        # split detectors: X shape is (batch, 3, 4096)
         h1 = X[:, 0, :]  # (batch, 4096)
         l1 = X[:, 1, :]
         v1 = X[:, 2, :]
 
-        # Process each detector through shared conv layers
+        # process each detector through shared conv layers
         h1_feat = self._process_detector(h1, training)  # (batch, 256)
         l1_feat = self._process_detector(l1, training)
         v1_feat = self._process_detector(v1, training)
 
-        # Concatenate features from all detectors
+        # concatenate features from all detectors
         combined = tf.concat([h1_feat, l1_feat, v1_feat], axis=-1)  # (batch, 768)
 
         # Classifier head
         # FC1
-        x = tf.matmul(combined, self.fc1_W) + self.fc1_b
+        x = tf.matmul(combined, self.fc1_W) + self.fc1_b        # matrix multiplication reduces time dimension (3x256) -> 256
         x = self._batch_norm(tf.expand_dims(x, 1), self.fc1_bn, training)
         x = tf.squeeze(x, 1)
         x = x * tf.nn.sigmoid(x)  # SiLU
@@ -208,7 +214,7 @@ class DIYModel:
             x = tf.nn.dropout(x, rate=self.dropout_rate)
 
         # FC2
-        x = tf.matmul(x, self.fc2_W) + self.fc2_b
+        x = tf.matmul(x, self.fc2_W) + self.fc2_b               # matrix multiplication reduces time dimension 256 -> 64
         x = self._batch_norm(tf.expand_dims(x, 1), self.fc2_bn, training)
         x = tf.squeeze(x, 1)
         x = x * tf.nn.sigmoid(x)  # SiLU
@@ -216,7 +222,7 @@ class DIYModel:
             x = tf.nn.dropout(x, rate=self.dropout_rate)
 
         # Output
-        x = tf.matmul(x, self.out_W) + self.out_b
+        x = tf.matmul(x, self.out_W) + self.out_b               # matrix multiplication reduces time dimension 64 -> 1
         predictions = tf.nn.sigmoid(x)
 
         return predictions
@@ -264,7 +270,7 @@ class DIYModel:
             predictions = self.forward(x, training=True)
             loss = self.compute_loss(y, predictions)
 
-        # Adam optimizer update
+        # AdamW optimizer update
         gradients = tape.gradient(loss, self.variables)
         self.optimizer.apply_gradients(zip(gradients, self.variables))
 
@@ -322,7 +328,7 @@ class DIYModel:
             history['val_spec'] = []
 
         for epoch in range(epochs):
-            # shuffle training data at start of each epoch
+            # shuffle training data at start of each epoc
             indices = np.random.permutation(n_samples)
             X_shuffled = X_train[indices]
             y_shuffled = y_train[indices]
@@ -343,7 +349,7 @@ class DIYModel:
             train_loss = np.mean(epoch_losses)
             history['train_loss'].append(train_loss)
 
-            # get metrics, log (evaluate expects numpy arrays)
+            # get metrics, log
             train_metrics = self.evaluate(X_train, y_train)
 
             history['train_acc'].append(train_metrics['accuracy'])
@@ -351,14 +357,13 @@ class DIYModel:
             history['train_recall'].append(train_metrics['recall'])
             history['train_spec'].append(train_metrics['specificity'])
 
-            # if we're doing validation
             if has_validation:
                 # forward step, don't train, log loss
                 val_pred = self.forward(X_val_tf)
                 val_loss = self.compute_loss(y_val_tf, val_pred).numpy()
                 history['val_loss'].append(val_loss)
 
-                # get metrics, log (evaluate expects numpy arrays)
+                # get metrics, log
                 val_metrics = self.evaluate(X_val, y_val)
 
                 history['val_acc'].append(val_metrics['accuracy'])
@@ -383,28 +388,43 @@ class DIYModel:
 
         return history
 
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def predict_proba(self, X: np.ndarray, batch_size: int = 256) -> np.ndarray:
         """
         Predict probabilities for input samples.
 
         Parameters
         ----------
         X : np.ndarray
-            Input features of shape (n_samples, n_features).
+            Input features of shape (n_samples, 3, n_time_samples).
+        batch_size : int
+            Batch size for inference to avoid OOM on large inputs.
 
         Returns
         -------
         np.ndarray
             Predicted probabilities of shape (n_samples,).
         """
-        X_tf = tf.convert_to_tensor(X, dtype=tf.float32)
-        predictions = self.forward(X_tf)
-        
-        return predictions.numpy().flatten()
+        n_samples = X.shape[0]
+
+        # small input: process all at once
+        if n_samples <= batch_size:
+            X_tf = tf.convert_to_tensor(X, dtype=tf.float32)
+            predictions = self.forward(X_tf)
+            return predictions.numpy().flatten()
+
+        # large input: process in batches
+        all_predictions = []
+        for start_idx in range(0, n_samples, batch_size):
+            end_idx = min(start_idx + batch_size, n_samples)
+            X_batch = tf.convert_to_tensor(X[start_idx:end_idx], dtype=tf.float32)
+            batch_pred = self.forward(X_batch)
+            all_predictions.append(batch_pred.numpy())
+
+        return np.concatenate(all_predictions, axis=0).flatten()
 
     def predict(self, X: np.ndarray, threshold: float = 0.5) -> np.ndarray:
         """
-        Predict binary labels for input samples.
+        Predict binary labels for input samples. 1 = BH merger, 0 = not
 
         Parameters
         ----------
@@ -420,7 +440,7 @@ class DIYModel:
         """
         probas = self.predict_proba(X)
 
-        return (probas >= threshold).astype(int)  # convert to bool
+        return (probas >= threshold).astype(int)
 
     def _compute_confusion_values(self, y_pred: np.ndarray, y_true: np.ndarray) -> dict:
         """
@@ -568,14 +588,9 @@ class DIYModel:
         sorted_indices = np.argsort(fpr_arr)
         fpr_sorted = fpr_arr[sorted_indices]
         tpr_sorted = tpr_arr[sorted_indices]
-        auc = np.trapz(tpr_sorted, fpr_sorted)
+        auc = np.trapezoid(tpr_sorted, fpr_sorted)
 
-        return {
-            'fpr': fpr_arr,
-            'tpr': tpr_arr,
-            'thresholds': thresholds,
-            'auc': float(auc)
-        }
+        return {'fpr': fpr_arr, 'tpr': tpr_arr, 'thresholds': thresholds, 'auc': float(auc)}
 
     def precision_recall_curve(self, X: np.ndarray, y: np.ndarray, n_thresholds: int = 100) -> dict:
         """
@@ -622,14 +637,9 @@ class DIYModel:
         sorted_indices = np.argsort(recall_arr)
         recall_sorted = recall_arr[sorted_indices]
         precision_sorted = precision_arr[sorted_indices]
-        ap = np.trapz(precision_sorted, recall_sorted)
+        ap = np.trapezoid(precision_sorted, recall_sorted)
 
-        return {
-            'precision': precision_arr,
-            'recall': recall_arr,
-            'thresholds': thresholds,
-            'ap': float(ap)
-        }
+        return {'precision': precision_arr, 'recall': recall_arr, 'thresholds': thresholds, 'ap': float(ap)}
 
     def save_weights(self, filepath: str) -> None:
         """

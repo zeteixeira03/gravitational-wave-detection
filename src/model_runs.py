@@ -1,12 +1,12 @@
 """
-DIY 1D CNN Model Training Pipeline
+1D CNN Model Training Pipeline
 
-Complete training cycle for the DIY neural network model:
-1. Load and preprocess signals (whitening)
-2. Initialize 1D CNN model with hyperparameters
-3. Train with validation split
-4. Evaluate performance
-5. Save weights and metrics
+Training cycle using preprocessed TFRecords:
+1. Load TFRecords (preprocessed signals, must run compute_psd.py and create_tfrecords before - in this order)
+2. Initialize 1D CNN model
+3. Train with early stopping and LR scheduling
+4. Evaluate and save metrics
+5. Generate evaluation plots
 """
 import sys
 import json
@@ -14,7 +14,6 @@ from pathlib import Path
 from datetime import datetime
 
 import numpy as np
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 import tensorflow as tf
@@ -25,8 +24,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from data.g2net import find_dataset_dir, load_labels, load_sample
-from data.preprocessing import preprocess_sample, load_psd
+from data.g2net import is_kaggle, get_output_dir
 from models.diy_model import DIYModel
 from visualization import (
     plot_learning_curves,
@@ -40,231 +38,185 @@ from visualization import (
 tf.random.set_seed(426425)
 
 # =====================================================================
-# SECTION 1: SIGNAL PREPROCESSING
+# SECTION 1: TRAINING LOOP
 # =====================================================================
 
-def precompute_signals(df, avg_psd, batch_size=1000, save_path=None):
+def fit(
+    model,
+    train_dataset,
+    val_dataset,
+    n_train,
+    n_val,
+    epochs,
+    batch_size,
+    verbose=True,
+    early_stopping_patience=5,
+    lr_reduce_patience=3,
+    lr_reduce_factor=0.5,
+    min_lr=1e-6
+):
     """
-    Precompute whitened signals for all samples in batches.
+    Train model using tf.data.Dataset generators.
 
     Parameters
     ----------
-    df : pd.DataFrame
-        DataFrame with 'id' and 'target' columns
-    avg_psd : np.ndarray
-        Average PSD for whitening, shape (3, N_FREQ)
+    model : DIYModel
+        Model to train
+    train_dataset : tf.data.Dataset
+        Training dataset (streaming)
+    val_dataset : tf.data.Dataset
+        Validation dataset (streaming)
+    n_train : int
+        Number of training samples
+    n_val : int
+        Number of validation samples
+    epochs : int
+        Number of training epochs
     batch_size : int
-        Number of samples to process per batch
-    save_path : Path, optional
-        Path to save precomputed signals
-
-    Returns
-    -------
-    X : np.ndarray
-        Preprocessed signals of shape (n_samples, 3, 4096)
-    y : np.ndarray
-        Labels of shape (n_samples,)
-    """
-    ids = df["id"].astype(str).values
-    targets = df["target"].values
-    n_samples = len(df)
-
-    print(f"Preprocessing signals for {n_samples} samples...")
-    print(f"Processing in batches of {batch_size}")
-
-    X_batches = []
-    y_batches = []
-
-    for i in tqdm(range(0, n_samples, batch_size), desc="Batches"):
-        batch_ids = ids[i:i+batch_size]
-        batch_targets = targets[i:i+batch_size]
-
-        X_batch = []
-        y_batch = []
-
-        for sample_id, target in zip(batch_ids, batch_targets):
-            try:
-                sample = load_sample(sample_id)
-                # Apply whitening and preprocessing
-                processed = preprocess_sample(sample, avg_psd)
-                X_batch.append(processed)
-                y_batch.append(target)
-            except Exception as e:
-                print(f"\nError processing {sample_id}: {e}")
-                continue
-
-        if X_batch:
-            X_batches.append(np.stack(X_batch, axis=0))
-            y_batches.append(np.array(y_batch))
-
-    # Concatenate all batches
-    X = np.vstack(X_batches).astype(np.float32)
-    y = np.concatenate(y_batches).astype(np.int64)
-
-    print(f"\nSignal matrix shape: {X.shape}")
-    print(f"Target shape: {y.shape}")
-    print(f"Class balance: {y.sum()} positive / {len(y)} total ({100*y.mean():.2f}%)")
-
-    if save_path:
-        print(f"Saving preprocessed signals to: {save_path}")
-        np.savez_compressed(save_path, X=X, y=y, ids=ids[:len(y)])
-        print("Signals saved.")
-
-    return X, y
-
-
-def load_precomputed_signals(path):
-    """Load precomputed preprocessed signals from disk."""
-    print(f"Loading preprocessed signals from: {path}")
-    data = np.load(path)
-    X = data['X']
-    y = data['y']
-    print(f"Loaded X: {X.shape}, y: {y.shape}")
-    return X, y
-
-
-# =====================================================================
-# SECTION 2: MODEL TRAINING
-# =====================================================================
-
-def train_diy_model(X, y, hyperparameters, test_size=0.2, random_state=42):
-    """
-    Train DIY 1D CNN model with specified hyperparameters.
-
-    Parameters
-    ----------
-    X : np.ndarray
-        Preprocessed signals of shape (n_samples, 3, 4096)
-    y : np.ndarray
-        Labels
-    hyperparameters : dict
-        Model hyperparameters (n_samples, learning_rate, epochs, etc.)
-    test_size : float
-        Validation split ratio
-    random_state : int
-        Random seed for reproducibility
+        Batch size (for progress calculation)
+    verbose : bool
+        Whether to print progress
+    early_stopping_patience : int
+        Stop training if val_loss doesn't improve for this many epochs
+    lr_reduce_patience : int
+        Reduce LR if val_loss doesn't improve for this many epochs
+    lr_reduce_factor : float
+        Factor to multiply LR by when reducing
+    min_lr : float
+        Minimum learning rate (won't reduce below this)
 
     Returns
     -------
     dict
-        Training results including model, metrics, and split data
+        Training history
     """
-    print("\n" + "="*60)
-    print("INITIALIZING 1D CNN MODEL")
-    print("="*60)
+    n_batches = (n_train + batch_size - 1) // batch_size
+    n_val_batches = (n_val + batch_size - 1) // batch_size
 
-    # Extract hyperparameters
-    n_samples = hyperparameters.get('n_samples', 4096)
-    learning_rate = hyperparameters.get('learning_rate', 0.001)
-    dropout_rate = hyperparameters.get('dropout_rate', 0.3)
-    epochs = hyperparameters.get('epochs', 50)
-    batch_size = hyperparameters.get('batch_size', 32)
-
-    print(f"Signal length: {n_samples}")
-    print(f"Learning rate: {learning_rate}")
-    print(f"Dropout rate: {dropout_rate}")
-    print(f"Epochs: {epochs}")
-    print(f"Batch size: {batch_size}")
-
-    # Split data
-    print("\n" + "="*60)
-    print("SPLITTING DATA")
-    print("="*60)
-
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y
-    )
-
-    print(f"Train set: {X_train.shape[0]} samples ({y_train.sum()} positive, {100*y_train.mean():.2f}%)")
-    print(f"Val set: {X_val.shape[0]} samples ({y_val.sum()} positive, {100*y_val.mean():.2f}%)")
-
-    # Signal statistics (already normalized by preprocessing)
-    print("\n" + "="*60)
-    print("SIGNAL STATISTICS")
-    print("="*60)
-
-    print(f"Train signals: mean={X_train.mean():.4f}, std={X_train.std():.4f}")
-    print(f"Val signals:   mean={X_val.mean():.4f}, std={X_val.std():.4f}")
-
-    # Initialize 1D CNN model
-    model = DIYModel(
-        n_samples=n_samples,
-        learning_rate=learning_rate,
-        dropout_rate=dropout_rate
-    )
-
-    # Train model
-    print("\n" + "="*60)
-    print("TRAINING MODEL")
-    print("="*60 + "\n")
-
-    history = model.fit(
-        X_train, y_train,
-        X_val, y_val,
-        epochs=epochs,
-        batch_size=batch_size,
-        verbose=True
-    )
-
-    print("\nTraining complete.")
-
-    # Evaluate on both sets
-    print("\n" + "="*60)
-    print("EVALUATING MODEL")
-    print("="*60)
-
-    # Training set metrics
-    y_train_proba = model.predict_proba(X_train)
-    y_train_pred = model.predict(X_train, threshold=0.5)
-    train_metrics = model.evaluate(X_train, y_train)
-    train_auc = roc_auc_score(y_train, y_train_proba)
-
-    print(f"\nTraining Set:")
-    print(f"  Accuracy:    {train_metrics['accuracy']:.4f}")
-    print(f"  AUC:         {train_auc:.4f}")
-    print(f"  Precision:   {train_metrics['precision']:.4f}")
-    print(f"  Recall:      {train_metrics['recall']:.4f}")
-    print(f"  Specificity: {train_metrics['specificity']:.4f}")
-
-    # Validation set metrics
-    y_val_proba = model.predict_proba(X_val)
-    y_val_pred = model.predict(X_val, threshold=0.5)
-    val_metrics = model.evaluate(X_val, y_val)
-    val_auc = roc_auc_score(y_val, y_val_proba)
-
-    print(f"\nValidation Set:")
-    print(f"  Accuracy:    {val_metrics['accuracy']:.4f}")
-    print(f"  AUC:         {val_auc:.4f}")
-    print(f"  Precision:   {val_metrics['precision']:.4f}")
-    print(f"  Recall:      {val_metrics['recall']:.4f}")
-    print(f"  Specificity: {val_metrics['specificity']:.4f}")
-
-    return {
-        'model': model,
-        'history': history,
-        'X_train': X_train,
-        'X_val': X_val,
-        'y_train': y_train,
-        'y_val': y_val,
-        'train_metrics': {
-            'accuracy': float(train_metrics['accuracy']),
-            'auc': float(train_auc),
-            'precision': float(train_metrics['precision']),
-            'recall': float(train_metrics['recall']),
-            'specificity': float(train_metrics['specificity'])
-        },
-        'val_metrics': {
-            'accuracy': float(val_metrics['accuracy']),
-            'auc': float(val_auc),
-            'precision': float(val_metrics['precision']),
-            'recall': float(val_metrics['recall']),
-            'specificity': float(val_metrics['specificity'])
-        }
+    history = {
+        'train_loss': [], 'train_acc': [],
+        'val_loss': [], 'val_acc': []
     }
+
+    # early stopping and LR scheduling
+    best_val_loss = float('inf')
+    best_weights = None
+    best_bn_state = None
+    epochs_without_improvement = 0
+    epochs_since_lr_reduce = 0
+
+    for epoch in range(epochs):
+        epoch_losses = []
+        pbar = tqdm(enumerate(train_dataset), total=n_batches, desc=f"Epoch {epoch+1}/{epochs}", disable=not verbose)
+
+        for batch_num, (X_batch, y_batch) in pbar:
+            y_batch = tf.cast(tf.reshape(y_batch, (-1, 1)), tf.float32)
+            loss = model.train_step(X_batch, y_batch)
+            epoch_losses.append(loss)
+            pbar.set_postfix(loss=f"{loss:.4f}")
+
+        train_loss = np.mean(epoch_losses)
+        history['train_loss'].append(train_loss)
+
+        # validation loss
+        val_losses = []
+        val_correct = 0
+        val_total = 0
+        for X_batch, y_batch in val_dataset:
+            y_batch_float = tf.cast(tf.reshape(y_batch, (-1, 1)), tf.float32)
+            pred = model.forward(X_batch, training=False)
+            loss = model.compute_loss(y_batch_float, pred).numpy()
+            val_losses.append(loss)
+
+            # accuracy on this batch
+            pred_labels = (pred.numpy() >= 0.5).astype(int).flatten()
+            val_correct += (pred_labels == y_batch.numpy()).sum()
+            val_total += len(y_batch)
+
+        val_loss = np.mean(val_losses)
+        val_acc = val_correct / val_total if val_total > 0 else 0.0
+
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        history['train_acc'].append(0.0)  # skip train acc for speed - train loss is a good enough metric without doing a full forward pass
+
+        # check for improvement
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            # save trainable weights
+            best_weights = {name: var.numpy().copy() for name, var in zip(
+                [v.name for v in model.variables], model.variables
+            )}
+            # save batch norm moving averages (critical for inference)
+            best_bn_state = {
+                'conv_bn': [(m.numpy().copy(), v.numpy().copy())
+                            for _, _, m, v in model.bn_layers],
+                'fc1_bn': (model.fc1_bn[2].numpy().copy(), model.fc1_bn[3].numpy().copy()),
+                'fc2_bn': (model.fc2_bn[2].numpy().copy(), model.fc2_bn[3].numpy().copy()),
+            }
+            epochs_without_improvement = 0
+            epochs_since_lr_reduce = 0
+            improvement_marker = " *"
+        else:
+            epochs_without_improvement += 1
+            epochs_since_lr_reduce += 1
+            improvement_marker = ""
+
+        # learning rate reduction
+        current_lr = float(model.optimizer.learning_rate.numpy())
+        if epochs_since_lr_reduce >= lr_reduce_patience and current_lr > min_lr:
+            new_lr = max(current_lr * lr_reduce_factor, min_lr)
+            model.optimizer.learning_rate.assign(new_lr)
+            epochs_since_lr_reduce = 0
+            if verbose:
+                print(f"  Reducing learning rate: {current_lr:.2e} -> {new_lr:.2e}")
+
+        if verbose:
+            print(f"Epoch {epoch + 1}/{epochs} - Loss: {train_loss:.4f} - Val Loss: {val_loss:.4f} - Val Acc: {val_acc:.4f}{improvement_marker}")
+
+        # early stopping check
+        if epochs_without_improvement >= early_stopping_patience:
+            if verbose:
+                print(f"\nEarly stopping: val_loss hasn't improved for {early_stopping_patience} epochs")
+            break
+
+    # restore best weights and batch norm state
+    if best_weights is not None:
+        if verbose:
+            print(f"Restoring best weights (val_loss: {best_val_loss:.4f})")
+        for var, name in zip(model.variables, best_weights.keys()):
+            var.assign(best_weights[name])
+
+        # restore batch norm moving averages
+        for i, (mean, var) in enumerate(best_bn_state['conv_bn']):
+            model.bn_layers[i][2].assign(mean)
+            model.bn_layers[i][3].assign(var)
+        model.fc1_bn[2].assign(best_bn_state['fc1_bn'][0])
+        model.fc1_bn[3].assign(best_bn_state['fc1_bn'][1])
+        model.fc2_bn[2].assign(best_bn_state['fc2_bn'][0])
+        model.fc2_bn[3].assign(best_bn_state['fc2_bn'][1])
+
+    return history
+
+
+def evaluate(model, dataset):
+    """Evaluate model on dataset, return predictions and labels."""
+    y_true_all = []
+    y_proba_all = []
+
+    for X_batch, y_batch in dataset:
+        pred = model.predict_proba(X_batch.numpy())
+        y_proba_all.append(pred)
+        y_true_all.append(y_batch.numpy())
+
+    y_true = np.concatenate(y_true_all)
+    y_proba = np.concatenate(y_proba_all)
+
+    return y_true, y_proba
 
 
 # =====================================================================
-# SECTION 3: SAVE RESULTS
+# SECTION 2: SAVE RESULTS
 # =====================================================================
 
 def save_model_and_metrics(results, hyperparameters, save_dir):
@@ -306,7 +258,6 @@ def save_model_and_metrics(results, hyperparameters, save_dir):
     metrics_data = {
         'timestamp': timestamp,
         'hyperparameters': hyperparameters,
-        'train_metrics': results['train_metrics'],
         'val_metrics': results['val_metrics'],
         'final_train_loss': float(results['history']['train_loss'][-1]),
         'final_val_loss': float(results['history']['val_loss'][-1]),
@@ -326,21 +277,25 @@ def save_model_and_metrics(results, hyperparameters, save_dir):
 
 
 # =====================================================================
-# SECTION 4: VISUALIZATION
+# SECTION 3: VISUALIZATION
 # =====================================================================
 
-def generate_plots(results, save_dir, base_name):
+def generate_plots(results, save_dir, base_name, max_plot_samples=10000):
     """
-    Generate and save all performance visualization plots.
+    Generate evaluation plots after training.
+
+    Loads a subset of validation data from TFRecords for plotting.
 
     Parameters
     ----------
     results : dict
-        Training results from train_diy_model()
+        Training results from train_from_tfrecords()
     save_dir : Path
         Directory to save plot files
     base_name : str
         Base filename for saved plots
+    max_plot_samples : int
+        Maximum samples to load for plotting
 
     Returns
     -------
@@ -353,8 +308,26 @@ def generate_plots(results, save_dir, base_name):
 
     model = results['model']
     history = results['history']
-    X_val = results['X_val']
-    y_val = results['y_val']
+    tfrecord_path = results['tfrecord_path']
+    n_val = results['n_val']
+
+    # load validation subset for plotting
+    n_plot = min(max_plot_samples, n_val)
+    print(f"Loading {n_plot} validation samples for plotting...")
+
+    full_dataset = tf.data.TFRecordDataset(str(tfrecord_path))
+    full_dataset = full_dataset.map(parse_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
+    plot_dataset = full_dataset.take(n_plot).batch(256).prefetch(tf.data.AUTOTUNE)
+
+    # collect data
+    X_list = []
+    y_list = []
+    for X_batch, y_batch in plot_dataset:
+        X_list.append(X_batch.numpy())
+        y_list.append(y_batch.numpy())
+
+    X_val = np.concatenate(X_list, axis=0)
+    plot_y = np.concatenate(y_list, axis=0)
 
     saved_plots = {}
 
@@ -368,21 +341,21 @@ def generate_plots(results, save_dir, base_name):
 
     # 2. ROC curve
     print("  - ROC curve")
-    roc_data = model.roc_curve(X_val, y_val)
+    roc_data = model.roc_curve(X_val, plot_y)
     roc_path = plots_dir / f"{base_name}_roc_curve.png"
     plot_roc_curve(roc_data, save_path=str(roc_path))
     saved_plots['roc_curve'] = roc_path
 
     # 3. Precision-Recall curve
     print("  - Precision-Recall curve")
-    pr_data = model.precision_recall_curve(X_val, y_val)
+    pr_data = model.precision_recall_curve(X_val, plot_y)
     pr_path = plots_dir / f"{base_name}_pr_curve.png"
     plot_precision_recall_curve(pr_data, save_path=str(pr_path))
     saved_plots['pr_curve'] = pr_path
 
     # 4. Confusion matrix
     print("  - Confusion matrix")
-    cm_data = model.confusion_matrix(X_val, y_val)
+    cm_data = model.confusion_matrix(X_val, plot_y)
     cm_path = plots_dir / f"{base_name}_confusion_matrix.png"
     plot_confusion_matrix(cm_data, normalize=True, save_path=str(cm_path))
     saved_plots['confusion_matrix'] = cm_path
@@ -391,13 +364,13 @@ def generate_plots(results, save_dir, base_name):
     print("  - Prediction distribution")
     y_proba = model.predict_proba(X_val)
     dist_path = plots_dir / f"{base_name}_prediction_dist.png"
-    plot_prediction_distribution(y_proba, y_val, save_path=str(dist_path))
+    plot_prediction_distribution(y_proba, plot_y, save_path=str(dist_path))
     saved_plots['prediction_dist'] = dist_path
 
     # 6. Combined dashboard
     print("  - Combined dashboard")
     dashboard_path = plots_dir / f"{base_name}_dashboard.png"
-    plot_all_metrics(model, X_val, y_val, history=history, save_path=str(dashboard_path))
+    plot_all_metrics(model, X_val, plot_y, history=history, save_path=str(dashboard_path))
     saved_plots['dashboard'] = dashboard_path
 
     print(f"Plots saved to: {plots_dir}")
@@ -406,91 +379,277 @@ def generate_plots(results, save_dir, base_name):
 
 
 # =====================================================================
+# SECTION 4: TFRECORD LOADING
+# =====================================================================
+
+def parse_tfrecord(example_proto):
+    """Parse a single TFRecord example."""
+    feature_spec = {
+        'signal': tf.io.FixedLenFeature([], tf.string),
+        'label': tf.io.FixedLenFeature([], tf.int64),
+    }
+    parsed = tf.io.parse_single_example(example_proto, feature_spec)
+
+    signal = tf.io.decode_raw(parsed['signal'], tf.float32)
+    signal = tf.reshape(signal, [3, 4096])
+    label = parsed['label']
+
+    return signal, label
+
+
+def create_tfrecord_dataset(tfrecord_path, batch_size=128, shuffle=True, buffer_size=50000):
+    """
+    Create a tf.data.Dataset from a TFRecord file.
+
+    Parameters
+    ----------
+    tfrecord_path : str or Path
+        Path to the TFRecord file
+    batch_size : int
+        Batch size
+    shuffle : bool
+        Whether to shuffle the data
+    buffer_size : int
+        Shuffle buffer size
+
+    Returns
+    -------
+    tf.data.Dataset
+        Dataset yielding (signal, label) batches
+    """
+    dataset = tf.data.TFRecordDataset(str(tfrecord_path))
+    dataset = dataset.map(parse_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
+
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=buffer_size)
+
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+
+    return dataset
+
+
+def train_from_tfrecords(
+    tfrecord_path,
+    n_samples,
+    hyperparameters,
+    val_split=0.2
+):
+    """
+    Train DIY 1D CNN model from preprocessed TFRecords.
+
+    Parameters
+    ----------
+    tfrecord_path : Path
+        Path to TFRecord file
+    n_samples : int
+        Total number of samples in the TFRecord
+    hyperparameters : dict
+        Model hyperparameters
+    val_split : float
+        Fraction of data to use for validation
+
+    Returns
+    -------
+    dict
+        Training results
+    """
+    print("\n" + "="*60)
+    print("INITIALIZING 1D CNN MODEL (TFRECORD MODE)")
+    print("="*60)
+
+    n_samples_config = hyperparameters.get('n_samples', 4096)
+    learning_rate = hyperparameters.get('learning_rate', 0.001)
+    dropout_rate = hyperparameters.get('dropout_rate', 0.3)
+    epochs = hyperparameters.get('epochs', 15)
+    batch_size = hyperparameters.get('batch_size', 128)
+
+    print(f"Signal length: {n_samples_config}")
+    print(f"Learning rate: {learning_rate}")
+    print(f"Dropout rate: {dropout_rate}")
+    print(f"Epochs: {epochs}")
+    print(f"Batch size: {batch_size}")
+    print(f"Total samples: {n_samples}")
+    print("Mode: TFRECORD (preprocessed data, fast loading)")
+
+    # split into train/val
+    n_val = int(n_samples * val_split)
+    n_train = n_samples - n_val
+
+    print(f"\nTrain samples: {n_train}")
+    print(f"Val samples: {n_val}")
+
+    # create datasets
+    # for validation, we take the first n_val samples (no shuffle on first pass)
+    full_dataset = tf.data.TFRecordDataset(str(tfrecord_path))
+    full_dataset = full_dataset.map(parse_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
+
+    val_dataset = full_dataset.take(n_val).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    train_dataset = full_dataset.skip(n_val).shuffle(50000).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    # initialize model
+    model = DIYModel(
+        n_samples=n_samples_config,
+        learning_rate=learning_rate,
+        dropout_rate=dropout_rate
+    )
+
+    # train
+    print("\n" + "="*60)
+    print("TRAINING MODEL")
+    print("="*60 + "\n")
+
+    history = fit(
+        model, train_dataset, val_dataset,
+        n_train, n_val,
+        epochs=epochs,
+        batch_size=batch_size,
+        verbose=True
+    )
+
+    print("\nTraining complete.")
+
+    # evaluate
+    print("\n" + "="*60)
+    print("EVALUATING MODEL")
+    print("="*60)
+
+    # recreate val dataset for evaluation
+    val_dataset_eval = full_dataset.take(n_val).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    y_val, y_val_proba = evaluate(model, val_dataset_eval)
+    y_val_pred = (y_val_proba >= 0.5).astype(int)
+
+    val_auc = roc_auc_score(y_val, y_val_proba)
+    cm = model._compute_confusion_values(y_val_pred, y_val)
+    val_metrics = model._metrics_from_confusion(cm, len(y_val))
+
+    print(f"\nValidation Set:")
+    print(f"  Accuracy:    {val_metrics['accuracy']:.4f}")
+    print(f"  AUC:         {val_auc:.4f}")
+    print(f"  Precision:   {val_metrics['precision']:.4f}")
+    print(f"  Recall:      {val_metrics['recall']:.4f}")
+    print(f"  Specificity: {val_metrics['specificity']:.4f}")
+
+    return {
+        'model': model,
+        'history': history,
+        'val_metrics': {
+            'accuracy': float(val_metrics['accuracy']),
+            'auc': float(val_auc),
+            'precision': float(val_metrics['precision']),
+            'recall': float(val_metrics['recall']),
+            'specificity': float(val_metrics['specificity'])
+        },
+        'n_train': n_train,
+        'n_val': n_val,
+        'tfrecord_path': tfrecord_path
+    }
+
+
+# =====================================================================
 # MAIN ENTRY POINT
 # =====================================================================
 
+def check_gpu():
+    """Check and report GPU availability."""
+    gpus = tf.config.list_physical_devices('GPU')
+    print("="*60)
+    print("GPU STATUS")
+    print("="*60)
+    if gpus:
+        print(f"GPU(s) detected: {len(gpus)}")
+        for gpu in gpus:
+            print(f"  - {gpu.name}")
+        print("Training will use GPU acceleration.")
+    else:
+        print("WARNING: No GPU detected!")
+        print("Training will run on CPU (much, MUCH slower).")
+        if is_kaggle():
+            print("Make sure GPU is enabled in Kaggle notebook settings.")
+    print()
+    return len(gpus) > 0
+
+
 def main():
     """
-    Main execution flow:
-    1. Load PSD and preprocess signals (whitening)
-    2. Initialize and train DIY 1D CNN model
-    3. Evaluate performance and save weights/metrics
-    4. Generate and save performance plots
+    Main execution flow for training.
+
+    Pipeline:
+    1. Load TFRecords from Kaggle dataset
+    2. Train model with early stopping and LR scheduling
+    3. Save weights and metrics
+    4. Generate evaluation plots
     """
+
+    # ========== GPU CHECK ==========
+    has_gpu = check_gpu()
 
     # ========== HYPERPARAMETERS ==========
     HYPERPARAMETERS = {
-        'n_samples': 4096,       # Signal length (2s at 2048Hz)
-        'learning_rate': 0.001,  # Learning rate for Adam
-        'dropout_rate': 0.3,     # Dropout rate
-        'epochs': 50,            # Training epochs
-        'batch_size': 32,        # Smaller batch size for CNN
+        'n_samples': 4096,
+        'learning_rate': 0.0001,
+        'dropout_rate': 0.5,
+        'epochs': 50,
+        'batch_size': 64 if has_gpu else 32,
     }
 
     # ========== SETUP PATHS ==========
     print("="*60)
-    print("SETUP")
+    print("SETUP (TFRECORD MODE)")
     print("="*60)
 
-    dataset_dir = find_dataset_dir()
-    print(f"Dataset directory: {dataset_dir}")
+    output_dir = get_output_dir()
+    print(f"Output directory: {output_dir}")
+    print(f"Environment: {'Kaggle' if is_kaggle() else 'Local'}")
+    print("Mode: TFRECORD (preprocessed data)")
 
-    psd_path = dataset_dir / "avg_psd.npz"
-    signals_path = dataset_dir / "signals_whitened.npz"
-    models_dir = PROJECT_ROOT / "models" / "saved"
+    # find TFRecord file (external drive first, then project, then Kaggle)
+    tfrecord_candidates = [
+        Path("D:/Programming/g2net-preprocessed/train.tfrecord"),
+        output_dir / "tfrecords" / "train.tfrecord",
+        Path("/kaggle/input/g2net-preprocessed-tfrecords/train.tfrecord"),
+    ]
 
+    tfrecord_path = None
+    for candidate in tfrecord_candidates:
+        if candidate.exists():
+            tfrecord_path = candidate
+            break
+
+    if tfrecord_path is None:
+        raise FileNotFoundError(
+            "TFRecord file not found. Expected at one of:\n" +
+            "\n".join(f"  - {p}" for p in tfrecord_candidates)
+        )
+
+    print(f"TFRecord file: {tfrecord_path}")
+
+    # load metadata to get sample count
+    metadata_path = tfrecord_path.parent / "metadata.json"
+    if metadata_path.exists():
+        import json
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        n_samples = metadata['n_samples']
+    else:
+        n_samples = 560000  # approximate if metadata missing
+
+    print(f"Total samples: {n_samples}")
+
+    models_dir = output_dir / "models" / "saved"
     print(f"Models directory: {models_dir}")
 
-    # ========== LOAD PSD ==========
-    print("\n" + "="*60)
-    print("LOADING AVERAGE PSD")
-    print("="*60 + "\n")
-
-    if not psd_path.exists():
-        raise FileNotFoundError(
-            f"Average PSD not found at {psd_path}. "
-            "Please run 'python src/data/compute_psd.py' first."
-        )
-
-    avg_psd = load_psd(psd_path)
-    print(f"Loaded PSD shape: {avg_psd.shape}")
-
-    # ========== STAGE 1: PREPROCESS SIGNALS ==========
-    if not signals_path.exists():
-        print("\n" + "="*60)
-        print("STAGE 1: PREPROCESSING SIGNALS (WHITENING)")
-        print("="*60 + "\n")
-
-        df = load_labels(dataset_dir)
-        print(f"Total samples: {len(df)}")
-
-        X, y = precompute_signals(
-            df,
-            avg_psd,
-            batch_size=1000,
-            save_path=signals_path
-        )
-    else:
-        print("\n" + "="*60)
-        print("STAGE 1: LOADING PREPROCESSED SIGNALS")
-        print("="*60 + "\n")
-        X, y = load_precomputed_signals(signals_path)
-
-    # ========== STAGE 2: TRAIN MODEL ==========
-    print("\n" + "="*60)
-    print("STAGE 2: MODEL TRAINING")
-    print("="*60)
-
-    results = train_diy_model(
-        X, y,
+    # ========== TRAIN MODEL ==========
+    results = train_from_tfrecords(
+        tfrecord_path,
+        n_samples,
         hyperparameters=HYPERPARAMETERS,
-        test_size=0.2,
-        random_state=42
+        val_split=0.2
     )
 
-    # ========== STAGE 3: SAVE RESULTS ==========
+    # ========== SAVE RESULTS ==========
     print("\n" + "="*60)
-    print("STAGE 3: SAVING RESULTS")
+    print("SAVING RESULTS")
     print("="*60 + "\n")
 
     saved_paths = save_model_and_metrics(
@@ -499,9 +658,9 @@ def main():
         models_dir
     )
 
-    # ========== STAGE 4: GENERATE PLOTS ==========
+    # ========== GENERATE PLOTS ==========
     print("\n" + "="*60)
-    print("STAGE 4: GENERATING PLOTS")
+    print("GENERATING PLOTS")
     print("="*60 + "\n")
 
     saved_plots = generate_plots(
@@ -528,7 +687,6 @@ def main():
     print(f"\nPlots saved:")
     for name, path in saved_plots.items():
         print(f"  {name}: {path.name}")
-    print(f"\nPreprocessed signals cached at: {signals_path}")
 
 
 if __name__ == "__main__":
