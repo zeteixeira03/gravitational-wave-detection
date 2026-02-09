@@ -62,7 +62,7 @@ def download_g2net_dataset(output_dir: Path | str | None = None, unzip: bool = T
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Downloading G2Net dataset to: {output_dir}")
-    print("This may take a while (dataset is ~120GB)...")
+    print("This may take a while (the training set alone is ~70GB)...")
 
     # Initialize Kaggle API
     try:

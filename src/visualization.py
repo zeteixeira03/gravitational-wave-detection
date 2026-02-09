@@ -1,7 +1,9 @@
 """
-Visualization utilities for model performance assessment.
+Visualization utilities for data exploration and model performance assessment.
 
 Provides plotting functions for:
+- Preprocessing pipeline step-by-step
+- Cross-detector correlation
 - Learning curves (loss, accuracy, metrics over epochs)
 - ROC curve
 - Precision-Recall curve
@@ -14,6 +16,172 @@ from typing import Optional, Dict, Any
 
 import numpy as np
 import matplotlib.pyplot as plt
+
+from data.preprocessing import (
+    bandpass_filter, whiten_signal, apply_tukey_window, preprocess_sample,
+    FS, N,
+)
+
+DETECTOR_NAMES = ["Hanford (H1)", "Livingston (L1)", "Virgo (V1)"]
+
+
+# ============================================================================================
+#                                   data exploration
+# ============================================================================================
+
+
+def plot_preprocessing_pipeline(
+    raw: np.ndarray,
+    avg_psd: np.ndarray,
+    label: int,
+    sample_id: str,
+    figsize: tuple = (16, 12),
+    save_path: Optional[str] = None,
+) -> plt.Figure:
+    """
+    Show each preprocessing stage for all 3 detectors.
+
+    Parameters
+    ----------
+    raw : np.ndarray
+        Raw signal, shape (3, 4096).
+    avg_psd : np.ndarray
+        Average noise PSD, shape (3, N_FREQ).
+    label : int
+        Ground truth label (0 = noise, 1 = signal).
+    sample_id : str
+        Sample identifier for the title.
+    figsize : tuple
+    save_path : str, optional
+
+    Returns
+    -------
+    plt.Figure
+    """
+    step1 = bandpass_filter(raw)
+    step2 = whiten_signal(step1, avg_psd)
+    step3 = apply_tukey_window(step2, alpha=0.2)
+    mean = step3.mean(axis=-1, keepdims=True)
+    std = np.maximum(step3.std(axis=-1, keepdims=True), 1e-10)
+    step4 = (step3 - mean) / std
+
+    stages = [
+        ("Raw", raw),
+        ("Bandpass (20-500 Hz)", step1),
+        ("Whitened", step2),
+        ("Normalized", step4),
+    ]
+
+    time = np.arange(N) / FS
+    fig, axes = plt.subplots(4, 3, figsize=figsize)
+
+    for row, (stage_name, data) in enumerate(stages):
+        for col in range(3):
+            ax = axes[row, col]
+            ax.plot(time, data[col], linewidth=0.5)
+            ax.grid(True, alpha=0.3)
+            if row == 0:
+                ax.set_title(DETECTOR_NAMES[col], fontsize=10)
+            if col == 0:
+                ax.set_ylabel(stage_name, fontsize=10)
+            if row == len(stages) - 1:
+                ax.set_xlabel("Time (s)", fontsize=9)
+
+    label_str = "Signal" if label == 1 else "Noise"
+    fig.suptitle(
+        f"Preprocessing Pipeline -- {label_str} (ID: {sample_id})", fontsize=12
+    )
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+    return fig
+
+
+def plot_cross_detector_correlation(
+    raw: np.ndarray,
+    avg_psd: np.ndarray,
+    label: int,
+    sample_id: str,
+    max_lag: int = 100,
+    figsize: tuple = (14, 5),
+    save_path: Optional[str] = None,
+) -> plt.Figure:
+    """
+    Cross-correlation between all detector pairs after preprocessing.
+
+    Parameters
+    ----------
+    raw : np.ndarray
+        Raw signal, shape (3, 4096).
+    avg_psd : np.ndarray
+        Average noise PSD, shape (3, N_FREQ).
+    label : int
+        Ground truth label (0 = noise, 1 = signal).
+    sample_id : str
+        Sample identifier for the title.
+    max_lag : int
+        Maximum lag in samples for the correlation window.
+    figsize : tuple
+    save_path : str, optional
+
+    Returns
+    -------
+    plt.Figure
+    """
+    processed = preprocess_sample(raw, avg_psd)
+    # max light-travel-time between detector pairs (ms)
+    pairs = [(0, 1, "H1-L1", 10), (0, 2, "H1-V1", 27), (1, 2, "L1-V1", 27)]
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+    for ax, (i, j, name, max_delay_ms) in zip(axes, pairs):
+        sig_i = (processed[i] - processed[i].mean()) / processed[i].std()
+        sig_j = (processed[j] - processed[j].mean()) / processed[j].std()
+
+        corr = np.correlate(sig_i, sig_j, mode="full") / len(sig_i)
+        center = len(corr) // 2
+        lags = np.arange(-max_lag, max_lag + 1)
+        corr_window = corr[center - max_lag : center + max_lag + 1]
+        lag_ms = lags / FS * 1000
+
+        ax.plot(lag_ms, corr_window, linewidth=1)
+        ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+        ax.axvline(x=0, color="gray", linestyle="--", alpha=0.5)
+        ax.axvspan(-max_delay_ms, max_delay_ms, alpha=0.08, color="green")
+
+        peak_idx = np.argmax(np.abs(corr_window))
+        ax.axvline(x=lag_ms[peak_idx], color="red", linestyle=":", alpha=0.7)
+        ax.text(
+            0.95, 0.95,
+            f"Peak: {corr_window[peak_idx]:.3f}\nLag: {lag_ms[peak_idx]:.1f} ms",
+            transform=ax.transAxes, ha="right", va="top",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
+
+        ax.set_xlabel("Lag (ms)")
+        ax.set_ylabel("Correlation")
+        ax.set_title(name)
+        ax.grid(True, alpha=0.3)
+
+    label_str = "Signal" if label == 1 else "Noise"
+    fig.suptitle(
+        f"Cross-Detector Correlation -- {label_str} (ID: {sample_id})", fontsize=12
+    )
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+    return fig
+
+
+# ============================================================================================
+#                                   model performance
+# ============================================================================================
 
 
 def plot_learning_curves(
