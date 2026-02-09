@@ -29,8 +29,8 @@ class DIYModel:
     def __init__(
         self,
         n_samples: int = 4096,
-        learning_rate: float = 0.001,
-        dropout_rate: float = 0.3,
+        learning_rate: float = 1e-4,
+        dropout_rate: float = 0.5,
         weight_decay: float = 1e-4
     ):
         """

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+
+
+SAMPLE_DATASET_SLUG = "zeteixeira/g2net-exploration-sample"
 
 
 # ---------------------------------------------------------------------
@@ -58,14 +62,64 @@ def find_project_root(start: Optional[Path] = None) -> Path:
     return Path.cwd()
 
 
+def sample_dataset_dir(project_root: Optional[Path] = None) -> Path:
+    """Return the local path where the exploration sample is stored."""
+    if project_root is None:
+        project_root = find_project_root()
+    return project_root / "data" / "g2net-exploration-sample"
+
+
+def _is_valid_dataset(path: Path) -> bool:
+    """Check whether *path* looks like a usable G2Net dataset (full or sample)."""
+    return path.exists() and (path / "train").is_dir()
+
+
+def download_sample_dataset(project_root: Optional[Path] = None) -> Path:
+    """
+    Download the exploration sample (~100 MB) via the Kaggle CLI.
+
+    Parameters
+    ----------
+    project_root : Path, optional
+        Project root. Resolved automatically if omitted.
+
+    Returns
+    -------
+    Path
+        Directory containing the downloaded sample dataset.
+    """
+    dest = sample_dataset_dir(project_root)
+    if _is_valid_dataset(dest):
+        return dest
+
+    print(f"Downloading exploration sample from Kaggle ({SAMPLE_DATASET_SLUG})...")
+    dest.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["kaggle", "datasets", "download", SAMPLE_DATASET_SLUG,
+         "--unzip", "-p", str(dest)],
+        check=True,
+    )
+
+    if not _is_valid_dataset(dest):
+        raise RuntimeError(
+            f"Download succeeded but {dest} does not contain a valid dataset. "
+            "Check the Kaggle dataset structure."
+        )
+
+    print(f"Sample dataset ready at {dest}")
+    return dest
+
+
 def find_dataset_dir(project_root: Optional[Path] = None) -> Path:
     """
     Find the G2Net dataset directory.
 
     Search order:
-    1. Environment variable G2NET_DATASET_PATH
-    2. project_root/data/g2net-gravitational-wave-detection
-    3. Current directory / g2net-gravitational-wave-detection
+    1. Kaggle input directory (when running on Kaggle)
+    2. Environment variable G2NET_DATASET_PATH
+    3. External drive (local development)
+    4. Full dataset under project_root/data/
+    5. Exploration sample under project_root/data/g2net-exploration-sample
 
     Parameters
     ----------
@@ -88,11 +142,11 @@ def find_dataset_dir(project_root: Optional[Path] = None) -> Path:
     # search order for dataset directory
     search_paths = []
 
-    # 1. Kaggle input directory - no need to keep the dataset locally
+    # 1. Kaggle input directory
     if is_kaggle():
         search_paths.append(Path("/kaggle/input/g2net-gravitational-wave-detection"))
 
-    # 2. Environment variable - for custom use
+    # 2. Environment variable
     env_path = os.getenv("G2NET_DATASET_PATH")
     if env_path:
         search_paths.append(Path(env_path))
@@ -100,22 +154,25 @@ def find_dataset_dir(project_root: Optional[Path] = None) -> Path:
     # 3. External drive (local development)
     search_paths.append(Path("D:/Programming/g2net-gravitational-wave-detection"))
 
-    # 4. Project data directory - if you're a madman and want to keep the dataset in your machine
+    # 4. Full dataset under project data directory
     search_paths.append(project_root / "data" / "g2net-gravitational-wave-detection")
 
-    # Find first valid path (must contain a 'train' file)
+    # 5. Exploration sample (1000 samples, ~100 MB)
+    search_paths.append(sample_dataset_dir(project_root))
+
+    # find first valid path
     for candidate_path in search_paths:
-        if candidate_path.exists() and (candidate_path / "train").is_dir():
+        if _is_valid_dataset(candidate_path):
             return candidate_path
 
-    # If no valid path found,
+    # nothing found
     error_msg = (
-        "G2Net dataset directory not found. Tried the following locations:\n" +
+        "G2Net dataset not found. Searched:\n" +
         "\n".join(f"  - {p}" for p in search_paths) +
-        "\n\nTo fix this, either:\n"
-        "1. Set environment variable: G2NET_DATASET_PATH=/path/to/dataset\n"
-        "2. Download dataset using: python src/data/download_data.py\n"
-        "3. Manually place dataset in: " + str(project_root / "data" / "g2net-gravitational-wave-detection")
+        "\n\nOptions:\n"
+        "1. Set G2NET_DATASET_PATH to your local copy of the full dataset\n"
+        "2. Call download_sample_dataset() to fetch a 1000-sample subset (~100 MB)\n"
+        "3. Run this notebook on Kaggle with the competition dataset attached"
     )
     raise FileNotFoundError(error_msg)
 
