@@ -108,6 +108,12 @@ $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{BCE}} + \lambda_1 \mathcal{L}_
 
 The lambda weights control how strongly each constraint influences training. They will be introduced one at a time, with ablation studies to measure individual impact. If a constraint degrades performance, it gets removed.
 
+
+
+### Please Help Out!
+
+If you read my code and found a bug, or a possible improvement that I didn't think of, please contact me so we can discuss this further. I'd love to hear about it!
+
 ---
 
 ### Sources
