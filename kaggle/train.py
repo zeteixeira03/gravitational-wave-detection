@@ -1,7 +1,7 @@
 """
-Kaggle training script - uses preprocessed TFRecords for fast training.
+Kaggle training script - uses preprocessed .pt tensors for fast training.
 
-The TFRecords dataset contains signals that have been preprocessed locally:
+The tensor dataset contains signals that have been preprocessed locally:
 - Bandpass filtered (20-500 Hz)
 - Whitened using noise PSD
 - Tukey windowed

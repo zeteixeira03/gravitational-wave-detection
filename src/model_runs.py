@@ -1,13 +1,14 @@
 """
 1D CNN Model Training Pipeline
 
-Training cycle using preprocessed TFRecords:
-1. Load TFRecords (preprocessed signals, must run compute_psd.py and create_tfrecords before - in this order)
+Training cycle using preprocessed PyTorch tensor shards:
+1. Load .pt shards (preprocessed signals, must run compute_psd.py and create_tensors.py before - in this order)
 2. Initialize 1D CNN model
 3. Train with early stopping and LR scheduling
 4. Evaluate and save metrics
 5. Generate evaluation plots
 """
+import copy
 import sys
 import json
 from pathlib import Path
@@ -16,7 +17,8 @@ from datetime import datetime
 import numpy as np
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
-import tensorflow as tf
+import torch
+from torch.utils.data import Dataset, DataLoader
 
 # add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -35,45 +37,70 @@ from visualization import (
     plot_all_metrics
 )
 
-tf.random.set_seed(426425)
+SEED = 426425
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
 
 # =====================================================================
-# SECTION 1: TRAINING LOOP
+#                           DATASET
+# =====================================================================
+
+class GWTensorDataset(Dataset):
+    """Wraps signal and label tensors for DataLoader."""
+
+    def __init__(self, signals: torch.Tensor, labels: torch.Tensor):
+        self.signals = signals
+        self.labels = labels
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, idx: int):
+        return self.signals[idx], self.labels[idx]
+
+
+# =====================================================================
+#                         TRAINING LOOP
 # =====================================================================
 
 def fit(
     model,
-    train_dataset,
-    val_dataset,
-    n_train,
-    n_val,
+    train_shard_paths,
+    val_loader,
+    optimizer,
+    device,
     epochs,
     batch_size,
     verbose=True,
     early_stopping_patience=5,
     lr_reduce_patience=3,
     lr_reduce_factor=0.5,
-    min_lr=1e-6
+    min_lr=1e-6,
 ):
     """
-    Train model using tf.data.Dataset generators.
+    Train model by streaming shards from disk.
+
+    Each epoch iterates over all training shards, loading one at a time to keep
+    memory usage constant (~2.4 GB per shard). Works with any number of shards,
+    including a single file.
 
     Parameters
     ----------
     model : DIYModel
         Model to train
-    train_dataset : tf.data.Dataset
-        Training dataset (streaming)
-    val_dataset : tf.data.Dataset
-        Validation dataset (streaming)
-    n_train : int
-        Number of training samples
-    n_val : int
-        Number of validation samples
+    train_shard_paths : list[Path]
+        Paths to training shard .pt files
+    val_loader : DataLoader
+        Validation data loader (kept in memory)
+    optimizer : torch.optim.Optimizer
+        Optimizer instance
+    device : torch.device
+        Device to train on
     epochs : int
         Number of training epochs
     batch_size : int
-        Batch size (for progress calculation)
+        Batch size for training
     verbose : bool
         Whether to print progress
     early_stopping_patience : int
@@ -83,131 +110,147 @@ def fit(
     lr_reduce_factor : float
         Factor to multiply LR by when reducing
     min_lr : float
-        Minimum learning rate (won't reduce below this)
+        Minimum learning rate
 
     Returns
     -------
     dict
         Training history
     """
-    n_batches = (n_train + batch_size - 1) // batch_size
-    n_val_batches = (n_val + batch_size - 1) // batch_size
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, patience=lr_reduce_patience, factor=lr_reduce_factor,
+        min_lr=min_lr
+    )
 
     history = {
         'train_loss': [], 'train_acc': [],
         'val_loss': [], 'val_acc': []
     }
 
-    # early stopping and LR scheduling
     best_val_loss = float('inf')
-    best_weights = None
-    best_bn_state = None
+    best_state = None
     epochs_without_improvement = 0
-    epochs_since_lr_reduce = 0
+    n_shards = len(train_shard_paths)
 
     for epoch in range(epochs):
+        # ---- training ----
+        model.train()
         epoch_losses = []
-        pbar = tqdm(enumerate(train_dataset), total=n_batches, desc=f"Epoch {epoch+1}/{epochs}", disable=not verbose)
+        train_correct = 0
+        train_total = 0
 
-        for batch_num, (X_batch, y_batch) in pbar:
-            y_batch = tf.cast(tf.reshape(y_batch, (-1, 1)), tf.float32)
-            loss = model.train_step(X_batch, y_batch)
-            epoch_losses.append(loss)
-            pbar.set_postfix(loss=f"{loss:.4f}")
+        shard_order = list(range(n_shards))
+        np.random.shuffle(shard_order)
+
+        for shard_num, shard_idx in enumerate(shard_order):
+            shard_path = train_shard_paths[shard_idx]
+            data = torch.load(str(shard_path), weights_only=True)
+            shard_dataset = GWTensorDataset(data['signals'], data['labels'])
+            shard_loader = DataLoader(
+                shard_dataset, batch_size=batch_size, shuffle=True,
+                num_workers=0, pin_memory=(device.type == 'cuda')
+            )
+
+            desc = f"Epoch {epoch+1}/{epochs}"
+            if n_shards > 1:
+                desc += f" [shard {shard_num+1}/{n_shards}]"
+            pbar = tqdm(shard_loader, desc=desc, disable=not verbose)
+
+            for X_batch, y_batch in pbar:
+                X_batch = X_batch.to(device)
+                y_batch = y_batch.float().unsqueeze(1).to(device)
+
+                optimizer.zero_grad()
+                predictions = model(X_batch)
+                loss = model.compute_loss(y_batch, predictions)
+                loss.backward()
+                optimizer.step()
+
+                epoch_losses.append(loss.item())
+                with torch.no_grad():
+                    pred_labels = (predictions >= 0.5).int().flatten()
+                    train_correct += (pred_labels == y_batch.flatten().int()).sum().item()
+                    train_total += len(y_batch)
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+            del data, shard_dataset, shard_loader
 
         train_loss = np.mean(epoch_losses)
+        train_acc = train_correct / train_total if train_total > 0 else 0.0
         history['train_loss'].append(train_loss)
 
-        # validation loss
+        # ---- validation ----
+        model.eval()
         val_losses = []
         val_correct = 0
         val_total = 0
-        for X_batch, y_batch in val_dataset:
-            y_batch_float = tf.cast(tf.reshape(y_batch, (-1, 1)), tf.float32)
-            pred = model.forward(X_batch, training=False)
-            loss = model.compute_loss(y_batch_float, pred).numpy()
-            val_losses.append(loss)
 
-            # accuracy on this batch
-            pred_labels = (pred.numpy() >= 0.5).astype(int).flatten()
-            val_correct += (pred_labels == y_batch.numpy()).sum()
-            val_total += len(y_batch)
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch = X_batch.to(device)
+                y_batch_float = y_batch.float().unsqueeze(1).to(device)
+
+                pred = model(X_batch)
+                loss = model.compute_loss(y_batch_float, pred)
+                val_losses.append(loss.item())
+
+                pred_labels = (pred.cpu().numpy() >= 0.5).astype(int).flatten()
+                val_correct += (pred_labels == y_batch.numpy()).sum()
+                val_total += len(y_batch)
 
         val_loss = np.mean(val_losses)
         val_acc = val_correct / val_total if val_total > 0 else 0.0
 
         history['val_loss'].append(val_loss)
         history['val_acc'].append(val_acc)
-        history['train_acc'].append(0.0)  # skip train acc for speed - train loss is a good enough metric without doing a full forward pass
+        history['train_acc'].append(train_acc)
+
+        # LR scheduling
+        scheduler.step(val_loss)
 
         # check for improvement
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            # save trainable weights
-            best_weights = {name: var.numpy().copy() for name, var in zip(
-                [v.name for v in model.variables], model.variables
-            )}
-            # save batch norm moving averages (critical for inference)
-            best_bn_state = {
-                'conv_bn': [(m.numpy().copy(), v.numpy().copy())
-                            for _, _, m, v in model.bn_layers],
-                'fc1_bn': (model.fc1_bn[2].numpy().copy(), model.fc1_bn[3].numpy().copy()),
-                'fc2_bn': (model.fc2_bn[2].numpy().copy(), model.fc2_bn[3].numpy().copy()),
-            }
+            best_state = copy.deepcopy(model.state_dict())
             epochs_without_improvement = 0
-            epochs_since_lr_reduce = 0
             improvement_marker = " *"
         else:
             epochs_without_improvement += 1
-            epochs_since_lr_reduce += 1
             improvement_marker = ""
 
-        # learning rate reduction
-        current_lr = float(model.optimizer.learning_rate.numpy())
-        if epochs_since_lr_reduce >= lr_reduce_patience and current_lr > min_lr:
-            new_lr = max(current_lr * lr_reduce_factor, min_lr)
-            model.optimizer.learning_rate.assign(new_lr)
-            epochs_since_lr_reduce = 0
-            if verbose:
-                print(f"  Reducing learning rate: {current_lr:.2e} -> {new_lr:.2e}")
-
         if verbose:
-            print(f"Epoch {epoch + 1}/{epochs} - Loss: {train_loss:.4f} - Val Loss: {val_loss:.4f} - Val Acc: {val_acc:.4f}{improvement_marker}")
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch + 1}/{epochs} - Loss: {train_loss:.4f} - "
+                  f"Val Loss: {val_loss:.4f} - Val Acc: {val_acc:.4f} - "
+                  f"LR: {current_lr:.2e}{improvement_marker}")
 
-        # early stopping check
+        # early stopping
         if epochs_without_improvement >= early_stopping_patience:
             if verbose:
                 print(f"\nEarly stopping: val_loss hasn't improved for {early_stopping_patience} epochs")
             break
 
-    # restore best weights and batch norm state
-    if best_weights is not None:
+    # restore best weights
+    if best_state is not None:
         if verbose:
             print(f"Restoring best weights (val_loss: {best_val_loss:.4f})")
-        for var, name in zip(model.variables, best_weights.keys()):
-            var.assign(best_weights[name])
-
-        # restore batch norm moving averages
-        for i, (mean, var) in enumerate(best_bn_state['conv_bn']):
-            model.bn_layers[i][2].assign(mean)
-            model.bn_layers[i][3].assign(var)
-        model.fc1_bn[2].assign(best_bn_state['fc1_bn'][0])
-        model.fc1_bn[3].assign(best_bn_state['fc1_bn'][1])
-        model.fc2_bn[2].assign(best_bn_state['fc2_bn'][0])
-        model.fc2_bn[3].assign(best_bn_state['fc2_bn'][1])
+        model.load_state_dict(best_state)
 
     return history
 
 
-def evaluate(model, dataset):
+def evaluate(model, data_loader, device):
     """Evaluate model on dataset, return predictions and labels."""
+    model.eval()
     y_true_all = []
     y_proba_all = []
 
-    for X_batch, y_batch in dataset:
-        pred = model.predict_proba(X_batch.numpy())
-        y_proba_all.append(pred)
-        y_true_all.append(y_batch.numpy())
+    with torch.no_grad():
+        for X_batch, y_batch in data_loader:
+            X_batch = X_batch.to(device)
+            pred = model(X_batch).cpu().numpy().flatten()
+            y_proba_all.append(pred)
+            y_true_all.append(y_batch.numpy())
 
     y_true = np.concatenate(y_true_all)
     y_proba = np.concatenate(y_proba_all)
@@ -216,7 +259,7 @@ def evaluate(model, dataset):
 
 
 # =====================================================================
-# SECTION 2: SAVE RESULTS
+#                          SAVE RESULTS
 # =====================================================================
 
 def save_model_and_metrics(results, hyperparameters, save_dir):
@@ -226,7 +269,7 @@ def save_model_and_metrics(results, hyperparameters, save_dir):
     Parameters
     ----------
     results : dict
-        Training results from train_diy_model()
+        Training results from train_from_tensors()
     hyperparameters : dict
         Model hyperparameters used
     save_dir : Path
@@ -239,22 +282,21 @@ def save_model_and_metrics(results, hyperparameters, save_dir):
     """
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    # Generate timestamp for unique filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     base_name = f"diy_{timestamp}"
 
-    # Save weights
-    weights_path = save_dir / f"{base_name}_weights.npz"
+    # save weights
+    weights_path = save_dir / f"{base_name}_weights.pt"
     results['model'].save_weights(str(weights_path))
     print(f"Weights saved to: {weights_path}")
 
-    # Save hyperparameters
+    # save hyperparameters
     config_path = save_dir / f"{base_name}_config.json"
     with open(config_path, 'w') as f:
         json.dump(hyperparameters, f, indent=2)
     print(f"Config saved to: {config_path}")
 
-    # Save metrics
+    # save metrics
     metrics_data = {
         'timestamp': timestamp,
         'hyperparameters': hyperparameters,
@@ -277,23 +319,23 @@ def save_model_and_metrics(results, hyperparameters, save_dir):
 
 
 # =====================================================================
-# SECTION 3: VISUALIZATION
+#                          VISUALIZATION
 # =====================================================================
 
-def generate_plots(results, save_dir, base_name, max_plot_samples=10000):
+def generate_plots(results, save_dir, base_name, device, max_plot_samples=10000):
     """
     Generate evaluation plots after training.
-
-    Loads a subset of validation data from TFRecords for plotting.
 
     Parameters
     ----------
     results : dict
-        Training results from train_from_tfrecords()
+        Training results from train_from_tensors()
     save_dir : Path
         Directory to save plot files
     base_name : str
         Base filename for saved plots
+    device : torch.device
+        Device for inference
     max_plot_samples : int
         Maximum samples to load for plotting
 
@@ -308,26 +350,24 @@ def generate_plots(results, save_dir, base_name, max_plot_samples=10000):
 
     model = results['model']
     history = results['history']
-    tfrecord_path = results['tfrecord_path']
-    n_val = results['n_val']
 
-    # load validation subset for plotting
-    n_plot = min(max_plot_samples, n_val)
+    # use validation data for plotting
+    val_loader = results['val_loader']
+    n_plot = min(max_plot_samples, results['n_val'])
     print(f"Loading {n_plot} validation samples for plotting...")
 
-    full_dataset = tf.data.TFRecordDataset(str(tfrecord_path))
-    full_dataset = full_dataset.map(parse_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
-    plot_dataset = full_dataset.take(n_plot).batch(256).prefetch(tf.data.AUTOTUNE)
-
-    # collect data
     X_list = []
     y_list = []
-    for X_batch, y_batch in plot_dataset:
+    collected = 0
+    for X_batch, y_batch in val_loader:
         X_list.append(X_batch.numpy())
         y_list.append(y_batch.numpy())
+        collected += len(y_batch)
+        if collected >= n_plot:
+            break
 
-    X_val = np.concatenate(X_list, axis=0)
-    plot_y = np.concatenate(y_list, axis=0)
+    X_val = np.concatenate(X_list, axis=0)[:n_plot]
+    plot_y = np.concatenate(y_list, axis=0)[:n_plot]
 
     saved_plots = {}
 
@@ -379,71 +419,22 @@ def generate_plots(results, save_dir, base_name, max_plot_samples=10000):
 
 
 # =====================================================================
-# SECTION 4: TFRECORD LOADING
+#                       TENSOR LOADING
 # =====================================================================
 
-def parse_tfrecord(example_proto):
-    """Parse a single TFRecord example."""
-    feature_spec = {
-        'signal': tf.io.FixedLenFeature([], tf.string),
-        'label': tf.io.FixedLenFeature([], tf.int64),
-    }
-    parsed = tf.io.parse_single_example(example_proto, feature_spec)
-
-    signal = tf.io.decode_raw(parsed['signal'], tf.float32)
-    signal = tf.reshape(signal, [3, 4096])
-    label = parsed['label']
-
-    return signal, label
-
-
-def create_tfrecord_dataset(tfrecord_path, batch_size=128, shuffle=True, buffer_size=50000):
+def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     """
-    Create a tf.data.Dataset from a TFRecord file.
+    Train DIY 1D CNN model from preprocessed .pt tensor shards.
+
+    Streams training shards from disk one at a time (~2.4 GB each) to avoid
+    loading the full dataset into memory. Validation shards are kept in memory.
 
     Parameters
     ----------
-    tfrecord_path : str or Path
-        Path to the TFRecord file
-    batch_size : int
-        Batch size
-    shuffle : bool
-        Whether to shuffle the data
-    buffer_size : int
-        Shuffle buffer size
-
-    Returns
-    -------
-    tf.data.Dataset
-        Dataset yielding (signal, label) batches
-    """
-    dataset = tf.data.TFRecordDataset(str(tfrecord_path))
-    dataset = dataset.map(parse_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
-
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=buffer_size)
-
-    dataset = dataset.batch(batch_size)
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
-
-    return dataset
-
-
-def train_from_tfrecords(
-    tfrecord_path,
-    n_samples,
-    hyperparameters,
-    val_split=0.2
-):
-    """
-    Train DIY 1D CNN model from preprocessed TFRecords.
-
-    Parameters
-    ----------
-    tfrecord_path : Path
-        Path to TFRecord file
+    data_dir : Path
+        Directory containing shard_*.pt files (or a single train.pt for small datasets)
     n_samples : int
-        Total number of samples in the TFRecord
+        Total number of samples
     hyperparameters : dict
         Model hyperparameters
     val_split : float
@@ -455,43 +446,108 @@ def train_from_tfrecords(
         Training results
     """
     print("\n" + "="*60)
-    print("INITIALIZING 1D CNN MODEL (TFRECORD MODE)")
+    print("INITIALIZING 1D CNN MODEL (TENSOR MODE)")
     print("="*60)
 
     n_samples_config = hyperparameters.get('n_samples', 4096)
     learning_rate = hyperparameters.get('learning_rate', 0.001)
     dropout_rate = hyperparameters.get('dropout_rate', 0.3)
+    weight_decay = hyperparameters.get('weight_decay', 1e-4)
     epochs = hyperparameters.get('epochs', 15)
     batch_size = hyperparameters.get('batch_size', 128)
 
     print(f"Signal length: {n_samples_config}")
     print(f"Learning rate: {learning_rate}")
     print(f"Dropout rate: {dropout_rate}")
+    print(f"Weight decay: {weight_decay}")
     print(f"Epochs: {epochs}")
     print(f"Batch size: {batch_size}")
     print(f"Total samples: {n_samples}")
-    print("Mode: TFRECORD (preprocessed data, fast loading)")
+    print("Mode: TENSOR (preprocessed data, shard streaming)")
 
-    # split into train/val
-    n_val = int(n_samples * val_split)
-    n_train = n_samples - n_val
+    # device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
 
-    print(f"\nTrain samples: {n_train}")
+    # split shards into val / train
+    single_file = data_dir / "train.pt"
+    if single_file.exists():
+        # small dataset mode: load entirely into memory
+        print(f"\nLoading single file: {single_file}")
+        data = torch.load(str(single_file), weights_only=True)
+        all_signals = data['signals']
+        all_labels = data['labels']
+
+        n_val = int(len(all_labels) * val_split)
+        n_train = len(all_labels) - n_val
+
+        val_signals = all_signals[:n_val]
+        val_labels = all_labels[:n_val]
+
+        # save train split as a temporary shard so fit() streams it from disk
+        train_shard = data_dir / "_train_split.pt"
+        torch.save({'signals': all_signals[n_val:], 'labels': all_labels[n_val:]}, str(train_shard))
+        train_shard_paths = [train_shard]
+        del all_signals, all_labels
+    else:
+        # shard mode: split by shard files
+        shard_files = sorted(data_dir.glob('shard_*.pt'))
+        if not shard_files:
+            raise FileNotFoundError(f"No shard or train.pt files found in {data_dir}")
+
+        n_val_target = int(n_samples * val_split)
+
+        # assign first N shards to validation until we have enough samples
+        val_shard_paths = []
+        train_shard_paths = []
+        val_count = 0
+
+        for f in shard_files:
+            if val_count < n_val_target:
+                val_shard_paths.append(f)
+                data = torch.load(str(f), weights_only=True)
+                val_count += len(data['labels'])
+                del data
+            else:
+                train_shard_paths.append(f)
+
+        # load val shards into memory (small enough: ~2-3 shards = 5-7 GB)
+        print(f"\nLoading {len(val_shard_paths)} validation shards into memory...")
+        val_signals_list = []
+        val_labels_list = []
+        for f in val_shard_paths:
+            print(f"  {f.name}")
+            data = torch.load(str(f), weights_only=True)
+            val_signals_list.append(data['signals'])
+            val_labels_list.append(data['labels'])
+            del data
+
+        val_signals = torch.cat(val_signals_list)
+        val_labels = torch.cat(val_labels_list)
+        del val_signals_list, val_labels_list
+
+        n_val = len(val_labels)
+        n_train = n_samples - n_val
+
+    print(f"Training shards: {len(train_shard_paths)} (streamed from disk)")
+    print(f"Train samples: {n_train}")
     print(f"Val samples: {n_val}")
 
-    # create datasets
-    # for validation, we take the first n_val samples (no shuffle on first pass)
-    full_dataset = tf.data.TFRecordDataset(str(tfrecord_path))
-    full_dataset = full_dataset.map(parse_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
-
-    val_dataset = full_dataset.take(n_val).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    train_dataset = full_dataset.skip(n_val).shuffle(50000).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    # validation DataLoader (always in memory)
+    val_dataset = GWTensorDataset(val_signals, val_labels)
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=0, pin_memory=(device.type == 'cuda')
+    )
 
     # initialize model
     model = DIYModel(
         n_samples=n_samples_config,
-        learning_rate=learning_rate,
         dropout_rate=dropout_rate
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
 
     # train
@@ -500,8 +556,7 @@ def train_from_tfrecords(
     print("="*60 + "\n")
 
     history = fit(
-        model, train_dataset, val_dataset,
-        n_train, n_val,
+        model, train_shard_paths, val_loader, optimizer, device,
         epochs=epochs,
         batch_size=batch_size,
         verbose=True
@@ -514,9 +569,7 @@ def train_from_tfrecords(
     print("EVALUATING MODEL")
     print("="*60)
 
-    # recreate val dataset for evaluation
-    val_dataset_eval = full_dataset.take(n_val).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    y_val, y_val_proba = evaluate(model, val_dataset_eval)
+    y_val, y_val_proba = evaluate(model, val_loader, device)
     y_val_pred = (y_val_proba >= 0.5).astype(int)
 
     val_auc = roc_auc_score(y_val, y_val_proba)
@@ -542,24 +595,25 @@ def train_from_tfrecords(
         },
         'n_train': n_train,
         'n_val': n_val,
-        'tfrecord_path': tfrecord_path
+        'val_loader': val_loader,
+        'device': device,
     }
 
 
 # =====================================================================
-# MAIN ENTRY POINT
+#                        MAIN ENTRY POINT
 # =====================================================================
 
 def check_gpu():
     """Check and report GPU availability."""
-    gpus = tf.config.list_physical_devices('GPU')
     print("="*60)
     print("GPU STATUS")
     print("="*60)
-    if gpus:
-        print(f"GPU(s) detected: {len(gpus)}")
-        for gpu in gpus:
-            print(f"  - {gpu.name}")
+    if torch.cuda.is_available():
+        n_gpus = torch.cuda.device_count()
+        print(f"GPU(s) detected: {n_gpus}")
+        for i in range(n_gpus):
+            print(f"  - {torch.cuda.get_device_name(i)}")
         print("Training will use GPU acceleration.")
     else:
         print("WARNING: No GPU detected!")
@@ -567,7 +621,7 @@ def check_gpu():
         if is_kaggle():
             print("Make sure GPU is enabled in Kaggle notebook settings.")
     print()
-    return len(gpus) > 0
+    return torch.cuda.is_available()
 
 
 def main():
@@ -575,7 +629,7 @@ def main():
     Main execution flow for training.
 
     Pipeline:
-    1. Load TFRecords from Kaggle dataset
+    1. Load .pt tensor shards from Kaggle dataset
     2. Train model with early stopping and LR scheduling
     3. Save weights and metrics
     4. Generate evaluation plots
@@ -589,45 +643,47 @@ def main():
         'n_samples': 4096,
         'learning_rate': 0.0001,
         'dropout_rate': 0.5,
+        'weight_decay': 1e-4,
         'epochs': 50,
         'batch_size': 64 if has_gpu else 32,
     }
 
     # ========== SETUP PATHS ==========
     print("="*60)
-    print("SETUP (TFRECORD MODE)")
+    print("SETUP (TENSOR MODE)")
     print("="*60)
 
     output_dir = get_output_dir()
     print(f"Output directory: {output_dir}")
     print(f"Environment: {'Kaggle' if is_kaggle() else 'Local'}")
-    print("Mode: TFRECORD (preprocessed data)")
+    print("Mode: TENSOR (preprocessed data)")
 
-    # find TFRecord file (external drive first, then project, then Kaggle)
-    tfrecord_candidates = [
-        Path("D:/Programming/g2net-preprocessed/train.tfrecord"),
-        output_dir / "tfrecords" / "train.tfrecord",
-        Path("/kaggle/input/g2net-preprocessed-tfrecords/train.tfrecord"),
+    # find data directory containing shards or train.pt
+    data_dir_candidates = [
+        Path("D:/Programming/g2net-preprocessed"),
+        output_dir / "tensors",
+        Path("/kaggle/input/g2net-preprocessed-tfrecords"),
     ]
 
-    tfrecord_path = None
-    for candidate in tfrecord_candidates:
-        if candidate.exists():
-            tfrecord_path = candidate
+    data_dir = None
+    for candidate in data_dir_candidates:
+        if candidate.exists() and (
+            list(candidate.glob("shard_*.pt")) or (candidate / "train.pt").exists()
+        ):
+            data_dir = candidate
             break
 
-    if tfrecord_path is None:
+    if data_dir is None:
         raise FileNotFoundError(
-            "TFRecord file not found. Expected at one of:\n" +
-            "\n".join(f"  - {p}" for p in tfrecord_candidates)
+            "Tensor data not found. Expected shard_*.pt or train.pt in one of:\n" +
+            "\n".join(f"  - {p}" for p in data_dir_candidates)
         )
 
-    print(f"TFRecord file: {tfrecord_path}")
+    print(f"Data directory: {data_dir}")
 
     # load metadata to get sample count
-    metadata_path = tfrecord_path.parent / "metadata.json"
+    metadata_path = data_dir / "metadata.json"
     if metadata_path.exists():
-        import json
         with open(metadata_path) as f:
             metadata = json.load(f)
         n_samples = metadata['n_samples']
@@ -640,8 +696,8 @@ def main():
     print(f"Models directory: {models_dir}")
 
     # ========== TRAIN MODEL ==========
-    results = train_from_tfrecords(
-        tfrecord_path,
+    results = train_from_tensors(
+        data_dir,
         n_samples,
         hyperparameters=HYPERPARAMETERS,
         val_split=0.2
@@ -666,7 +722,8 @@ def main():
     saved_plots = generate_plots(
         results,
         models_dir,
-        saved_paths['base_name']
+        saved_paths['base_name'],
+        results['device']
     )
 
     # ========== SUMMARY ==========
