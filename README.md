@@ -12,6 +12,8 @@ So I decided to phase the development. I would build a "normal" Neural Network, 
 
 If you're interested, I included a markdown file ([THE_SCIENCE.md](THE_SCIENCE.md)) explaining detector Physics, the pre-processing pipeline, and the full description of the Neural Network as it is right now. Additionally, if you want to jump straight to the fun, there are two Jupyter notebooks you can interact with to explore the dataset ([01_data_exploration.ipynb](notebooks/01_data_exploration.ipynb)), and to play with the model ([02_model_explorer.ipynb](notebooks/02_model_explorer.ipynb)). Future development plans are in [next-steps.md](next-steps.md). For a visual overview of the preprocessing and training pipeline, check out [PIPELINE.md](PIPELINE.md).
 
+The main branch uses TensorFlow. A PyTorch implementation is in active development on the 'pytorch' branch, motivated by the need for flexible custom loss computation in the planned physics-informed extensions.
+
 ## Architecture
 
 ```
