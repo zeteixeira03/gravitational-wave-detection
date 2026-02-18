@@ -1,6 +1,8 @@
 # Gravitational Wave Detection with Neural Networks
 
-A 1D Convolutional Neural Network for binary classification of gravitational wave signals in LIGO/Virgo detector noise, built from scratch in TensorFlow.
+A 1D Convolutional Neural Network for binary classification of gravitational wave signals in LIGO/Virgo detector noise, built from scratch.
+
+The main branch uses TensorFlow. A PyTorch implementation is in active development on the `pytorch` branch, motivated by the need for flexible custom loss computation in the planned physics-informed extensions.
 
 ## About This Project
 
@@ -34,6 +36,16 @@ Input (3 detectors x 4096 samples)
 | Conv2 | 64      | 32          | 4         |
 | Conv3 | 128     | 16          | 4         |
 | Conv4 | 256     | 8           | 4         |
+
+## Current Performance
+
+| Accuracy | AUC | Precision | Recall | F1 |
+|----------|-----|-----------|--------|----|
+| 0.784 | 0.854 | 0.847 | 0.688 | 0.759 |
+
+<p align="center"><img src="assets/dashboard.png" width="700"></p>
+
+The model overfits after ~5 epochs (visible in the learning curves), and recall lags behind precision — it's conservative, missing about 31% of real signals. Improving generalization and recall are the current priorities.
 
 ## Installation
 
