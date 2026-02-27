@@ -2,7 +2,7 @@
 
 A 1D Convolutional Neural Network for binary classification of gravitational wave signals in LIGO/Virgo detector noise, built from scratch.
 
-The main branch uses TensorFlow. A PyTorch implementation is in active development on the `pytorch` branch, motivated by the need for flexible custom loss computation in the planned physics-informed extensions.
+This branch uses PyTorch. It builds on an earlier TensorFlow implementation preserved on the `tensorflow` branch.
 
 ## About This Project
 
@@ -55,7 +55,7 @@ pip install -r requirements.txt
 
 Requires Python 3.8+. 
 
-**Dependencies**: TensorFlow, NumPy, SciPy, pandas, scikit-learn, matplotlib, tqdm.
+**Dependencies**: PyTorch, NumPy, SciPy, pandas, scikit-learn, matplotlib, tqdm.
 
 **Dataset**: [G2Net Gravitational Wave Detection](https://www.kaggle.com/c/g2net-gravitational-wave-detection) on Kaggle. For local exploration, set `G2NET_DATASET_PATH` or place the dataset in `data/g2net-gravitational-wave-detection/`.
 
@@ -67,19 +67,19 @@ Requires Python 3.8+.
 python src/data/compute_psd.py
 ```
 
-Computes the average noise Power Spectral Density from noise-only samples and saves it to `avg_psd.npz`. Required before creating TFRecords or training locally.
+Computes the average noise Power Spectral Density from noise-only samples and saves it to `avg_psd.npz`. Required before creating tensor shards or training locally.
 
 ### 2. Train on Kaggle
 
-Training runs on Kaggle's GPU. Preprocess the dataset into TFRecords locally, upload them alongside the source code as Kaggle datasets, and push the training kernel.
+Training runs on Kaggle's GPU. Preprocess the dataset into tensor shards locally, upload them alongside the source code as Kaggle datasets, and push the training kernel.
 
 ```bash
-# one-time: preprocess into TFRecords
-python src/data/create_tfrecords.py --input <path-to-dataset> --output <path-to-output>
+# one-time: preprocess into tensor shards
+python src/data/create_tensors.py --input <path-to-dataset> --output <path-to-output>
 
 # upload source code and preprocessed data
 kaggle datasets version -p src -m "update" --dir-mode zip
-kaggle datasets version -p <tfrecords-path> -m "update"
+kaggle datasets version -p <tensors-path> -m "update"
 
 # run training and pull results
 kaggle kernels push -p kaggle
@@ -96,7 +96,7 @@ For local training: `python src/model_runs.py`. You need to have the full datase
 │   │   ├── g2net.py              # Dataset loading
 │   │   ├── preprocessing.py      # Signal preprocessing (whitening, filtering)
 │   │   ├── compute_psd.py        # PSD computation (run once before training)
-│   │   ├── create_tfrecords.py   # TFRecord generation for Kaggle
+│   │   ├── create_tensors.py     # Tensor shard generation for Kaggle
 │   │   └── download_data.py      # Dataset download helper
 │   ├── models/
 │   │   └── diy_model.py          # 1D CNN implementation

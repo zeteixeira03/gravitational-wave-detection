@@ -7,16 +7,16 @@
 │                           ONE-TIME LOCAL PREPROCESSING                       │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│   Raw G2Net Data (70GB)          create_tfrecords.py                        │
-│   D:/Programming/g2net-...  ──────────────────────────►  TFRecords (18GB)   │
+│   Raw G2Net Data (70GB)          create_tensors.py                          │
+│   D:/Programming/g2net-...  ──────────────────────────►  Tensor shards      │
 │                                                          D:/Programming/     │
 │   For each sample:                                       g2net-preprocessed/ │
-│   1. Load .npy file                                      ├── train.tfrecord  │
-│   2. Bandpass filter (20-500 Hz)                         ├── avg_psd.npz     │
-│   3. Whiten using avg_psd                                └── metadata.json   │
-│   4. Tukey window                                                            │
-│   5. Normalize                                                               │
-│   6. Serialize to TFRecord                                                   │
+│   1. Load .npy file                                      ├── shard_00.pt    │
+│   2. Bandpass filter (20-500 Hz)                         ├── shard_01.pt    │
+│   3. Whiten using avg_psd                                ├── ...            │
+│   4. Tukey window                                        ├── avg_psd.npz    │
+│   5. Normalize                                           └── metadata.json  │
+│   6. Serialize to .pt shard (torch.save)                                    │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
@@ -29,19 +29,20 @@
 │   Kaggle Input Datasets:                                                    │
 │   ├── /kaggle/input/gw-src-code/           (your src/ code)                 │
 │   └── /kaggle/input/g2net-preprocessed-tfrecords/                           │
-│       └── train.tfrecord                   (preprocessed signals)           │
+│       └── shard_*.pt                       (preprocessed signals)           │
 │                                                                             │
 │   kaggle/train.py                                                           │
 │        │                                                                    │
 │        ▼                                                                    │
-│   main()  ───────►  train_from_tfrecords()  ───────►  DIYModel              │
+│   main()  ───────►  train_from_tensors()  ───────►  DIYModel               │
 │        │                       │                           │                │
-│        │                       │ tf.data.TFRecordDataset   │ 1D CNN         │
-│        │                       │ (fast sequential read)    │ 4 conv blocks  │
-│        │                       ▼                           │ GeM pooling    │
-│        │                    fit()                          │ 3 FC layers    │
-│        │                       │                           ▼                │
-│        │                       │ - Early stopping          Trained Weights  │
+│        │                       │ GWTensorDataset           │ 1D CNN         │
+│        │                       │ + DataLoader              │ 4 conv blocks  │
+│        │                       │ (shard streaming)         │ GeM pooling    │
+│        │                       ▼                           │ 2 FC layers    │
+│        │                    fit()                          ▼                │
+│        │                       │                      Trained Weights       │
+│        │                       │ - Early stopping                           │
 │        │                       │ - LR scheduling                            │
 │        │                       │ - Best weights restore                     │
 │        │                       ▼                                            │
@@ -49,7 +50,7 @@
 │        │                       │                                            │
 │        ▼                       ▼                                            │
 │   /kaggle/working/models/saved/                                             │
-│   ├── diy_YYYYMMDD_HHMM_weights.npz                                         │
+│   ├── diy_YYYYMMDD_HHMM_weights.pt                                          │
 │   ├── diy_YYYYMMDD_HHMM_config.json                                         │
 │   ├── diy_YYYYMMDD_HHMM_metrics.json                                        │
 │   └── plots/                                                                │
@@ -66,7 +67,7 @@
 | Data | Size |
 |------|------|
 | Raw G2Net dataset | ~70 GB |
-| Preprocessed TFRecords | ~18 GB |
+| Preprocessed tensor shards | ~2.4 GB/shard |
 | avg_psd.npz | ~45 KB |
 | Model weights | ~4 MB |
 | src/ code (zipped) | ~150 KB |
