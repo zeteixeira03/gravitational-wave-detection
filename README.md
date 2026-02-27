@@ -2,7 +2,7 @@
 
 A 1D Convolutional Neural Network for binary classification of gravitational wave signals in LIGO/Virgo detector noise, built from scratch.
 
-The main branch uses TensorFlow. A PyTorch implementation is in active development on the `pytorch` branch, motivated by the need for flexible custom loss computation in the planned physics-informed extensions.
+This is the original TensorFlow implementation of the project, preserved as a historical reference. Active development has moved to the `main` branch, which is a PyTorch reimplementation that builds on this foundation.
 
 ## About This Project
 
