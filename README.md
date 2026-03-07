@@ -41,7 +41,7 @@ Input (3 detectors x 4096 samples)
 
 | Accuracy | AUC | Precision | Recall | F1 |
 |----------|-----|-----------|--------|----|
-| 0.784 | 0.854 | 0.847 | 0.688 | 0.759 |
+| 0.788 | 0.858 | 0.905 | 0.641 | 0.750 |
 
 <p align="center"><img src="assets/dashboard.png" width="700"></p>
 
