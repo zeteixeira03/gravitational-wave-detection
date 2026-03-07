@@ -45,7 +45,7 @@ Input (3 detectors x 4096 samples)
 
 <p align="center"><img src="assets/dashboard.png" width="700"></p>
 
-The model overfits after ~5 epochs (visible in the learning curves), and recall lags behind precision — it's conservative, missing about 31% of real signals. Improving generalization and recall are the current priorities.
+Early overfitting has been fixed by adding time shifts, Gaussian noise injection, and mixup augmentation. The model is still quite conservative, with precision outpacing recall (0.91 vs 0.64 at the default threshold). Improving recall is the current priority.
 
 ## Installation
 

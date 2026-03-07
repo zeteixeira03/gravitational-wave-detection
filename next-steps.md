@@ -6,39 +6,23 @@ This document tracks planned improvements across three phases: fixing training d
 
 ## Phase 1: Optimization
 
-The model currently plateaus at 78.5% accuracy with signs of early overfitting. The priority is to fix training dynamics before adding complexity.
-
-### The Problem
-
-1. Validation loss bottoms at epoch 3: abnormally fast convergence, suggesting the model finds local patterns but fails to generalize
-2. Training loss continues dropping after validation diverges, meaning the model has capacity to learn more, but memorizes instead of generalizing
-3. No data augmentation: the model sees identical samples each epoch (of course it will memorize)
-
-The core issue is that the model learns fast, not well.
+The model currently plateaus at ~79% accuracy. It's quite conservative (symmetric BCE + mixup soft labels discourage confident positive
+predictions), resulting in high false-negative rates. Training dynamics have been fixed. Current priority is improving recall before adding complexity.
 
 ### Data Augmentation
 
-The pipeline has zero data augmentation. This is the single biggest lever for improvement.
+The pipeline has some data augmentation, and this has produced good results in fixing early overfitting. As of now, time shift, Gaussian noise, and mixup have been implemented. The rest are saved in case they're needed further down the line.
 
 | Technique | Rationale | Implementation |
 |---|---|---|
-| Time shift | GW signals arrive at different times at each detector (up to ~10ms offset); shifting is label-preserving | Random offset of 0-20 samples per detector |
-| Gaussian noise | Detector noise varies between observations; small noise injection builds robustness | Add noise with std = 0.01-0.1 of signal std |
 | Amplitude scaling | GW amplitude varies with source distance; scaling preserves signal structure | Scale by factor 0.8-1.2 |
-| Mixup | Interpolates training pairs to create virtual samples; proven for time-series (Farhadi et al., 2023) | $$x_{new} = \lambda \cdot x_1 + \frac{1 - \lambda}{x_2}, \lambda \sim Beta(0.2, 0.2)$$ |
 | Channel dropout | Zeroing one detector forces the model to not over-rely on any single channel | Set one of 3 channels to zero with p=0.1 |
-| SpecAugment masking | Masks time/frequency regions; forces distributed feature learning (Owusu et al., 2025) | Random rectangular masks in time domain |
-
-Priority: time shift + Gaussian noise first, then Mixup.
 
 ### Training Dynamics
 
-| Change | Rationale | Current -> Planned |
-|---|---|---|
-| LR warmup | Prevents early aggressive updates pushing into poor local minima | None -> 3-5 epoch linear warmup (1e-6 to 1e-4) |
-| Cosine annealing | Smoother decay than step reduction | ReduceLROnPlateau -> CosineAnnealing |
-| Lower initial LR | Current 1e-4 may be too high (model converges in 3 epochs) | 1e-4 -> 5e-5 or 3e-5 |
-| Early stopping patience | With better regularization, model needs more epochs | 5 -> 10-15 |
+Early overfitting has been mostly solved by adding time shifts, Gaussian noise injection, and mixup augmentation. The current issue is that the model has been stuck at ~79%/AUC 0.858 despite the improvements. This suggests it's picking up a local minimum and struggling to escape it.
+
+The current learning rate scheduling works in only one direction: once loss plateaus, it reduces and stays reduced. Cosine annealing is a technique which can be used to combat this problem. The learning rate will periodically increase to allow the model to escape the local minimum. The cosine cycle should start after warmup completes to avoid the two schedulers conflicting. If cosine annealing doesn't move the needle, the plateau is likely an architecture ceiling rather than an optimization issue, and Phase 2 is the answer.
 
 ### Regularization
 
@@ -54,26 +38,25 @@ Priority: time shift + Gaussian noise first, then Mixup.
 |---|---|
 | Reduce model capacity | 2.5M params may be excessive; try halving filter counts |
 | Add skip connections | To preserve input information (Nair et al., 2023) |
-| Replace GeM with global average pooling | Simpler pooling may reduce overfitting |
+| Replace GeM with global average pooling | Simpler pooling reduces model complexity |
 
 ### Implementation Order
 
 **Step 1** (highest impact, lowest effort):
-- Time shift + Gaussian noise augmentation
-- LR warmup (5 epochs)
-- Early stopping patience -> 10
+- Time shift + Gaussian noise augmentation (done)
+- LR warmup (5 epochs) (done)
+- Early stopping patience -> 10 (done)
 
-**Step 2** (if overfitting persists):
-- Mixup augmentation
+**Step 2** (if plateau persists after Step 1):
+- Mixup augmentation (done)
 - Label smoothing (0.1)
-- Reduce LR to 5e-5, increase weight decay to 5e-4
+- Reduce LR to 5e-5, increase weight decay to 5e-4 (done)
 
-**Step 3** (if still overfitting):
+**Step 3** (if plateau persists after Step 2):
 - Conv layer dropout
 - Reduce model capacity
-- Cosine annealing LR
 
-Expected outcome from Step 1: training extends to 15-25 epochs, accuracy improves to 82-84%, train/val loss gap shrinks from 0.28 to <0.1.
+Expected outcome from Step 1: training extends to 15-25 epochs (confirmed), accuracy improves to ~80%, train/val loss gap shrinks from 0.28 to <0.1 (confirmed).
 
 ---
 
@@ -91,9 +74,11 @@ This forces each branch to maintain individually discriminative features, preven
 
 ### Phase 2b: GNN Aggregation Head
 
-The current classifier concatenates the three detector feature vectors into a flat 768-d vector and passes it through FC layers. This is permutation-sensitive and treats cross-detector relationships as something the FC layers must discover implicitly.
+The current classifier concatenates the three detector feature vectors into a flat 768-d vector and passes it through FC layers. This is permutation-sensitive: the model can in principle learn to treat detector 0 differently from detector 1 for no physical reason, since detector labelling is arbitrary. The physics is invariant to which detector is called H1, L1, or V1.
 
-The replacement: a small graph where each detector is a node (256-d features) and each edge encodes the physical relationship between that detector pair. Edge features are computed from the whitened signals before pooling:
+The replacement is a permutation-invariant aggregation via a small graph, where each detector is a node (256-d features) and messages are passed symmetrically between all pairs. Because message passing treats all nodes equivalently by construction, the aggregated representation is invariant to detector relabelling -- the symmetry group S₃ acting on the detector set is respected by design rather than left for the FC layers to discover from data.
+
+Edge features encode the physical relationship between each detector pair, computed from the whitened signals before pooling:
 
 - Cross-correlation peak value between the pair
 - Peak lag (in samples)

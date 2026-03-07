@@ -47,22 +47,56 @@ np.random.seed(SEED)
 # =====================================================================
 
 class GWTensorDataset(Dataset):
-    """Wraps signal and label tensors for DataLoader."""
+    """Wraps signal and label tensors for DataLoader"""
 
-    def __init__(self, signals: torch.Tensor, labels: torch.Tensor):
+    def __init__(self, signals: torch.Tensor, labels: torch.Tensor, augment: bool = False):
         self.signals = signals
         self.labels = labels
+        self.augment = augment
 
     def __len__(self) -> int:
         return len(self.labels)
 
     def __getitem__(self, idx: int):
-        return self.signals[idx], self.labels[idx]
+        x = self.signals[idx].clone()
+        if self.augment:
+            # time shift: roll each detector independently by 0-20 samples
+            for ch in range(x.shape[0]):
+                shift = int(torch.randint(0, 21, (1,)).item())
+                x[ch] = torch.roll(x[ch], shift)
+            # gaussian noise: scale relative to signal amplitude
+            noise_scale = (0.01 + 0.09 * torch.rand(1).item()) * x.std().item()
+            x = x + torch.randn_like(x) * noise_scale
+        return x, self.labels[idx]
 
 
 # =====================================================================
 #                         TRAINING LOOP
 # =====================================================================
+
+def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.2) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply mixup to a batch.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input signals of shape (batch, channels, time).
+    y : torch.Tensor
+        Labels of shape (batch, 1), may be soft.
+    alpha : float
+        Beta distribution concentration parameter.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        Mixed signals and soft labels.
+    """
+    lam = float(torch.distributions.Beta(alpha, alpha).sample())
+    perm = torch.randperm(x.size(0), device=x.device)
+    # beta distribution
+    return lam * x + (1 - lam) * x[perm], lam * y + (1 - lam) * y[perm]
+
 
 def fit(
     model,
@@ -73,10 +107,12 @@ def fit(
     epochs,
     batch_size,
     verbose=True,
-    early_stopping_patience=5,
+    early_stopping_patience=10,
     lr_reduce_patience=3,
     lr_reduce_factor=0.5,
     min_lr=1e-6,
+    warmup_epochs=0,
+    warmup_start_lr=1e-6,
 ):
     """
     Train model by streaming shards from disk.
@@ -111,6 +147,10 @@ def fit(
         Factor to multiply LR by when reducing
     min_lr : float
         Minimum learning rate
+    warmup_epochs : int
+        Number of epochs for linear LR warmup; 0 disables warmup
+    warmup_start_lr : float
+        Starting LR for warmup (linearly increases to the optimizer's initial LR)
 
     Returns
     -------
@@ -131,8 +171,15 @@ def fit(
     best_state = None
     epochs_without_improvement = 0
     n_shards = len(train_shard_paths)
+    target_lr = optimizer.param_groups[0]['lr']
 
     for epoch in range(epochs):
+        # linear LR warmup
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            warmup_lr = warmup_start_lr + (target_lr - warmup_start_lr) * (epoch + 1) / warmup_epochs
+            for pg in optimizer.param_groups:
+                pg['lr'] = warmup_lr
+
         # ---- training ----
         model.train()
         epoch_losses = []
@@ -145,7 +192,7 @@ def fit(
         for shard_num, shard_idx in enumerate(shard_order):
             shard_path = train_shard_paths[shard_idx]
             data = torch.load(str(shard_path), weights_only=True)
-            shard_dataset = GWTensorDataset(data['signals'], data['labels'])
+            shard_dataset = GWTensorDataset(data['signals'], data['labels'], augment=True)
             shard_loader = DataLoader(
                 shard_dataset, batch_size=batch_size, shuffle=True,
                 num_workers=0, pin_memory=(device.type == 'cuda')
@@ -159,6 +206,7 @@ def fit(
             for X_batch, y_batch in pbar:
                 X_batch = X_batch.to(device)
                 y_batch = y_batch.float().unsqueeze(1).to(device)
+                X_batch, y_batch = mixup_batch(X_batch, y_batch)
 
                 optimizer.zero_grad()
                 predictions = model(X_batch)
@@ -205,8 +253,9 @@ def fit(
         history['val_acc'].append(val_acc)
         history['train_acc'].append(train_acc)
 
-        # LR scheduling
-        scheduler.step(val_loss)
+        # LR scheduling (skip during warmup to avoid premature reduction)
+        if epoch >= warmup_epochs:
+            scheduler.step(val_loss)
 
         # check for improvement
         if val_loss < best_val_loss:
@@ -455,6 +504,8 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     weight_decay = hyperparameters.get('weight_decay', 1e-4)
     epochs = hyperparameters.get('epochs', 15)
     batch_size = hyperparameters.get('batch_size', 128)
+    early_stopping_patience = hyperparameters.get('early_stopping_patience', 10)
+    warmup_epochs = hyperparameters.get('warmup_epochs', 0)
 
     print(f"Signal length: {n_samples_config}")
     print(f"Learning rate: {learning_rate}")
@@ -462,6 +513,8 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     print(f"Weight decay: {weight_decay}")
     print(f"Epochs: {epochs}")
     print(f"Batch size: {batch_size}")
+    print(f"Early stopping patience: {early_stopping_patience}")
+    print(f"Warmup epochs: {warmup_epochs}")
     print(f"Total samples: {n_samples}")
     print("Mode: TENSOR (preprocessed data, shard streaming)")
 
@@ -559,7 +612,9 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
         model, train_shard_paths, val_loader, optimizer, device,
         epochs=epochs,
         batch_size=batch_size,
-        verbose=True
+        verbose=True,
+        early_stopping_patience=early_stopping_patience,
+        warmup_epochs=warmup_epochs,
     )
 
     print("\nTraining complete.")
@@ -641,11 +696,13 @@ def main():
     # ========== HYPERPARAMETERS ==========
     HYPERPARAMETERS = {
         'n_samples': 4096,
-        'learning_rate': 0.0001,
+        'learning_rate': 5e-5,
         'dropout_rate': 0.5,
-        'weight_decay': 1e-4,
+        'weight_decay': 5e-4,
         'epochs': 50,
         'batch_size': 64 if has_gpu else 32,
+        'early_stopping_patience': 10,
+        'warmup_epochs': 5,
     }
 
     # ========== SETUP PATHS ==========
