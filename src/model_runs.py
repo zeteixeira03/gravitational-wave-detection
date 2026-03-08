@@ -94,8 +94,8 @@ def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.2) -> tuple[t
     """
     lam = float(torch.distributions.Beta(alpha, alpha).sample())
     perm = torch.randperm(x.size(0), device=x.device)
-    # beta distribution
-    return lam * x + (1 - lam) * x[perm], lam * y + (1 - lam) * y[perm]
+
+    return (lam * x + (1 - lam) * x[perm], lam * y + (1 - lam) * y[perm])
 
 
 def fit(
@@ -108,8 +108,6 @@ def fit(
     batch_size,
     verbose=True,
     early_stopping_patience=10,
-    lr_reduce_patience=3,
-    lr_reduce_factor=0.5,
     min_lr=1e-6,
     warmup_epochs=0,
     warmup_start_lr=1e-6,
@@ -141,10 +139,6 @@ def fit(
         Whether to print progress
     early_stopping_patience : int
         Stop training if val_loss doesn't improve for this many epochs
-    lr_reduce_patience : int
-        Reduce LR if val_loss doesn't improve for this many epochs
-    lr_reduce_factor : float
-        Factor to multiply LR by when reducing
     min_lr : float
         Minimum learning rate
     warmup_epochs : int
@@ -157,10 +151,7 @@ def fit(
     dict
         Training history
     """
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=lr_reduce_patience, factor=lr_reduce_factor,
-        min_lr=min_lr
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=min_lr)
 
     history = {
         'train_loss': [], 'train_acc': [],
@@ -180,7 +171,7 @@ def fit(
             for pg in optimizer.param_groups:
                 pg['lr'] = warmup_lr
 
-        # ---- training ----
+        # training
         model.train()
         epoch_losses = []
         train_correct = 0
@@ -227,7 +218,7 @@ def fit(
         train_acc = train_correct / train_total if train_total > 0 else 0.0
         history['train_loss'].append(train_loss)
 
-        # ---- validation ----
+        # validation
         model.eval()
         val_losses = []
         val_correct = 0
@@ -255,7 +246,7 @@ def fit(
 
         # LR scheduling (skip during warmup to avoid premature reduction)
         if epoch >= warmup_epochs:
-            scheduler.step(val_loss)
+            scheduler.step(epoch - warmup_epochs)
 
         # check for improvement
         if val_loss < best_val_loss:
@@ -371,7 +362,7 @@ def save_model_and_metrics(results, hyperparameters, save_dir):
 #                          VISUALIZATION
 # =====================================================================
 
-def generate_plots(results, save_dir, base_name, device, max_plot_samples=10000):
+def generate_plots(results, save_dir, base_name, max_plot_samples=10000):
     """
     Generate evaluation plots after training.
 
@@ -383,8 +374,6 @@ def generate_plots(results, save_dir, base_name, device, max_plot_samples=10000)
         Directory to save plot files
     base_name : str
         Base filename for saved plots
-    device : torch.device
-        Device for inference
     max_plot_samples : int
         Maximum samples to load for plotting
 
@@ -499,10 +488,10 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     print("="*60)
 
     n_samples_config = hyperparameters.get('n_samples', 4096)
-    learning_rate = hyperparameters.get('learning_rate', 0.001)
-    dropout_rate = hyperparameters.get('dropout_rate', 0.3)
+    learning_rate = hyperparameters.get('learning_rate', 0.0001)
+    dropout_rate = hyperparameters.get('dropout_rate', 0.5)
     weight_decay = hyperparameters.get('weight_decay', 1e-4)
-    epochs = hyperparameters.get('epochs', 15)
+    epochs = hyperparameters.get('epochs', 50)
     batch_size = hyperparameters.get('batch_size', 128)
     early_stopping_patience = hyperparameters.get('early_stopping_patience', 10)
     warmup_epochs = hyperparameters.get('warmup_epochs', 0)
@@ -609,7 +598,11 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     print("="*60 + "\n")
 
     history = fit(
-        model, train_shard_paths, val_loader, optimizer, device,
+        model, 
+        train_shard_paths, 
+        val_loader, 
+        optimizer, 
+        device,
         epochs=epochs,
         batch_size=batch_size,
         verbose=True,

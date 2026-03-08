@@ -4,65 +4,63 @@ This document tracks planned improvements across three phases: fixing training d
 
 ---
 
-## Phase 1: Optimization
+## Phase 1: Optimization (concluded)
 
-The model currently plateaus at ~79% accuracy. It's quite conservative (symmetric BCE + mixup soft labels discourage confident positive
-predictions), resulting in high false-negative rates. Training dynamics have been fixed. Current priority is improving recall before adding complexity.
+Phase 1 focused on fixing training dynamics and regularization. After exhausting all optimization-level improvements, the model plateaus at ~79% accuracy / AUC 0.858. The plateau is architectural, not an optimization issue. Phase 2 is the path forward.
 
-### Data Augmentation
+### Results
 
-The pipeline has some data augmentation, and this has produced good results in fixing early overfitting. As of now, time shift, Gaussian noise, and mixup have been implemented. The rest are saved in case they're needed further down the line.
+Each change was tested on the full 560k-sample dataset (80/20 train/val split, Kaggle P100 GPU). Changes were cumulative -- each run includes all previous improvements.
 
-| Technique | Rationale | Implementation |
-|---|---|---|
-| Amplitude scaling | GW amplitude varies with source distance; scaling preserves signal structure | Scale by factor 0.8-1.2 |
-| Channel dropout | Zeroing one detector forces the model to not over-rely on any single channel | Set one of 3 channels to zero with p=0.1 |
+| Run | Date | Change introduced | AUC | Accuracy | Val loss |
+|-----|------|-------------------|-----|----------|----------|
+| 1 | Jan 17 | Baseline (3 epochs, LR 1e-3) | 0.768 | 0.549 | 3.538 |
+| 2 | Jan 26 | LR 1e-4, dropout 0.5, 50 epochs | 0.854 | 0.784 | 0.564 |
+| 3 | Feb 04 | Reproducibility check (same config) | 0.854 | 0.785 | 0.593 |
+| 4 | Feb 16 | + weight decay 1e-4 | 0.852 | 0.781 | 0.714 |
+| 5 | Feb 16 | Re-run | 0.854 | 0.784 | 0.684 |
+| 6 | Mar 02 | + mixup augmentation (alpha=0.2) | 0.859 | 0.791 | 0.447 |
+| 7 | Mar 02 | Re-run | 0.856 | 0.786 | 0.472 |
+| 8 | Mar 03 | + LR warmup (5 epochs) | 0.858 | 0.788 | 0.468 |
+| 9 | Mar 03 | + LR 5e-5, weight decay 5e-4 | 0.858 | 0.788 | 0.459 |
+| 10 | Mar 07 | + cosine annealing (T_0=10) | 0.858 | 0.787 | 0.461 |
 
-### Training Dynamics
+Key observations:
 
-Early overfitting has been mostly solved by adding time shifts, Gaussian noise injection, and mixup augmentation. The current issue is that the model has been stuck at ~79%/AUC 0.858 despite the improvements. This suggests it's picking up a local minimum and struggling to escape it.
+- **Runs 2-5** (LR/dropout/weight decay tuning): AUC stuck at 0.852-0.854. The model was overfitting (train loss ~0.23, val loss ~0.69).
+- **Run 6** (mixup): Best single improvement. AUC jumped to 0.859, and the train-val gap collapsed (0.40 vs 0.45), confirming overfitting was addressed. But val performance barely moved.
+- **Runs 8-10** (warmup, LR reduction, cosine annealing): No measurable improvement. AUC flat at 0.858.
 
-The current learning rate scheduling works in only one direction: once loss plateaus, it reduces and stays reduced. Cosine annealing is a technique which can be used to combat this problem. The learning rate will periodically increase to allow the model to escape the local minimum. The cosine cycle should start after warmup completes to avoid the two schedulers conflicting. If cosine annealing doesn't move the needle, the plateau is likely an architecture ceiling rather than an optimization issue, and Phase 2 is the answer.
+Conclusion: the model fits the training data cleanly but cannot extract more signal. The remaining error is not from poor optimization or overfitting -- it is from the architecture's inability to model cross-detector correlations, which are the primary physical signature of a real gravitational wave.
 
-### Regularization
+### What was implemented
 
-| Parameter | Current | Planned |
-|---|---|---|
-| Dropout | 0.5 in FC layers only | Add 0.1-0.2 to conv layers (Spatial Dropout1D) |
-| Weight decay | 1e-4 | Increase to 5e-4 or 1e-3 |
-| BN momentum | 0.99 | 0.9 for faster adaptation |
+- Time shift augmentation (0-20 samples per detector)
+- Gaussian noise injection (1-10% of signal std)
+- Mixup (alpha=0.2)
+- LR warmup (5 epochs, linear from 1e-6 to target LR)
+- Cosine annealing with warm restarts (T_0=10, eta_min=1e-6)
+- AdamW with weight decay 5e-4
+- Early stopping (patience=10)
 
-### Architecture (if all else is not enough)
+### What was not pursued
 
-| Change | Rationale |
+These remaining Phase 1 ideas were deprioritized because the plateau is architectural:
+
+| Technique | Reason skipped |
 |---|---|
-| Reduce model capacity | 2.5M params may be excessive; try halving filter counts |
-| Add skip connections | To preserve input information (Nair et al., 2023) |
-| Replace GeM with global average pooling | Simpler pooling reduces model complexity |
-
-### Implementation Order
-
-**Step 1** (highest impact, lowest effort):
-- Time shift + Gaussian noise augmentation (done)
-- LR warmup (5 epochs) (done)
-- Early stopping patience -> 10 (done)
-
-**Step 2** (if plateau persists after Step 1):
-- Mixup augmentation (done)
-- Label smoothing (0.1)
-- Reduce LR to 5e-5, increase weight decay to 5e-4 (done)
-
-**Step 3** (if plateau persists after Step 2):
-- Conv layer dropout
-- Reduce model capacity
-
-Expected outcome from Step 1: training extends to 15-25 epochs (confirmed), accuracy improves to ~80%, train/val loss gap shrinks from 0.28 to <0.1 (confirmed).
+| Label smoothing | Mixup already provides soft labels |
+| Conv layer dropout | Overfitting is already solved |
+| Reduced model capacity | Model is not overfitting; fewer params would hurt |
+| Amplitude scaling augmentation | Unlikely to help given the architectural ceiling |
+| Channel dropout augmentation | Conceptually better addressed by Phase 2a (per-branch losses) |
+| Skip connections | Architectural change better suited to Phase 2 scope |
 
 ---
 
-## Phase 2: Architecture and Physics-Informed Training
+## Phase 2: Architecture and Physics-Informed Training (current)
 
-Once training dynamics are healthy, the next step is embedding physical knowledge into both the architecture and the loss function. The current model learns entirely from data. The only physics it has is what's baked into the architecture (shared detector weights) and preprocessing. Changes are introduced one at a time, with ablation studies to measure individual impact. If a change degrades performance, it gets removed.
+Training dynamics are healthy (Phase 1 confirmed). The next step is embedding physical knowledge into both the architecture and the loss function. The current model learns entirely from data. The only physics it has is what's baked into the architecture (shared detector weights) and preprocessing. Changes are introduced one at a time, with ablation studies to measure individual impact. If a change degrades performance, it gets removed.
 
 ### Phase 2a: Auxiliary Per-Branch Losses
 
