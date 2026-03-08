@@ -111,6 +111,7 @@ def fit(
     min_lr=1e-6,
     warmup_epochs=0,
     warmup_start_lr=1e-6,
+    aux_loss_weight=0.0,
 ):
     """
     Train model by streaming shards from disk.
@@ -145,6 +146,8 @@ def fit(
         Number of epochs for linear LR warmup; 0 disables warmup
     warmup_start_lr : float
         Starting LR for warmup (linearly increases to the optimizer's initial LR)
+    aux_loss_weight : float
+        Weight for auxiliary per-branch losses (Phase 2a). 0 disables.
 
     Returns
     -------
@@ -200,8 +203,8 @@ def fit(
                 X_batch, y_batch = mixup_batch(X_batch, y_batch)
 
                 optimizer.zero_grad()
-                predictions = model(X_batch)
-                loss = model.compute_loss(y_batch, predictions)
+                predictions, branch_preds = model(X_batch)
+                loss = model.compute_loss(y_batch, predictions, branch_preds, aux_loss_weight)
                 loss.backward()
                 optimizer.step()
 
@@ -495,6 +498,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     batch_size = hyperparameters.get('batch_size', 128)
     early_stopping_patience = hyperparameters.get('early_stopping_patience', 10)
     warmup_epochs = hyperparameters.get('warmup_epochs', 0)
+    aux_loss_weight = hyperparameters.get('aux_loss_weight', 0.0)
 
     print(f"Signal length: {n_samples_config}")
     print(f"Learning rate: {learning_rate}")
@@ -504,6 +508,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     print(f"Batch size: {batch_size}")
     print(f"Early stopping patience: {early_stopping_patience}")
     print(f"Warmup epochs: {warmup_epochs}")
+    print(f"Aux loss weight: {aux_loss_weight}")
     print(f"Total samples: {n_samples}")
     print("Mode: TENSOR (preprocessed data, shard streaming)")
 
@@ -608,6 +613,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
         verbose=True,
         early_stopping_patience=early_stopping_patience,
         warmup_epochs=warmup_epochs,
+        aux_loss_weight=aux_loss_weight,
     )
 
     print("\nTraining complete.")
@@ -696,6 +702,7 @@ def main():
         'batch_size': 64 if has_gpu else 32,
         'early_stopping_patience': 10,
         'warmup_epochs': 5,
+        'aux_loss_weight': 0.2,
     }
 
     # ========== SETUP PATHS ==========
@@ -773,7 +780,6 @@ def main():
         results,
         models_dir,
         saved_paths['base_name'],
-        results['device']
     )
 
     # ========== SUMMARY ==========

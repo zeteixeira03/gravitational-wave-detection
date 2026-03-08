@@ -10,13 +10,13 @@ Phase 1 focused on fixing training dynamics and regularization. After exhausting
 
 ### Results
 
-Each change was tested on the full 560k-sample dataset (80/20 train/val split, Kaggle P100 GPU). Changes were cumulative -- each run includes all previous improvements.
+Each change was tested on the full 560k-sample dataset (80/20 train/val split, Kaggle P100 GPU). Changes were cumulative, i.e.each run includes all previous improvements.
 
 | Run | Date | Change introduced | AUC | Accuracy | Val loss |
 |-----|------|-------------------|-----|----------|----------|
 | 1 | Jan 17 | Baseline (3 epochs, LR 1e-3) | 0.768 | 0.549 | 3.538 |
 | 2 | Jan 26 | LR 1e-4, dropout 0.5, 50 epochs | 0.854 | 0.784 | 0.564 |
-| 3 | Feb 04 | Reproducibility check (same config) | 0.854 | 0.785 | 0.593 |
+| 3 | Feb 04 | Re-run | 0.854 | 0.785 | 0.593 |
 | 4 | Feb 16 | + weight decay 1e-4 | 0.852 | 0.781 | 0.714 |
 | 5 | Feb 16 | Re-run | 0.854 | 0.784 | 0.684 |
 | 6 | Mar 02 | + mixup augmentation (alpha=0.2) | 0.859 | 0.791 | 0.447 |
@@ -31,15 +31,15 @@ Key observations:
 - **Run 6** (mixup): Best single improvement. AUC jumped to 0.859, and the train-val gap collapsed (0.40 vs 0.45), confirming overfitting was addressed. But val performance barely moved.
 - **Runs 8-10** (warmup, LR reduction, cosine annealing): No measurable improvement. AUC flat at 0.858.
 
-Conclusion: the model fits the training data cleanly but cannot extract more signal. The remaining error is not from poor optimization or overfitting -- it is from the architecture's inability to model cross-detector correlations, which are the primary physical signature of a real gravitational wave.
+Conclusion: the model fits the training data cleanly but cannot extract more signal. We can now conclude that the remaining error is not from poor optimization or overfitting. Rather, it is (primarily) from the architecture's inability to model cross-detector correlations, which are the primary physical signature of a real gravitational wave.
 
 ### What was implemented
 
 - Time shift augmentation (0-20 samples per detector)
 - Gaussian noise injection (1-10% of signal std)
-- Mixup (alpha=0.2)
+- Mixup ($\alpha=0.2$)
 - LR warmup (5 epochs, linear from 1e-6 to target LR)
-- Cosine annealing with warm restarts (T_0=10, eta_min=1e-6)
+- Cosine annealing with warm restarts ($T_0$=10, $\eta_{min}$=1e-6)
 - AdamW with weight decay 5e-4
 - Early stopping (patience=10)
 
@@ -68,7 +68,9 @@ The current model has no supervision of individual detector representations, i.e
 
 $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{BCE}}(\text{combined}) + \lambda \sum_{i} \mathcal{L}_{\text{BCE}}(\text{detector}_i)$$
 
-This forces each branch to maintain individually discriminative features, preventing any single detector from carrying the entire signal. Use a small λ (~0.1--0.3) since individual branches cannot reliably classify at low SNR (soft constraint).
+This forces each branch to maintain individually discriminative features, preventing any single detector from carrying the entire signal. $\lambda$ should be small (~0.1--0.3) since individual branches cannot reliably classify at low SNR (soft constraint).
+
+**Result ($\lambda$=0.2):** AUC 0.857, accuracy 0.780 -- no improvement over baseline. The per-branch supervision did not unlock new capacity, confirming the bottleneck is not weak per-detector features but the fusion step that combines them. The auxiliary heads remain in the model as a diagnostic tool (individual branch AUCs can be checked after training) but do not contribute to performance.
 
 ### Phase 2b: GNN Aggregation Head
 

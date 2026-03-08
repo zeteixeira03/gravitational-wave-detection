@@ -54,8 +54,9 @@ class DIYModel(nn.Module):
 
     Architecture:
     - Shared 1D conv layers process each detector independently
+    - Auxiliary per-branch heads supervise individual detector features (Phase 2a)
     - Features concatenated and passed through dense classifier
-    - Loss: Binary Cross-Entropy
+    - Loss: Binary Cross-Entropy + weighted auxiliary per-branch BCE
     - Optimizer: AdamW (configured externally in model_runs.py)
 
     Input shape: (batch_size, 3, 4096) - 3 detectors, 4096 time samples
@@ -99,6 +100,12 @@ class DIYModel(nn.Module):
 
         # GeM pooling
         self.gem_pool = GeMPool1d(p=3.0)
+
+        # auxiliary per-branch classification heads (Phase 2a)
+        self.branch_head = nn.Sequential(
+            nn.Linear(256, 1),
+            nn.Sigmoid(),
+        )
 
         # classifier head: 256 features per detector * 3 detectors = 768
         self.classifier = nn.Sequential(
@@ -149,7 +156,7 @@ class DIYModel(nn.Module):
         x = self.gem_pool(x)
         return x
 
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
+    def forward(self, X: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Perform a forward pass through the network.
 
@@ -160,8 +167,9 @@ class DIYModel(nn.Module):
 
         Returns
         -------
-        torch.Tensor
-            Output predictions of shape (batch_size, 1) with sigmoid applied.
+        torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]
+            During inference: output predictions of shape (batch_size, 1).
+            During training: tuple of (main predictions, list of 3 branch predictions).
         """
         # split detectors: X shape is (batch, 3, 4096)
         h1 = X[:, 0, :]  # (batch, 4096)
@@ -177,28 +185,58 @@ class DIYModel(nn.Module):
         combined = torch.cat([h1_feat, l1_feat, v1_feat], dim=-1)  # (batch, 768)
 
         # classifier head
-        return self.classifier(combined)
+        main_pred = self.classifier(combined)
 
-    def compute_loss(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            branch_preds = [
+                self.branch_head(h1_feat),
+                self.branch_head(l1_feat),
+                self.branch_head(v1_feat),
+            ]
+            return main_pred, branch_preds
+
+        return main_pred
+
+    def _bce(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+        """Compute binary cross-entropy between y_true and y_pred."""
+        epsilon = 1e-7
+        y_pred = y_pred.clamp(epsilon, 1 - epsilon)
+        bce = -(y_true * torch.log(y_pred) + (1 - y_true) * torch.log(1 - y_pred))
+        return bce.mean()
+
+    def compute_loss(
+        self,
+        y_true: torch.Tensor,
+        y_pred: torch.Tensor,
+        branch_preds: list[torch.Tensor] | None = None,
+        aux_loss_weight: float = 0.0,
+    ) -> torch.Tensor:
         """
-        Compute binary cross-entropy loss.
+        Compute total loss: main BCE + weighted auxiliary per-branch BCE.
 
         Parameters
         ----------
         y_true : torch.Tensor
             True labels of shape (batch_size, 1).
         y_pred : torch.Tensor
-            Predicted probabilities of shape (batch_size, 1).
+            Main predicted probabilities of shape (batch_size, 1).
+        branch_preds : list[torch.Tensor] | None
+            Per-detector predictions, each of shape (batch_size, 1).
+        aux_loss_weight : float
+            Weight for auxiliary branch losses (lambda). 0 disables.
 
         Returns
         -------
         torch.Tensor
             Scalar loss value.
         """
-        epsilon = 1e-7
-        y_pred = y_pred.clamp(epsilon, 1 - epsilon)
-        bce = -(y_true * torch.log(y_pred) + (1 - y_true) * torch.log(1 - y_pred))
-        return bce.mean()
+        main_loss = self._bce(y_true, y_pred)
+
+        if branch_preds is not None and aux_loss_weight > 0:
+            aux_loss = sum(self._bce(y_true, bp) for bp in branch_preds) / len(branch_preds)
+            return main_loss + aux_loss_weight * aux_loss
+
+        return main_loss
 
     @torch.no_grad()
     def predict_proba(self, X: np.ndarray, batch_size: int = 256) -> np.ndarray:
