@@ -54,7 +54,7 @@ This still leaves the signal with the thermal noise, as well as the residual tai
 
 These properties motivate computing the average **Power Spectral Density** (PSD):
 
-$$S_n(f) = 2\,\mathbb{E}\!\left[|n(f)|^2\right]$$
+$$S_n(f) = 2\,\mathbb{E}\left[|n(f)|^2\right]$$
 
 estimated by averaging $|n(f)|^2$ over many noise-only samples (those labelled target=0). Using noise-only samples avoids biasing the estimate with signal power, which would inflate the apparent noise floor and reduce the effective SNR after whitening.
 
@@ -92,12 +92,12 @@ A critical design choice is  sharing weights across detectors. All three signals
 
 Each convolutional block follows the sequence: convolution, batch normalization, SiLU activation, max pooling. Four such blocks progressively reduce the 4096-sample input into a compact 256-dimensional feature vector per detector:
 
-| Layer | Filters | Kernel Size | Pool Size |
-|-------|---------|-------------|-----------|
-| Conv1 | 32      | 64          | 4         |
-| Conv2 | 64      | 32          | 4         |
-| Conv3 | 128     | 16          | 4         |
-| Conv4 | 256     | 8           | 4         |
+| Layer | Filters | Kernel Size | Pool Size | Input Size (time steps × channels)| Output Size (time steps × channels) |
+|-------|---------|-------------|-----------|-----------------------------------|-------------------------------------|
+| Conv1 | 32      | 64          | 4         | 4096 x 1                          | 1024 x 32                           |
+| Conv2 | 64      | 32          | 4         | 1024 x 32                         | 256 x 64                            |
+| Conv3 | 128     | 16          | 4         | 256 x 64                          | 64 x 128                            |
+| Conv4 | 256     | 8           | 4         | 64 x 128                          | 16 x 256                            |
 
 The first layer uses a kernel of 64 samples , corresponding to $\sim31$ ms of data at 2048 Hz. This is deliberate: gravitational wave chirps from binary mergers have structure on timescales of tens of milliseconds, and a large initial kernel lets the network capture these broad oscillation patterns directly. Subsequent layers use progressively smaller kernels (32, 16, 8) to refine the features, picking up finer temporal details from the patterns already extracted by earlier layers.
 
@@ -109,7 +109,27 @@ where $p$ is a learnable parameter. When $p = 1$, this is average pooling; as $p
 
 With 256 features extracted from each of the three detectors, the vectors are concatenated into a single 768-dimensional representation. This is where the cross-detector correlation from the previous section becomes relevant. Up to this point, each detector was processed in isolation. Now, the classifier head learns to find patterns that span all three feature sets simultaneously. A real gravitational wave produces correlated features across detectors. Noise, being independent, does not. The final sigmoid activation maps the output to a probability between 0 and 1: the model's confidence that a gravitational wave is present.
 
-Training uses binary cross-entropy loss, which is the natural choice for binary classification. It penalizes confident wrong answers more heavily than uncertain ones. AdamW optimization adds weight decay to the parameters, discouraging the network from fitting too closely to the training data. Randomly zeroing a share of neuron activations during training (Dropout) provides additional regularization by forcing the network to learn redundant representations rather than relying on any single feature pathway.
+### Training
+
+The loss function is binary cross-entropy (BCE):
+
+$$\mathcal{L} = -\frac{1}{N}\sum_{i=1}^{N}\left[y_i \log \hat{y}_i + (1-y_i)\log(1-\hat{y}_i)\right]$$
+
+where $y_i \in \{0,1\}$ is the true label and $\hat{y}_i$ is the model's predicted probability. This is the natural choice for binary classification: it is the negative log-likelihood of a Bernoulli distribution, so minimizing it is equivalent to maximum likelihood estimation. The logarithm means confident wrong answers are penalized far more heavily than uncertain ones — predicting 0.99 when the true label is 0 incurs a much larger loss than predicting 0.6.
+
+In addition to the main classifier loss, each detector branch produces its own auxiliary prediction through a small per-branch head. These auxiliary losses encourage each detector's convolutional features to be independently useful for classification, rather than relying on the other two branches to compensate. The total loss is a weighted sum:
+
+$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{main}} + w_{\text{aux}} \cdot \frac{1}{3}\sum_{d=1}^{3} \mathcal{L}_{\text{branch},d}$$
+
+where $w_{\text{aux}}$ controls how much the auxiliary task influences training. The intent is to improve gradient flow into the early convolutional layers via deep supervision. In practice, this did not measurably improve performance (see [next-steps.md](next-steps.md), Phase 2a), suggesting the bottleneck is not weak per-detector features but rather how they are fused. The auxiliary heads remain useful as a diagnostic tool for inspecting individual branch quality.
+
+The optimizer is AdamW, which combines Adam's adaptive per-parameter learning rates with decoupled weight decay. Weight decay adds a penalty proportional to the magnitude of the weights, gently pulling them toward zero each step. This discourages the network from fitting too closely to the training data by keeping the learned parameters small. Unlike classical L2 regularization, AdamW applies the decay directly to the weights rather than through the gradient, which interacts more cleanly with adaptive learning rate methods.
+
+The learning rate follows a schedule with two phases. First, a linear warmup ramps the learning rate from near-zero up to the target value over the first few epochs, preventing the large random gradients of an untrained network from causing destructive early updates. After warmup, cosine annealing with warm restarts gradually reduces the learning rate following a cosine curve, periodically resetting it to allow the optimizer to escape local minima and explore new regions of the loss landscape.
+
+Two forms of regularization combat overfitting. Dropout randomly zeroes a fraction of neuron activations during training, forcing the network to learn redundant representations rather than relying on any single feature pathway — at test time, all neurons are active and their outputs are scaled accordingly. Mixup takes pairs of training examples and creates synthetic samples by linearly interpolating both the inputs and their labels: $\tilde{x} = \lambda x_i + (1-\lambda) x_j$, $\tilde{y} = \lambda y_i + (1-\lambda) y_j$, where $\lambda$ is drawn from a Beta distribution. This smooths the decision boundary and reduces the model's tendency to memorize individual training examples.
+
+Finally, early stopping monitors validation loss and halts training when it stops improving, restoring the model weights from the best-performing epoch. This prevents the network from training past the point of diminishing returns into pure overfitting.
 
 ## Why a Neural Network?
 

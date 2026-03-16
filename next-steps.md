@@ -66,11 +66,11 @@ Training dynamics are healthy (Phase 1 confirmed). The next step is embedding ph
 
 The current model has no supervision of individual detector representations, i.e. the classifier head only sees the concatenated features. Adding lightweight classification heads on each detector's 256-d output before aggregation gives:
 
-$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{BCE}}(\text{combined}) + \lambda \sum_{i} \mathcal{L}_{\text{BCE}}(\text{detector}_i)$$
+$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{main}} + w_{\text{aux}} \cdot \frac{1}{3}\sum_{d=1}^{3} \mathcal{L}_{\text{branch},d}$$
 
-This forces each branch to maintain individually discriminative features, preventing any single detector from carrying the entire signal. $\lambda$ should be small (~0.1--0.3) since individual branches cannot reliably classify at low SNR (soft constraint).
+This forces each branch to maintain individually discriminative features, preventing any single detector from carrying the entire signal. $w_{\text{aux}}$ should be small (~0.1--0.3) since individual branches cannot reliably classify at low SNR (soft constraint).
 
-**Result ($\lambda$=0.2):** AUC 0.857, accuracy 0.780 -- no improvement over baseline. The per-branch supervision did not unlock new capacity, confirming the bottleneck is not weak per-detector features but the fusion step that combines them. The auxiliary heads remain in the model as a diagnostic tool (individual branch AUCs can be checked after training) but do not contribute to performance.
+**Result ($w_{\text{aux}}$=0.2):** AUC 0.857, accuracy 0.780 -- no improvement over baseline. The per-branch supervision did not unlock new capacity, confirming the bottleneck is not weak per-detector features but the fusion step that combines them. The auxiliary heads remain in the model as a diagnostic tool (individual branch AUCs can be checked after training) but do not contribute to performance.
 
 ### Phase 2b: GNN Aggregation Head
 
