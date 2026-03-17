@@ -203,14 +203,14 @@ def fit(
                 X_batch, y_batch = mixup_batch(X_batch, y_batch)
 
                 optimizer.zero_grad()
-                predictions, branch_preds = model(X_batch)
-                loss = model.compute_loss(y_batch, predictions, branch_preds, aux_loss_weight)
+                logits, branch_logits = model(X_batch)
+                loss = model.compute_loss(y_batch, logits, branch_logits, aux_loss_weight)
                 loss.backward()
                 optimizer.step()
 
                 epoch_losses.append(loss.item())
                 with torch.no_grad():
-                    pred_labels = (predictions >= 0.5).int().flatten()
+                    pred_labels = (logits >= 0.0).int().flatten()
                     train_correct += (pred_labels == y_batch.flatten().int()).sum().item()
                     train_total += len(y_batch)
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -232,11 +232,11 @@ def fit(
                 X_batch = X_batch.to(device)
                 y_batch_float = y_batch.float().unsqueeze(1).to(device)
 
-                pred = model(X_batch)
-                loss = model.compute_loss(y_batch_float, pred)
+                logits = model(X_batch)
+                loss = model.compute_loss(y_batch_float, logits)
                 val_losses.append(loss.item())
 
-                pred_labels = (pred.cpu().numpy() >= 0.5).astype(int).flatten()
+                pred_labels = (logits.cpu().numpy() >= 0.0).astype(int).flatten()
                 val_correct += (pred_labels == y_batch.numpy()).sum()
                 val_total += len(y_batch)
 

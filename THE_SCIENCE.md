@@ -85,10 +85,12 @@ Input (3 detectors x 4096 samples)
                                                   Concatenate (768 features)
                                                             |
                                                             v
-                                                  Dense (256) -> Dense (64) -> Dense (1) -> Sigmoid
+                                                  Dense (64) -> Dense (1) -> logits
 ```
 
-A critical design choice is  sharing weights across detectors. All three signals pass through the exact same convolutional layers, with the exact same learned parameters. This is an implicit physical constraint in the architecture: a gravitational wave, once whitened, should produce a similar waveform shape in every detector (up to arrival time offsets and amplitude differences from detector orientation). The network learns what a gravitational wave looks like once, and applies that knowledge three times.
+A critical design choice is sharing weights across detectors. All three signals pass through the exact same convolutional layers, with the exact same learned parameters. This is an implicit physical constraint in the architecture: a gravitational wave, once whitened, should produce a similar waveform shape in every detector (up to arrival time offsets and amplitude differences from detector orientation). The network learns what a gravitational wave looks like once, and applies that knowledge three times.
+
+Note on weight sharing: the current model shares weights across all three detectors, but LIGO Hanford and Livingston are the same instrument design (4 km arms) while Virgo is different (3 km arms, different noise profile). The planned residual backbone (see [developer-notes.md](developer-notes.md), Phase 3) will share weights only between the LIGO pair and give Virgo its own extractor, enforcing the correct $Z_2$ symmetry rather than the full $S_3$.
 
 Each convolutional block follows the sequence: convolution, batch normalization, SiLU activation, max pooling. Four such blocks progressively reduce the 4096-sample input into a compact 256-dimensional feature vector per detector:
 
@@ -107,7 +109,7 @@ $$\mathbf{f} = \left(\frac{1}{T}\sum_{t=1}^{T} x_t^{\,p}\right)^{1/p}$$
 
 where $p$ is a learnable parameter. When $p = 1$, this is average pooling; as $p \to \infty$, it approaches max pooling. The network learns whether to focus on the strongest activations (max-like) or the overall signal level (average-like).
 
-With 256 features extracted from each of the three detectors, the vectors are concatenated into a single 768-dimensional representation. This is where the cross-detector correlation from the previous section becomes relevant. Up to this point, each detector was processed in isolation. Now, the classifier head learns to find patterns that span all three feature sets simultaneously. A real gravitational wave produces correlated features across detectors. Noise, being independent, does not. The final sigmoid activation maps the output to a probability between 0 and 1: the model's confidence that a gravitational wave is present.
+With 256 features extracted from each of the three detectors, the vectors are concatenated into a single 768-dimensional representation. This is where the cross-detector correlation from the previous section becomes relevant. Up to this point, each detector was processed in isolation. Now, the classifier head learns to find patterns that span all three feature sets simultaneously. A real gravitational wave produces correlated features across detectors. Noise, being independent, does not. The network outputs a raw logit, which is passed through a sigmoid function at inference time to produce a probability between 0 and 1.
 
 ### Training
 
@@ -115,21 +117,43 @@ The loss function is binary cross-entropy (BCE):
 
 $$\mathcal{L} = -\frac{1}{N}\sum_{i=1}^{N}\left[y_i \log \hat{y}_i + (1-y_i)\log(1-\hat{y}_i)\right]$$
 
-where $y_i \in \{0,1\}$ is the true label and $\hat{y}_i$ is the model's predicted probability. This is the natural choice for binary classification: it is the negative log-likelihood of a Bernoulli distribution, so minimizing it is equivalent to maximum likelihood estimation. The logarithm means confident wrong answers are penalized far more heavily than uncertain ones — predicting 0.99 when the true label is 0 incurs a much larger loss than predicting 0.6.
+where $y_i \in \{0,1\}$ is the true label and $\hat{y}_i$ is the model's predicted probability. This is the natural choice for binary classification: it is the negative log-likelihood of a Bernoulli distribution, so minimizing it is equivalent to maximum likelihood estimation. The logarithm means confident wrong answers are penalized far more heavily than uncertain ones — predicting 0.99 when the true label is 0 incurs a much larger loss than predicting 0.6 (as a result, the current iteration of the model is quite conservative).
 
 In addition to the main classifier loss, each detector branch produces its own auxiliary prediction through a small per-branch head. These auxiliary losses encourage each detector's convolutional features to be independently useful for classification, rather than relying on the other two branches to compensate. The total loss is a weighted sum:
 
 $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{main}} + w_{\text{aux}} \cdot \frac{1}{3}\sum_{d=1}^{3} \mathcal{L}_{\text{branch},d}$$
 
-where $w_{\text{aux}}$ controls how much the auxiliary task influences training. The intent is to improve gradient flow into the early convolutional layers via deep supervision. In practice, this did not measurably improve performance (see [next-steps.md](next-steps.md), Phase 2a), suggesting the bottleneck is not weak per-detector features but rather how they are fused. The auxiliary heads remain useful as a diagnostic tool for inspecting individual branch quality.
+where $w_{\text{aux}}$ controls how much the auxiliary task influences training. The intent is to improve gradient flow into the early convolutional layers via deep supervision. In practice, this did not measurably improve performance (see [developer-notes.md](developer-notes.md), Phase 2a), suggesting the bottleneck is in the feature extractor's representational capacity rather than in individual branch quality. The auxiliary heads remain useful as a diagnostic tool.
 
 The optimizer is AdamW, which combines Adam's adaptive per-parameter learning rates with decoupled weight decay. Weight decay adds a penalty proportional to the magnitude of the weights, gently pulling them toward zero each step. This discourages the network from fitting too closely to the training data by keeping the learned parameters small. Unlike classical L2 regularization, AdamW applies the decay directly to the weights rather than through the gradient, which interacts more cleanly with adaptive learning rate methods.
 
 The learning rate follows a schedule with two phases. First, a linear warmup ramps the learning rate from near-zero up to the target value over the first few epochs, preventing the large random gradients of an untrained network from causing destructive early updates. After warmup, cosine annealing with warm restarts gradually reduces the learning rate following a cosine curve, periodically resetting it to allow the optimizer to escape local minima and explore new regions of the loss landscape.
 
-Two forms of regularization combat overfitting. Dropout randomly zeroes a fraction of neuron activations during training, forcing the network to learn redundant representations rather than relying on any single feature pathway — at test time, all neurons are active and their outputs are scaled accordingly. Mixup takes pairs of training examples and creates synthetic samples by linearly interpolating both the inputs and their labels: $\tilde{x} = \lambda x_i + (1-\lambda) x_j$, $\tilde{y} = \lambda y_i + (1-\lambda) y_j$, where $\lambda$ is drawn from a Beta distribution. This smooths the decision boundary and reduces the model's tendency to memorize individual training examples.
+Two forms of regularization combat overfitting. Dropout randomly zeroes a fraction of neuron activations during training, forcing the network to learn redundant representations rather than relying on any single feature pathway. Mixup takes pairs of training examples and creates synthetic samples by linearly interpolating both the inputs and their labels: $\tilde{x} = \lambda x_i + (1-\lambda) x_j$, $\tilde{y} = \lambda y_i + (1-\lambda) y_j$, where $\lambda$ is drawn from a Beta distribution. This smooths the decision boundary and reduces the model's tendency to memorize individual training examples.
 
 Finally, early stopping monitors validation loss and halts training when it stops improving, restoring the model weights from the best-performing epoch. This prevents the network from training past the point of diminishing returns into pure overfitting.
+
+### Geometric Structure of the Detector Network
+
+The CNN architecture described above processes each detector independently and combines them by concatenation. This captures what each detector sees, but it does not explicitly encode a fundamental physical constraint: a real gravitational wave must arrive at the three detectors with specific, geometrically determined time delays. A gravitational wave source at sky position $\hat{n}(\theta, \varphi)$ reaches detectors $i$ and $j$ with a time delay
+
+$$\tau_{ij} = \frac{(\mathbf{r}_i - \mathbf{r}_j) \cdot \hat{n}(\theta, \varphi)}{c}$$
+
+where $\mathbf{r}_i$ and $\mathbf{r}_j$ are the detector positions on Earth's surface. The crucial constraint is consistency: for a real signal, all three pairwise delays $\tau_{12}$, $\tau_{13}$, $\tau_{23}$ must correspond to a single point on the sky sphere $S^2$. For noise, cross-correlations at any combination of delays are uncorrelated. This geometric consistency is one of the strongest discriminators between signal and noise, and neither the CNN backbone nor the classifier head encodes it explicitly.
+
+To exploit this structure, we construct a scalar field on $S^2$ that we call the sky consistency map. The idea is to ask, for every direction on the sky, how well the three detectors agree that a signal arrived from that direction. Given $N$ points on the sky, we compute the predicted time delays $\tau_{12}(k)$, $\tau_{13}(k)$, $\tau_{23}(k)$ for each sky pixel $k$ from the known detector coordinates. These are constants that depend only on the detector network geometry and are precomputed once. For each sample, we compute the full cross-correlation between each detector pair via FFT, evaluate it at the predicted delay for each sky pixel, and combine the three values into a single consistency score $C(k)$. The result is a function $C(\theta, \varphi)$ defined on the sphere: for noise, it is a flat random field; for a real signal, it peaks at the true source position, where all three detector pairs show correlated signal at the geometrically predicted delays.
+
+This sky map is a function on $S^2$ and admits a natural expansion in spherical harmonics:
+
+$$C(\theta, \varphi) = \sum_{\ell=0}^{\ell_{\max}} \sum_{m=-\ell}^{\ell} a_{\ell m} \, Y_{\ell m}(\theta, \varphi)$$
+
+Truncating at $\ell_{\max} \sim 12$ gives $(\ell_{\max}+1)^2 = 169$ real coefficients, a compact representation of the sky map's angular structure. The $\ell = 0$ coefficient is the average consistency across the entire sky. Higher multipoles encode progressively finer angular structure, with a strong signal producing power at multipoles corresponding to the angular resolution set by the detector baselines.
+
+The detection problem has a natural symmetry: whether a gravitational wave is present does not depend on where on the sky it came from. But the *evidence* for a signal does depend on direction: it lives on $S^2$ and transforms under rotations. The spherical harmonic coefficients form what is called an equivariant representation: under an SO(3) rotation of the sky, each multipole $\ell$ transforms independently (via the Wigner $D$-matrices), and the full set of coefficients transforms in a known, structured way rather than being scrambled arbitrarily. The classifier head then collapses this structured representation into a single invariant output: the probability that a signal is present regardless of its origin. The aim is to process the data through intermediate representations that respect the symmetries of the domain, rather than hoping the network discovers those symmetries from the data alone.
+
+The detector network also carries a discrete symmetry. LIGO Hanford and Livingston are the same instrument design, so swapping them should not change the detection outcome. This $Z_2$ symmetry is enforced in the CNN backbone by weight sharing between the two LIGO branches (while Virgo, a different instrument, gets its own extractor). The sky map inherits this symmetry automatically, since cross-correlation is symmetric under pair reordering.
+
+In the full architecture, the spherical harmonic coefficients are concatenated with the CNN backbone features before the classifier head. The two paths are complementary: the CNN captures signal morphology (what the waveform looks like in each detector), while the sky map captures geometric consistency (whether the detectors agree at delays that correspond to a single astrophysical source). A single detector might exhibit a chirp-like feature due to a noise artifact, but only the sky map can confirm that all three detectors see correlated signal with the correct relative timing for a real source at a specific sky position.
 
 ## Why a Neural Network?
 
@@ -159,4 +183,4 @@ The ROC curve captures the tradeoff between these errors across all classificati
 
 ---
 
-For visualizations of the data and preprocessing pipeline, see the [data exploration notebook](notebooks/01_data_exploration.ipynb). For model analysis and interpretability, see the [model explorer notebook](notebooks/02_model_explorer.ipynb). For planned improvements, see [next-steps.md](next-steps.md).
+For visualizations of the data and preprocessing pipeline, see the [data exploration notebook](notebooks/01_data_exploration.ipynb). For model analysis and interpretability, see the [model explorer notebook](notebooks/02_model_explorer.ipynb). For the reasoning behind architectural decisions, see [developer-notes.md](developer-notes.md).

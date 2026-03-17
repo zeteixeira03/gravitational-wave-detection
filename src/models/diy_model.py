@@ -7,7 +7,6 @@ then concatenates features for classification.
 """
 
 from __future__ import annotations
-from typing import Optional
 
 import numpy as np
 import torch
@@ -50,13 +49,13 @@ class GeMPool1d(nn.Module):
 
 class DIYModel(nn.Module):
     """
-    1D Convolutional Neural Network for binary classification of GW signals.
+    1D CNN model for binary classification of GW signals.
 
     Architecture:
     - Shared 1D conv layers process each detector independently
-    - Auxiliary per-branch heads supervise individual detector features (Phase 2a)
-    - Features concatenated and passed through dense classifier
-    - Loss: Binary Cross-Entropy + weighted auxiliary per-branch BCE
+    - Concatenated detector features fed to classifier head
+    - Auxiliary per-branch heads supervise individual detector features
+    - All outputs are raw logits (no sigmoid); use BCEWithLogitsLoss
     - Optimizer: AdamW (configured externally in model_runs.py)
 
     Input shape: (batch_size, 3, 4096) - 3 detectors, 4096 time samples
@@ -64,8 +63,6 @@ class DIYModel(nn.Module):
 
     def __init__(self, n_samples: int = 4096, dropout_rate: float = 0.5):
         """
-        Initialize the DIY 1D CNN model.
-
         Parameters
         ----------
         n_samples : int
@@ -101,24 +98,16 @@ class DIYModel(nn.Module):
         # GeM pooling
         self.gem_pool = GeMPool1d(p=3.0)
 
-        # auxiliary per-branch classification heads (Phase 2a)
-        self.branch_head = nn.Sequential(
-            nn.Linear(256, 1),
-            nn.Sigmoid(),
-        )
+        # auxiliary per-branch classification heads (raw logits)
+        self.branch_head = nn.Linear(256, 1)
 
-        # classifier head: 256 features per detector * 3 detectors = 768
+        # classifier head: 3 detectors * 256 features = 768
         self.classifier = nn.Sequential(
-            nn.Linear(768, 256),
-            nn.BatchNorm1d(256, momentum=0.1, eps=1e-5),
-            nn.SiLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(256, 64),
+            nn.Linear(768, 64),
             nn.BatchNorm1d(64, momentum=0.1, eps=1e-5),
             nn.SiLU(),
             nn.Dropout(dropout_rate),
             nn.Linear(64, 1),
-            nn.Sigmoid(),
         )
 
         # kaiming initialization
@@ -168,60 +157,51 @@ class DIYModel(nn.Module):
         Returns
         -------
         torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]
-            During inference: output predictions of shape (batch_size, 1).
-            During training: tuple of (main predictions, list of 3 branch predictions).
+            During inference: raw logits of shape (batch_size, 1).
+            During training: tuple of (main logits, list of 3 branch logits).
         """
-        # split detectors: X shape is (batch, 3, 4096)
-        h1 = X[:, 0, :]  # (batch, 4096)
-        l1 = X[:, 1, :]
-        v1 = X[:, 2, :]
-
         # process each detector through shared conv layers
-        h1_feat = self._process_detector(h1)  # (batch, 256)
-        l1_feat = self._process_detector(l1)
-        v1_feat = self._process_detector(v1)
+        h1_feat = self._process_detector(X[:, 0, :])  # (batch, 256)
+        l1_feat = self._process_detector(X[:, 1, :])
+        v1_feat = self._process_detector(X[:, 2, :])
 
-        # concatenate features from all detectors
+        # concatenate detector features
         combined = torch.cat([h1_feat, l1_feat, v1_feat], dim=-1)  # (batch, 768)
 
-        # classifier head
-        main_pred = self.classifier(combined)
+        # classifier head (raw logits)
+        main_logits = self.classifier(combined)
 
         if self.training:
-            branch_preds = [
+            branch_logits = [
                 self.branch_head(h1_feat),
                 self.branch_head(l1_feat),
                 self.branch_head(v1_feat),
             ]
-            return main_pred, branch_preds
+            return main_logits, branch_logits
 
-        return main_pred
-
-    def _bce(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
-        """Compute binary cross-entropy between y_true and y_pred."""
-        epsilon = 1e-7
-        y_pred = y_pred.clamp(epsilon, 1 - epsilon)
-        bce = -(y_true * torch.log(y_pred) + (1 - y_true) * torch.log(1 - y_pred))
-        return bce.mean()
+        return main_logits
 
     def compute_loss(
         self,
         y_true: torch.Tensor,
-        y_pred: torch.Tensor,
-        branch_preds: list[torch.Tensor] | None = None,
+        logits: torch.Tensor,
+        branch_logits: list[torch.Tensor] | None = None,
         aux_loss_weight: float = 0.0,
     ) -> torch.Tensor:
         """
         Compute total loss: main BCE + weighted auxiliary per-branch BCE.
 
+        All inputs are raw logits (pre-sigmoid). Uses BCEWithLogitsLoss for
+        numerical stability.
+
         Parameters
         ----------
         y_true : torch.Tensor
             True labels of shape (batch_size, 1).
-        y_pred : torch.Tensor
-            Main predicted probabilities of shape (batch_size, 1).
-        branch_preds : list[torch.Tensor] | None
-            Per-detector predictions, each of shape (batch_size, 1).
+        logits : torch.Tensor
+            Main logits of shape (batch_size, 1).
+        branch_logits : list[torch.Tensor] | None
+            Per-detector logits, each of shape (batch_size, 1).
         aux_loss_weight : float
             Weight for auxiliary branch losses (lambda). 0 disables.
 
@@ -230,10 +210,12 @@ class DIYModel(nn.Module):
         torch.Tensor
             Scalar loss value.
         """
-        main_loss = self._bce(y_true, y_pred)
+        main_loss = F.binary_cross_entropy_with_logits(logits, y_true)
 
-        if branch_preds is not None and aux_loss_weight > 0:
-            aux_loss = sum(self._bce(y_true, bp) for bp in branch_preds) / len(branch_preds)
+        if branch_logits is not None and aux_loss_weight > 0:
+            aux_loss = sum(
+                F.binary_cross_entropy_with_logits(bl, y_true) for bl in branch_logits
+            ) / len(branch_logits)
             return main_loss + aux_loss_weight * aux_loss
 
         return main_loss
@@ -262,15 +244,15 @@ class DIYModel(nn.Module):
         n_samples = X.shape[0]
         if n_samples <= batch_size:
             X_t = torch.tensor(X, dtype=torch.float32, device=device)
-            predictions = self.forward(X_t)
-            result = predictions.cpu().numpy().flatten()
+            logits = self.forward(X_t)
+            result = torch.sigmoid(logits).cpu().numpy().flatten()
         else:
             all_predictions = []
             for start_idx in range(0, n_samples, batch_size):
                 end_idx = min(start_idx + batch_size, n_samples)
                 X_batch = torch.tensor(X[start_idx:end_idx], dtype=torch.float32, device=device)
-                batch_pred = self.forward(X_batch)
-                all_predictions.append(batch_pred.cpu().numpy())
+                logits = self.forward(X_batch)
+                all_predictions.append(torch.sigmoid(logits).cpu().numpy())
             result = np.concatenate(all_predictions, axis=0).flatten()
 
         if was_training:
