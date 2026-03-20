@@ -12,7 +12,7 @@ But why gravitational waves? I have a Physics degree, and did my thesis on Numer
 
 So I decided to start with a binary classifier, and introduce physics into the architecture as I go. I began with a "normal" 1D CNN, which after optimization worked reasonably well ($\sim 0.85$ AUC), but failed to extract the "ambiguous" signals. It resulted in a network that was quite confident in the signals that it detected, but reverted to classifying the non-obvious signals as noise. I tried to add domain knowledge via a small GNN at the end of the CNN backbone and before the classifier head to have the network learn the correlations between signals from different detectors (gravitational waves travel at the speed of light), but it gave me no measurable improvement.
 
-As a consequence of the stuff that I'm doing outside of this project, I started learning about Geometric Deep Learning (check out Bronstein's book on this), and found a way to properly formalize my reasoning on this. The GNN failed because a complete graph on 3 nodes has no meaningful geometry to learn from. The real geometric structure in this problem lives on the sky sphere $S^2$: a gravitational wave from a given direction arrives at each detector with specific time delays, and for a real signal all three pairwise delays must be consistent with a single point on the sky. Noise doesn't have this property. That consistency constraint is far richer than anything a 3-node graph can capture, and it's what I'm building towards now: a sky consistency map decomposed into spherical harmonics, concatenated with the CNN         features before the classifier. The CNN captures what each detector sees; the sky map captures whether they agree in a way that is geometrically consistent with an astrophysical source.  
+As a consequence of the stuff that I'm doing outside of this project, I started learning about Geometric Deep Learning (check out Bronstein's book on this), and found a way to properly formalize my reasoning for this problem. The GNN failed because a complete graph on 3 nodes has no meaningful geometry to learn from. In fact, the real geometric structure in this problem lives on the sky sphere $S^2$: a gravitational wave from a given direction arrives at each detector with specific time delays, and for a real signal all three pairwise delays must be consistent with a single point on the sky. Noise doesn't have this property. That consistency constraint is far richer than anything a 3-node graph can capture, and it's what I'm building towards now: a sky consistency map decomposed into spherical harmonics, concatenated with the CNN         features before the classifier. The CNN captures what each detector sees; the sky map captures whether they agree in a way that is geometrically consistent with an astrophysical source.  
 
 But first, the CNN backbone itself needs work. A gravitational wave chirp has hierarchical temporal structure: it begins as a slow, low-frequency inspiral and accelerates into a rapid high-frequency merger. Resolving this requires a deep feature hierarchy where early layers capture broad oscillation patterns and deeper layers refine progressively finer temporal structure. With only 4 convolutional blocks, the network can't represent the full range of timescales present in a chirp. The next step is a deep (residual, to avoid vanishing gradients) backbone, and only then the geometric layer on top.
 
@@ -23,33 +23,30 @@ If you're interested, I included a markdown file ([THE_SCIENCE.md](THE_SCIENCE.m
 ```
 Input (3 detectors x 4096 samples)
     |
-    |---> Detector H1 ---\
-    |---> Detector L1 ----+---> Shared Conv Layers ---> GeM Pool ---> 256 features each
-    |---> Detector V1 ---/
-                                                            |
-                                                            v
-                                                  Concatenate (768 features)
-                                                            |
-                                                            v
-                                                  Dense (64) -> Dense (1) -> logits
+    |---> Detector H1 -----|
+    |                      +---> LIGO Extractor (shared weights) -----|
+    |---> Detector L1 -----|                                          |
+    |                                                                 +---> Shared Residual
+    |---> Detector V1 ---------> Virgo Extractor (separate weights) --|     Backbone (10 blocks)
+                                                                               |
+                                                                          ConcatPool ---> 256 features each
+                                                                               |
+                                                                          Concatenate (768 features)
+                                                                               |
+                                                                          3-layer classifier ---> logits
 ```
 
-| Layer | Filters | Kernel Size | Pool Size |
-|-------|---------|-------------|-----------|
-| Conv1 | 32      | 64          | 4         |
-| Conv2 | 64      | 32          | 4         |
-| Conv3 | 128     | 16          | 4         |
-| Conv4 | 256     | 8           | 4         |
+Deep residual backbone with ~10 residual blocks (20 conv layers) and GeM pooling. LIGO H1/L1 share extractor weights; Virgo has a separate extractor. Channels progress as 32 -> 32 -> 64 -> 128 -> 128, with kernel sizes decreasing from 64 -> 31 -> 15 -> 7.
 
 ## Current Performance
 
 | Accuracy | AUC | Precision | Recall | F1 |
 |----------|-----|-----------|--------|----|
-| 0.788 | 0.858 | 0.905 | 0.641 | 0.750 |
+| 0.792 | 0.868 | 0.812 | 0.756 | 0.783 |
 
 <p align="center"><img src="assets/dashboard.png" width="700"></p>
 
-Early overfitting has been fixed by adding time shifts, Gaussian noise injection, and mixup augmentation. The model is still quite conservative, with precision outpacing recall (0.91 vs 0.64 at the default threshold). Improving recall is the current priority.
+The deep residual backbone (Phase 3, Step 1) brought a meaningful improvement over the Phase 1 plateau at 0.858 AUC. Recall improved substantially (0.64 -> 0.75) with precision coming down from its previously over-conservative 0.91 to a more balanced 0.82.
 
 ## Installation
 

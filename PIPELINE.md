@@ -8,8 +8,8 @@
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │   Raw G2Net Data (70GB)          create_tensors.py                          │
-│   D:/Programming/g2net-...  ──────────────────────────►  Tensor shards      │
-│                                                          D:/Programming/     │
+│   <path-to-dataset>/       ──────────────────────────►  Tensor shards      │
+│                                                          <output-path>/     │
 │   For each sample:                                       g2net-preprocessed/ │
 │   1. Load .npy file                                      ├── shard_00.pt    │
 │   2. Bandpass filter (20-500 Hz)                         ├── shard_01.pt    │
@@ -36,10 +36,10 @@
 │        ▼                                                                    │
 │   main()  ───────►  train_from_tensors()  ───────►  DIYModel               │
 │        │                       │                           │                │
-│        │                       │ GWTensorDataset           │ 1D CNN         │
-│        │                       │ + DataLoader              │ 4 conv blocks  │
-│        │                       │ (shard streaming)         │ GeM pooling    │
-│        │                       ▼                           │ 2 FC layers    │
+│        │                       │ GWTensorDataset           │ Deep residual  │
+│        │                       │ + DataLoader              │ 1D CNN (10     │
+│        │                       │ (shard streaming)         │ res blocks)    │
+│        │                       ▼                           │ 3-layer head   │
 │        │                    fit()                          ▼                │
 │        │                       │                      Trained Weights       │
 │        │                       │ - Early stopping                           │
@@ -69,5 +69,5 @@
 | Raw G2Net dataset | ~70 GB |
 | Preprocessed tensor shards | ~2.4 GB/shard |
 | avg_psd.npz | ~45 KB |
-| Model weights | ~4 MB |
+| Model weights | ~6 MB |
 | src/ code (zipped) | ~150 KB |

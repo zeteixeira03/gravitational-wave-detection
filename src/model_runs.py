@@ -4,7 +4,7 @@
 Training cycle using preprocessed PyTorch tensor shards:
 1. Load .pt shards (preprocessed signals, must run compute_psd.py and create_tensors.py before - in this order)
 2. Initialize 1D CNN model
-3. Train with early stopping and LR scheduling
+3. Train
 4. Evaluate and save metrics
 5. Generate evaluation plots
 """
@@ -18,6 +18,7 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 # add project root to path
@@ -34,7 +35,8 @@ from visualization import (
     plot_precision_recall_curve,
     plot_confusion_matrix,
     plot_prediction_distribution,
-    plot_all_metrics
+    plot_all_metrics,
+    plot_lr_range_test,
 )
 
 SEED = 426425
@@ -112,6 +114,8 @@ def fit(
     warmup_epochs=0,
     warmup_start_lr=1e-6,
     aux_loss_weight=0.0,
+    use_amp=False,
+    clip_grad_norm=None,
 ):
     """
     Train model by streaming shards from disk.
@@ -148,6 +152,10 @@ def fit(
         Starting LR for warmup (linearly increases to the optimizer's initial LR)
     aux_loss_weight : float
         Weight for auxiliary per-branch losses (Phase 2a). 0 disables.
+    use_amp : bool
+        Enable mixed precision training (CUDA only).
+    clip_grad_norm : float | None
+        Max gradient norm for clipping. None disables.
 
     Returns
     -------
@@ -155,6 +163,10 @@ def fit(
         Training history
     """
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=min_lr)
+
+    # amp setup (CUDA only)
+    use_amp = use_amp and (device.type == 'cuda')
+    scaler = torch.cuda.amp.GradScaler("cuda", enabled=use_amp)
 
     history = {
         'train_loss': [], 'train_acc': [],
@@ -203,14 +215,19 @@ def fit(
                 X_batch, y_batch = mixup_batch(X_batch, y_batch)
 
                 optimizer.zero_grad()
-                logits, branch_logits = model(X_batch)
-                loss = model.compute_loss(y_batch, logits, branch_logits, aux_loss_weight)
-                loss.backward()
-                optimizer.step()
+                with torch.cuda.amp.autocast("cuda", enabled=use_amp):
+                    logits, branch_logits = model(X_batch)
+                    loss = model.compute_loss(y_batch, logits, branch_logits, aux_loss_weight)
+                scaler.scale(loss).backward()
+                if clip_grad_norm:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
 
                 epoch_losses.append(loss.item())
                 with torch.no_grad():
-                    pred_labels = (logits >= 0.0).int().flatten()
+                    pred_labels = (logits.float() >= 0.0).int().flatten()
                     train_correct += (pred_labels == y_batch.flatten().int()).sum().item()
                     train_total += len(y_batch)
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -232,11 +249,12 @@ def fit(
                 X_batch = X_batch.to(device)
                 y_batch_float = y_batch.float().unsqueeze(1).to(device)
 
-                logits = model(X_batch)
-                loss = model.compute_loss(y_batch_float, logits)
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    logits = model(X_batch)
+                    loss = model.compute_loss(y_batch_float, logits)
                 val_losses.append(loss.item())
 
-                pred_labels = (logits.cpu().numpy() >= 0.0).astype(int).flatten()
+                pred_labels = (logits.float().cpu().numpy() >= 0.0).astype(int).flatten()
                 val_correct += (pred_labels == y_batch.numpy()).sum()
                 val_total += len(y_batch)
 
@@ -265,7 +283,7 @@ def fit(
             current_lr = optimizer.param_groups[0]['lr']
             print(f"Epoch {epoch + 1}/{epochs} - Loss: {train_loss:.4f} - "
                   f"Val Loss: {val_loss:.4f} - Val Acc: {val_acc:.4f} - "
-                  f"LR: {current_lr:.2e}{improvement_marker}")
+                  f"LR: {current_lr:.2e}{improvement_marker}", flush=True)
 
         # early stopping
         if epochs_without_improvement >= early_stopping_patience:
@@ -283,7 +301,7 @@ def fit(
 
 
 def evaluate(model, data_loader, device):
-    """Evaluate model on dataset, return predictions and labels."""
+    """Evaluate model on dataset, return probabilities and labels."""
     model.eval()
     y_true_all = []
     y_proba_all = []
@@ -291,8 +309,9 @@ def evaluate(model, data_loader, device):
     with torch.no_grad():
         for X_batch, y_batch in data_loader:
             X_batch = X_batch.to(device)
-            pred = model(X_batch).cpu().numpy().flatten()
-            y_proba_all.append(pred)
+            logits = model(X_batch)
+            proba = torch.sigmoid(logits).cpu().numpy().flatten()
+            y_proba_all.append(proba)
             y_true_all.append(y_batch.numpy())
 
     y_true = np.concatenate(y_true_all)
@@ -588,10 +607,10 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     )
 
     # initialize model
-    model = DIYModel(
-        n_samples=n_samples_config,
-        dropout_rate=dropout_rate
-    ).to(device)
+    n_channels = hyperparameters.get('n_channels', 32)
+    model = DIYModel(n_channels=n_channels, dropout_rate=dropout_rate).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model: DIYModel ({n_params:,} parameters)")
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
@@ -602,11 +621,14 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     print("TRAINING MODEL")
     print("="*60 + "\n")
 
+    use_amp = hyperparameters.get('use_amp', False)
+    clip_grad_norm = hyperparameters.get('clip_grad_norm', None)
+
     history = fit(
-        model, 
-        train_shard_paths, 
-        val_loader, 
-        optimizer, 
+        model,
+        train_shard_paths,
+        val_loader,
+        optimizer,
         device,
         epochs=epochs,
         batch_size=batch_size,
@@ -614,6 +636,8 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
         early_stopping_patience=early_stopping_patience,
         warmup_epochs=warmup_epochs,
         aux_loss_weight=aux_loss_weight,
+        use_amp=use_amp,
+        clip_grad_norm=clip_grad_norm,
     )
 
     print("\nTraining complete.")
@@ -653,6 +677,176 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
         'device': device,
     }
 
+# =====================================================================
+#                        LR RANGE TEST
+# =====================================================================
+
+def lr_range_test(
+    model,
+    shard_paths,
+    device,
+    batch_size,
+    use_amp=False,
+    weight_decay=5e-4,
+    lr_start=1e-5,
+    lr_end=1e-1,
+    n_steps=1000,
+):
+    """
+    Exponentially increase LR over n_steps, record loss at each step.
+
+    Parameters
+    ----------
+    model : nn.Module
+        Model to test (weights will be modified).
+    shard_paths : list[Path]
+        Training data shard paths.
+    device : torch.device
+        Device to run on.
+    batch_size : int
+        Batch size.
+    use_amp : bool
+        Whether to use mixed precision.
+    weight_decay : float
+        Weight decay for AdamW.
+    lr_start : float
+        Starting learning rate.
+    lr_end : float
+        Ending learning rate.
+    n_steps : int
+        Number of optimization steps.
+
+    Returns
+    -------
+    dict
+        {'lrs': list, 'losses': list, 'smoothed': list, 'suggested_lr': float}
+    """
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr_start, weight_decay=weight_decay)
+    use_amp = use_amp and (device.type == 'cuda')
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    lr_mult = (lr_end / lr_start) ** (1.0 / n_steps)
+    lrs = []
+    losses = []
+    best_loss = float('inf')
+    step = 0
+
+    for shard_path in shard_paths:
+        if step >= n_steps:
+            break
+        data = torch.load(str(shard_path), weights_only=True)
+        dataset = GWTensorDataset(data['signals'], data['labels'], augment=False)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+
+        for X_batch, y_batch in loader:
+            if step >= n_steps:
+                break
+
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.float().unsqueeze(1).to(device)
+
+            optimizer.zero_grad()
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                output = model(X_batch)
+                logits = output[0] if isinstance(output, tuple) else output
+                loss = F.binary_cross_entropy_with_logits(logits, y_batch)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            lrs.append(optimizer.param_groups[0]['lr'])
+            losses.append(loss.item())
+
+            if step > 20 and loss.item() > 4 * best_loss:
+                print(f"  Loss exploded at step {step}, stopping.")
+                break
+            best_loss = min(best_loss, loss.item())
+
+            for pg in optimizer.param_groups:
+                pg['lr'] *= lr_mult
+            step += 1
+
+        del data, dataset, loader
+        if step > 20 and losses[-1] > 4 * best_loss:
+            break
+
+    if not losses:
+        print("  No steps completed.")
+        return {'lrs': [], 'losses': [], 'smoothed': [], 'suggested_lr': lr_start}
+
+    # smooth losses (exponential moving average)
+    smoothed = []
+    avg = losses[0]
+    for l in losses:
+        avg = 0.98 * avg + 0.02 * l
+        smoothed.append(avg)
+
+    # suggested LR: where smoothed loss is minimum, divided by 5
+    min_idx = int(np.argmin(smoothed))
+    suggested_lr = lrs[min_idx] / 5
+
+    print(f"\nLR Range Test: {len(lrs)} steps")
+    print(f"  Best smoothed loss: {smoothed[min_idx]:.4f} at LR {lrs[min_idx]:.2e}")
+    print(f"  Suggested LR: {suggested_lr:.2e}")
+
+    return {'lrs': lrs, 'losses': losses, 'smoothed': smoothed, 'suggested_lr': suggested_lr}
+
+
+def run_lr_range_test(data_dir, n_samples, hyperparameters):
+    """
+    Set up model and data, run LR range test, save plot.
+
+    Parameters
+    ----------
+    data_dir : Path
+        Directory containing tensor shards.
+    n_samples : int
+        Total number of samples in dataset.
+    hyperparameters : dict
+        Model and training configuration.
+    """
+    print("\n" + "=" * 60)
+    print("LR RANGE TEST")
+    print("=" * 60)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    batch_size = hyperparameters.get('batch_size', 64)
+    dropout_rate = hyperparameters.get('dropout_rate', 0.5)
+    n_channels = hyperparameters.get('n_channels', 32)
+
+    # find shards
+    shard_files = sorted(data_dir.glob('shard_*.pt'))
+    if not shard_files:
+        single = data_dir / 'train.pt'
+        if single.exists():
+            shard_files = [single]
+        else:
+            raise FileNotFoundError(f"No data files in {data_dir}")
+
+    # create model
+    model = DIYModel(n_channels=n_channels, dropout_rate=dropout_rate).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model: DIYModel ({n_params:,} parameters)")
+    print(f"Device: {device}")
+    print(f"Shards: {len(shard_files)}")
+
+    # run test
+    use_amp = hyperparameters.get('use_amp', False)
+    lr_data = lr_range_test(
+        model, shard_files, device, batch_size,
+        use_amp=use_amp,
+        weight_decay=hyperparameters.get('weight_decay', 5e-4),
+    )
+
+    # save plot
+    output_dir = get_output_dir()
+    plot_path = output_dir / "lr_range_test.png"
+    plot_lr_range_test(lr_data, save_path=str(plot_path))
+    print(f"Plot saved: {plot_path}")
+
+    return lr_data
+
 
 # =====================================================================
 #                        MAIN ENTRY POINT
@@ -678,15 +872,14 @@ def check_gpu():
     return torch.cuda.is_available()
 
 
-def main():
+def main(mode='train'):
     """
-    Main execution flow for training.
+    Main execution flow for training or LR range test.
 
-    Pipeline:
-    1. Load .pt tensor shards from Kaggle dataset
-    2. Train model with early stopping and LR scheduling
-    3. Save weights and metrics
-    4. Generate evaluation plots
+    Parameters
+    ----------
+    mode : str
+        'train' for full training, 'lr_test' for LR range test.
     """
 
     # ========== GPU CHECK ==========
@@ -694,15 +887,18 @@ def main():
 
     # ========== HYPERPARAMETERS ==========
     HYPERPARAMETERS = {
+        'n_channels': 32,
         'n_samples': 4096,
-        'learning_rate': 5e-5,
+        'learning_rate': 1e-3,
         'dropout_rate': 0.5,
         'weight_decay': 5e-4,
         'epochs': 50,
         'batch_size': 64 if has_gpu else 32,
-        'early_stopping_patience': 10,
+        'early_stopping_patience': 15,
         'warmup_epochs': 5,
         'aux_loss_weight': 0.2,
+        'use_amp': True,
+        'clip_grad_norm': 1.0,
     }
 
     # ========== SETUP PATHS ==========
@@ -748,6 +944,11 @@ def main():
         n_samples = 560000  # approximate if metadata missing
 
     print(f"Total samples: {n_samples}")
+
+    # ========== LR RANGE TEST MODE ==========
+    if mode == 'lr_test':
+        run_lr_range_test(data_dir, n_samples, HYPERPARAMETERS)
+        return
 
     models_dir = output_dir / "models" / "saved"
     print(f"Models directory: {models_dir}")

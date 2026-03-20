@@ -2,11 +2,11 @@
 
 ## Gravitational Wave Detectors
 
-Gravitational waves are ripples in the geometry of spacetime, produced when massive objects accelerate violently. The strongest sources we can detect (merging black holes and neutron stars) radiate enormous energy as gravitational radiation during their final inspiral and coalescence. By the time these waves reach Earth, the spacetime distortion they produce is almost inconceivably small: a fractional change in length of roughly $10^{-21}$. For a 4 km baseline, that corresponds to a displacement of about $10^{-18}$ meters — a thousandth of the diameter of a proton.
+Gravitational waves are ripples in the geometry of spacetime, produced when massive objects accelerate violently. The strongest sources we can detect (merging black holes and neutron stars) radiate enormous energy as gravitational radiation during their final inspiral and coalescence. By the time these waves reach Earth, the spacetime distortion they produce is almost inconceivably small: a fractional change in length of roughly $10^{-21}$. For a 4 km baseline, that corresponds to a displacement of about $10^{-18}$ meters. This corresponds to a thousandth of the diameter of a proton.
 
-Measuring this requires a Michelson interferometer. The concept is elegant: split a laser beam into two perpendicular paths, send them down long arms, bounce them off mirrors at the far ends, and recombine them at a photodetector. When the arm lengths are precisely equal, the two returning beams interfere destructively — they cancel each other out, and no light reaches the detector. When a gravitational wave passes through, it stretches space along one arm while compressing it along the other. The path lengths change, the destructive interference becomes imperfect, and light appears at the photodetector.
+Measuring this requires a Michelson interferometer. The concept is simple: split a laser beam into two perpendicular paths, send them down long arms, bounce them off mirrors at the far ends, and recombine them at a photodetector. When the arm lengths are precisely equal, the two returning beams interfere destructively, cancelling each other out and making it so no light reaches the detector. When a gravitational wave passes through, it stretches space along one arm while compressing it along the other. The path lengths change, the destructive interference becomes imperfect, and light appears at the photodetector.
 
-That's the principle. Making it work at the $10^{-21}$ level is, to put it mildly, an engineering challenge. LIGO uses 4 km arms (Virgo uses 3 km), Fabry-Perot cavities that bounce the laser back and forth hundreds of times to effectively multiply the arm length, seismic isolation to decouple the mirrors from ground vibrations, and one of the most stable laser systems ever built. The entire optical path sits inside one of the most perfect vacuum chambers ever built by humans to eliminate scattering from air molecules.
+That's the principle. Making it work at the $10^{-21}$ level is, to put it mildly, an engineering challenge. LIGO uses 4 km arms (Virgo uses 3 km), Fabry-Perot cavities that bounce the laser back and forth hundreds of times to effectively multiply the arm length, seismic isolation to decouple the mirrors from ground vibrations, and one of the most stable laser systems ever developed. The entire optical path sits inside one of the most perfect vacuum chambers ever built (by humans; interplanetary and intergalactic space are far more empty) to eliminate scattering from air molecules.
 
 Three detectors operate simultaneously, spread across two continents:
 
@@ -16,7 +16,7 @@ Three detectors operate simultaneously, spread across two continents:
 
 The geographic separation is essential. A real gravitational wave, traveling at the speed of light, must appear in all three detectors with specific time delays determined by the wave's sky position. A local disturbance (could literally be a truck driving by a few miles away, or even a logger felling a tree) affects only one site. Requiring coincident signals across the detector network is one of the most powerful tools we have for rejecting false alarms. If you're interested, I suggest reading on the future LISA mission to build one of these in space rather than on the ground.
 
-Each detector samples its output at 2048 Hz, producing 4096 data points over each 2-second observation window. What it records is the *strain*: the fractional change in arm length, $h(t) = \Delta L / L$. 
+Each detector samples its output at 2048 Hz, producing 4096 data points over each 2-second observation window. It records a dimensionless quantity known as its *strain*: the fractional change in arm length, $h(t) = \Delta L / L$. 
 
 ## The Signal
 
@@ -30,7 +30,7 @@ $$h(t) := \frac{\Delta L}{L} = F_+(t)\,h_+(t) + F_\times(t)\,h_\times(t),$$
 
 where $F_+$ and $F_\times$ are the beam pattern functions, determined by the detector's location, the source's sky position, and the polarization angle of the wave.
 
-A crucial asymmetry: gravitational wave signals are correlated across detectors (a wave arriving at Hanford at time $t$ reaches Livingston at $t + \Delta t$), but noise is not — it depends on each detector's local apparatus and environment. Because the noise is uncorrelated, the joint probability of the data across detectors factorizes, and the log-likelihood ratio (signal present vs. noise only) reduces to a sum over individual detectors:
+A crucial asymmetry: gravitational wave signals are correlated across detectors (a wave arriving at Hanford at time $t$ reaches Livingston at $t + \Delta t$), but noise is not, depending rather on each detector's local apparatus and environment. Because the noise is uncorrelated, the joint probability of the data across detectors factorizes, and the log-likelihood ratio (signal present vs. noise only) reduces to a sum over individual detectors:
 
 $$\log \Lambda[\mathbf{x}] = \sum_{I} \log \Lambda_I[x_I]$$
 
@@ -66,7 +66,7 @@ With the PSD in hand, whitening is straightforward:
 
 This flattens the noise spectrum: colored noise becomes approximately white, with equal power at every frequency. The noise is still present, but it no longer carries structure that a neural network could mistake for signal features. After whitening, SNR contributions are equalized across frequencies, and the network can focus on the actual waveform.
 
-The cross-detector correlation then becomes the decisive feature. After whitening, the remaining noise in each detector is independent, but a real gravitational wave produces a correlated pattern across all three. The model architecture exploits this directly: shared convolutional layers process each detector identically, and the classifier head combines their features to detect precisely this correlation.
+The cross-detector correlation then becomes the decisive feature. After whitening, the remaining noise in each detector is independent, but a real gravitational wave produces a correlated pattern across all three. The model architecture exploits this directly: the convolutional backbone processes each detector's signal through the same residual blocks, and the classifier head combines their features to detect precisely this correlation.
 
 ## How the Neural Network Detects Signals
 
@@ -77,39 +77,37 @@ The architecture is a 1D Convolutional Neural Network (CNN). If you've encounter
 ```
 Input (3 detectors x 4096 samples)
     |
-    |---> Detector H1 ---\
-    |---> Detector L1 ----+---> Shared Conv Layers ---> GeM Pool ---> 256 features each
-    |---> Detector V1 ---/
-                                                            |
-                                                            v
-                                                  Concatenate (768 features)
-                                                            |
-                                                            v
-                                                  Dense (64) -> Dense (1) -> logits
+    |---> Detector H1 ---|
+    |                    +---> LIGO Extractor (shared weights)  --------|
+    |---> Detector L1 ---|                                              |
+    |                                                                   +----------> Shared Residual
+    |---> Detector V1 -------> Virgo Extractor (separate weights) ------|            Backbone (10 blocks)
+                                                                                             |
+                                                                                          ConcatPool ---> 256 features each
+                                                                                             |
+                                                                                         Concatenate ---> 768 features
+                                                                                             |
+                                                                                     3-layer classifier ---> logits
 ```
 
-A critical design choice is sharing weights across detectors. All three signals pass through the exact same convolutional layers, with the exact same learned parameters. This is an implicit physical constraint in the architecture: a gravitational wave, once whitened, should produce a similar waveform shape in every detector (up to arrival time offsets and amplitude differences from detector orientation). The network learns what a gravitational wave looks like once, and applies that knowledge three times.
+A critical design choice is weight sharing. LIGO Hanford and Livingston are the same instrument design (4 km arms, similar noise characteristics), so their signals pass through the same extractor with shared parameters. Virgo is a different instrument (3 km arms, different seismic environment, different sensitivity curve) and gets its own extractor with independent weights. This enforces the correct $Z_2$ symmetry by construction: a gravitational wave, once whitened, produces a similar waveform shape in both LIGO detectors (up to arrival time offsets and amplitude differences from beam pattern functions), but Virgo's different characteristics warrant separate learned filters. After extraction, all three branches share the same residual backbone.
 
-Note on weight sharing: the current model shares weights across all three detectors, but LIGO Hanford and Livingston are the same instrument design (4 km arms) while Virgo is different (3 km arms, different noise profile). The planned residual backbone (see [developer-notes.md](developer-notes.md), Phase 3) will share weights only between the LIGO pair and give Virgo its own extractor, enforcing the correct $Z_2$ symmetry rather than the full $S_3$.
+The architecture is a deep residual backbone: an extractor followed by 10 residual blocks (20 convolutional layers) with progressive downsampling and channel widening:
 
-Each convolutional block follows the sequence: convolution, batch normalization, SiLU activation, max pooling. Four such blocks progressively reduce the 4096-sample input into a compact 256-dimensional feature vector per detector:
+| Stage | Channels | Kernel Size | Downsample | Temporal dim |
+|-------|----------|-------------|------------|-------------|
+| Extractor | 1 -> 32 | 64 | GeM(2) | 4096 -> 2048 |
+| Group 1 (2 blocks) | 32 | 31 | GeM(4) + identity | 2048 -> 512 |
+| Group 2 (2 blocks) | 32 | 31 | identity | 512 |
+| Group 3 (2 blocks) | 64 | 15 | GeM(4) + identity | 512 -> 128 |
+| Group 4 (2 blocks) | 128 | 7 | GeM(4) + identity | 128 -> 32 |
+| Group 5 (2 blocks) | 128 | 7 | identity | 32 |
 
-| Layer | Filters | Kernel Size | Pool Size | Input Size (time steps × channels)| Output Size (time steps × channels) |
-|-------|---------|-------------|-----------|-----------------------------------|-------------------------------------|
-| Conv1 | 32      | 64          | 4         | 4096 x 1                          | 1024 x 32                           |
-| Conv2 | 64      | 32          | 4         | 1024 x 32                         | 256 x 64                            |
-| Conv3 | 128     | 16          | 4         | 256 x 64                          | 64 x 128                            |
-| Conv4 | 256     | 8           | 4         | 64 x 128                          | 16 x 256                            |
+The extractor uses a kernel of 64 samples, corresponding to $\sim31$ ms of data at 2048 Hz. This is deliberate. Gravitational wave chirps from binary mergers have structure on timescales of tens of milliseconds, and a large initial kernel lets the network capture these broad oscillation patterns directly. Subsequent groups use progressively smaller kernels (31, 15, 7) to refine the features, picking up finer temporal details from the patterns already extracted by earlier layers. Residual connections in every block provide direct gradient paths, allowing the network to be this deep without vanishing gradients.
 
-The first layer uses a kernel of 64 samples , corresponding to $\sim31$ ms of data at 2048 Hz. This is deliberate: gravitational wave chirps from binary mergers have structure on timescales of tens of milliseconds, and a large initial kernel lets the network capture these broad oscillation patterns directly. Subsequent layers use progressively smaller kernels (32, 16, 8) to refine the features, picking up finer temporal details from the patterns already extracted by earlier layers.
+After the residual backbone, AdaptiveConcatPool1d concatenates adaptive average pooling and adaptive max pooling, producing a 256-dimensional feature vector per detector (128 from each pooling mode). This lets the network retain both the overall signal level and the strongest activations.
 
-After the convolutional stack, Generalized Mean (GeM) pooling compresses whatever temporal dimension remains into a single feature vector. GeM computes:
-
-$$\mathbf{f} = \left(\frac{1}{T}\sum_{t=1}^{T} x_t^{\,p}\right)^{1/p}$$
-
-where $p$ is a learnable parameter. When $p = 1$, this is average pooling; as $p \to \infty$, it approaches max pooling. The network learns whether to focus on the strongest activations (max-like) or the overall signal level (average-like).
-
-With 256 features extracted from each of the three detectors, the vectors are concatenated into a single 768-dimensional representation. This is where the cross-detector correlation from the previous section becomes relevant. Up to this point, each detector was processed in isolation. Now, the classifier head learns to find patterns that span all three feature sets simultaneously. A real gravitational wave produces correlated features across detectors. Noise, being independent, does not. The network outputs a raw logit, which is passed through a sigmoid function at inference time to produce a probability between 0 and 1.
+With 256 features extracted from each of the three detectors, the vectors are concatenated into a single 768-dimensional representation. This is where the cross-detector correlation from the previous section becomes relevant. Up to this point, each detector was processed in isolation. Now, the classifier head (a 3-layer MLP: 768 -> 128 -> 64 -> 1) learns to find patterns that span all three feature sets simultaneously. A real gravitational wave produces correlated features across detectors. Noise, being independent, does not. The network outputs a raw logit, which is passed through a sigmoid function at inference time to produce a probability between 0 and 1.
 
 ### Training
 
@@ -117,7 +115,7 @@ The loss function is binary cross-entropy (BCE):
 
 $$\mathcal{L} = -\frac{1}{N}\sum_{i=1}^{N}\left[y_i \log \hat{y}_i + (1-y_i)\log(1-\hat{y}_i)\right]$$
 
-where $y_i \in \{0,1\}$ is the true label and $\hat{y}_i$ is the model's predicted probability. This is the natural choice for binary classification: it is the negative log-likelihood of a Bernoulli distribution, so minimizing it is equivalent to maximum likelihood estimation. The logarithm means confident wrong answers are penalized far more heavily than uncertain ones — predicting 0.99 when the true label is 0 incurs a much larger loss than predicting 0.6 (as a result, the current iteration of the model is quite conservative).
+where $y_i \in \{0,1\}$ is the true label and $\hat{y}_i$ is the model's predicted probability. This is the natural choice for binary classification: it is the negative log-likelihood of a Bernoulli distribution, so minimizing it is equivalent to maximum likelihood estimation. The logarithm means confident wrong answers are penalized far more heavily than uncertain ones — predicting 0.99 when the true label is 0 incurs a much larger loss than predicting 0.6.
 
 In addition to the main classifier loss, each detector branch produces its own auxiliary prediction through a small per-branch head. These auxiliary losses encourage each detector's convolutional features to be independently useful for classification, rather than relying on the other two branches to compensate. The total loss is a weighted sum:
 
@@ -125,7 +123,7 @@ $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{main}} + w_{\text{aux}} \cdot 
 
 where $w_{\text{aux}}$ controls how much the auxiliary task influences training. The intent is to improve gradient flow into the early convolutional layers via deep supervision. In practice, this did not measurably improve performance (see [developer-notes.md](developer-notes.md), Phase 2a), suggesting the bottleneck is in the feature extractor's representational capacity rather than in individual branch quality. The auxiliary heads remain useful as a diagnostic tool.
 
-The optimizer is AdamW, which combines Adam's adaptive per-parameter learning rates with decoupled weight decay. Weight decay adds a penalty proportional to the magnitude of the weights, gently pulling them toward zero each step. This discourages the network from fitting too closely to the training data by keeping the learned parameters small. Unlike classical L2 regularization, AdamW applies the decay directly to the weights rather than through the gradient, which interacts more cleanly with adaptive learning rate methods.
+The optimizer is AdamW, which adds weight decay to the Adam framework. Weight decay adds a penalty proportional to the magnitude of the weights, gently pulling them toward zero each step. This discourages the network from fitting too closely to the training data by keeping the learned parameters small. Unlike classical L2 regularization, AdamW applies the decay directly to the weights rather than through the gradient, which interacts more cleanly with adaptive learning rate methods.
 
 The learning rate follows a schedule with two phases. First, a linear warmup ramps the learning rate from near-zero up to the target value over the first few epochs, preventing the large random gradients of an untrained network from causing destructive early updates. After warmup, cosine annealing with warm restarts gradually reduces the learning rate following a cosine curve, periodically resetting it to allow the optimizer to escape local minima and explore new regions of the loss landscape.
 
@@ -139,23 +137,23 @@ The CNN architecture described above processes each detector independently and c
 
 $$\tau_{ij} = \frac{(\mathbf{r}_i - \mathbf{r}_j) \cdot \hat{n}(\theta, \varphi)}{c}$$
 
-where $\mathbf{r}_i$ and $\mathbf{r}_j$ are the detector positions on Earth's surface. The crucial constraint is consistency: for a real signal, all three pairwise delays $\tau_{12}$, $\tau_{13}$, $\tau_{23}$ must correspond to a single point on the sky sphere $S^2$. For noise, cross-correlations at any combination of delays are uncorrelated. This geometric consistency is one of the strongest discriminators between signal and noise, and neither the CNN backbone nor the classifier head encodes it explicitly.
+where $\mathbf{r}_i$ and $\mathbf{r}_j$ are the detector positions on Earth's surface, $\hat{n}$ is the normal vector pointing towards the source's sky location (assumed to be the same for all 3 detectors), and $c$ is the speed of light. The crucial constraint is consistency: for a real signal, all three pairwise delays $\tau_{12}$, $\tau_{13}$, $\tau_{23}$ must correspond to a single point on the sky sphere $S^2$. For noise, cross-correlations at any combination of delays are uncorrelated. This geometric consistency is one of the strongest discriminators between signal and noise, and neither the CNN backbone nor the classifier head encodes it explicitly.
 
-To exploit this structure, we construct a scalar field on $S^2$ that we call the sky consistency map. The idea is to ask, for every direction on the sky, how well the three detectors agree that a signal arrived from that direction. Given $N$ points on the sky, we compute the predicted time delays $\tau_{12}(k)$, $\tau_{13}(k)$, $\tau_{23}(k)$ for each sky pixel $k$ from the known detector coordinates. These are constants that depend only on the detector network geometry and are precomputed once. For each sample, we compute the full cross-correlation between each detector pair via FFT, evaluate it at the predicted delay for each sky pixel, and combine the three values into a single consistency score $C(k)$. The result is a function $C(\theta, \varphi)$ defined on the sphere: for noise, it is a flat random field; for a real signal, it peaks at the true source position, where all three detector pairs show correlated signal at the geometrically predicted delays.
+To exploit this structure, we construct a scalar field on $S^2$ that we call the **sky consistency map**. The idea is to ask, for every direction on the sky, how well the three detectors agree that a signal arrived from that direction. Given $N$ points on the sky, we compute the predicted time delays $\tau_{12}(k)$, $\tau_{13}(k)$, $\tau_{23}(k)$ for each sky pixel $k$ from the known detector coordinates. These are constants that depend only on the detector network geometry and are precomputed once. For each sample, we compute the full cross-correlation between each detector pair via FFT, evaluate it at the predicted delay for each sky pixel, and combine the three values into a single consistency score $C(k)$. The result is a function $C(\theta, \varphi)$ defined on the sphere: for noise, it is a flat random field; for a real signal, it (ideally) peaks at the true source position, where all three detector pairs show correlated signal at the geometrically predicted delays.
 
-This sky map is a function on $S^2$ and admits a natural expansion in spherical harmonics:
+This sky consistency map is a function on $S^2$, and therefore admits a natural expansion in spherical harmonics:
 
 $$C(\theta, \varphi) = \sum_{\ell=0}^{\ell_{\max}} \sum_{m=-\ell}^{\ell} a_{\ell m} \, Y_{\ell m}(\theta, \varphi)$$
 
-Truncating at $\ell_{\max} \sim 12$ gives $(\ell_{\max}+1)^2 = 169$ real coefficients, a compact representation of the sky map's angular structure. The $\ell = 0$ coefficient is the average consistency across the entire sky. Higher multipoles encode progressively finer angular structure, with a strong signal producing power at multipoles corresponding to the angular resolution set by the detector baselines.
+Truncating at $\ell_{\max} \sim 12$ gives $(\ell_{\max}+1)^2 = 169$ real coefficients, giving a compact representation of the sky map's angular structure. The $\ell = 0$ coefficient is the average consistency across the entire sky. Higher multipoles encode progressively finer angular structure, with a strong signal producing power at multipoles corresponding to the angular resolution set by the detector baselines.
 
 The detection problem has a natural symmetry: whether a gravitational wave is present does not depend on where on the sky it came from. But the *evidence* for a signal does depend on direction: it lives on $S^2$ and transforms under rotations. The spherical harmonic coefficients form what is called an equivariant representation: under an SO(3) rotation of the sky, each multipole $\ell$ transforms independently (via the Wigner $D$-matrices), and the full set of coefficients transforms in a known, structured way rather than being scrambled arbitrarily. The classifier head then collapses this structured representation into a single invariant output: the probability that a signal is present regardless of its origin. The aim is to process the data through intermediate representations that respect the symmetries of the domain, rather than hoping the network discovers those symmetries from the data alone.
 
-The detector network also carries a discrete symmetry. LIGO Hanford and Livingston are the same instrument design, so swapping them should not change the detection outcome. This $Z_2$ symmetry is enforced in the CNN backbone by weight sharing between the two LIGO branches (while Virgo, a different instrument, gets its own extractor). The sky map inherits this symmetry automatically, since cross-correlation is symmetric under pair reordering.
+The detector network also carries a discrete symmetry. LIGO Hanford and Livingston are the same instrument design, so swapping them should not change the detection outcome (the individual signals will differ in amplitude, but not in morphology). This $Z_2$ symmetry is enforced in the CNN backbone by weight sharing between the two LIGO branches (while Virgo, a different instrument, gets its own extractor). The sky consistency map inherits this symmetry automatically, since cross-correlation is symmetric under pair reordering.
 
-In the full architecture, the spherical harmonic coefficients are concatenated with the CNN backbone features before the classifier head. The two paths are complementary: the CNN captures signal morphology (what the waveform looks like in each detector), while the sky map captures geometric consistency (whether the detectors agree at delays that correspond to a single astrophysical source). A single detector might exhibit a chirp-like feature due to a noise artifact, but only the sky map can confirm that all three detectors see correlated signal with the correct relative timing for a real source at a specific sky position.
+In the full architecture (to be developed), the spherical harmonic coefficients are concatenated with the CNN backbone features before the classifier head. The two paths are complementary: the CNN captures signal morphology (what the waveform looks like in each detector), while the sky map captures geometric consistency (whether the detectors agree at delays that correspond to a single astrophysical source). A single detector might exhibit a chirp-like feature due to a noise artifact, but only the sky map can confirm that all three detectors see correlated signal with the correct relative timing for a real source at a specific sky position.
 
-## Why a Neural Network?
+## But why a Neural Network?
 
 The classical approach to gravitational wave detection is *matched filtering*: correlate the data with a template waveform and compare to a threshold. For Gaussian noise and a known waveform shape, matched filtering is optimal. It maximizes signal-to-noise ratio over all linear filters. So why replace it with a CNN?
 

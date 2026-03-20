@@ -644,3 +644,41 @@ def plot_all_metrics(
         plt.close(fig)
 
     return fig
+
+
+# =====================================================================
+#                         LR RANGE TEST
+# =====================================================================
+
+def plot_lr_range_test(lr_data: dict, save_path: Optional[str] = None):
+    """
+    Plot LR range test results: loss vs learning rate (log scale).
+
+    Parameters
+    ----------
+    lr_data : dict
+        Output from lr_range_test() with keys 'lrs', 'losses', 'smoothed', 'suggested_lr'.
+    save_path : str | None
+        Path to save the plot.
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    ax.plot(lr_data['lrs'], lr_data['losses'], alpha=0.2, color='steelblue', label='raw')
+    ax.plot(lr_data['lrs'], lr_data['smoothed'], color='steelblue', linewidth=2, label='smoothed')
+    ax.axvline(lr_data['suggested_lr'], color='red', linestyle='--', linewidth=1.5,
+               label=f"suggested: {lr_data['suggested_lr']:.2e}")
+
+    ax.set_xscale('log')
+    ax.set_xlabel('Learning Rate')
+    ax.set_ylabel('Loss')
+    ax.set_title('LR Range Test')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+
+    return fig

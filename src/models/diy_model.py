@@ -1,9 +1,9 @@
 """
-1D CNN Model for G2Net gravitational wave detection.
+Deep residual 1D CNN for G2Net gravitational wave detection.
 
-Custom PyTorch implementation using 1D convolutions on whitened signals.
-This architecture processes the 3 detector signals through shared conv layers,
-then concatenates features for classification.
+Phase 3, Step 1: ~10 residual blocks with progressive downsampling.
+LIGO H1/L1 share extractor weights; Virgo has a separate extractor.
+Residual backbone is shared across all 3 branches.
 """
 
 from __future__ import annotations
@@ -15,32 +15,97 @@ import torch.nn.functional as F
 
 
 # ============================================================================================
-#                                      GEM POOLING
+#                                        POOLING
 # ============================================================================================
 
-class GeMPool1d(nn.Module):
-    """Generalized Mean Pooling over the time dimension."""
+class GeM(nn.Module):
+    """
+    Generalized Mean pooling with learnable exponent.
 
-    def __init__(self, p: float = 3.0):
+    Computes (mean(x^p))^(1/p) with learnable p (init=3). Interpolates between
+    average pooling (p=1) and max pooling (p->inf). Negative activations from
+    BatchNorm are clamped to eps. Forces float32 to prevent NaN under AMP.
+
+    Parameters
+    ----------
+    kernel_size : int
+        Pooling window size.
+    p : float
+        Initial value for the learnable exponent.
+    eps : float
+        Clamping floor for negative/zero activations.
+    """
+
+    def __init__(self, kernel_size: int, p: float = 3.0, eps: float = 1e-6):
         super().__init__()
-        self.p = nn.Parameter(torch.tensor([p]))
+        self.kernel_size = kernel_size
+        self.p = nn.Parameter(torch.tensor(p))
+        self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input of shape (batch, channels, time).
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            x = x.clamp(min=self.eps).pow(self.p)
+            x = F.avg_pool1d(x, self.kernel_size)
+            return x.pow(1.0 / self.p)
 
-        Returns
-        -------
-        torch.Tensor
-            Pooled output of shape (batch, channels).
-        """
-        p = self.p.clamp(1.0, 10.0)
-        eps = 1e-6
-        x = x.clamp(min=eps)
-        return x.pow(p).mean(dim=2).pow(1.0 / p)
+
+class AdaptiveConcatPool1d(nn.Module):
+    """Concatenation of adaptive average pooling and adaptive max pooling."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.cat([
+            F.adaptive_avg_pool1d(x, 1),
+            F.adaptive_max_pool1d(x, 1),
+        ], dim=1)
+
+
+# ============================================================================================
+#                                    RESIDUAL BLOCK
+# ============================================================================================
+
+class ResBlock(nn.Module):
+    """
+    Residual block with two Conv1d layers and optional GeM downsampling (part of ablation study).
+
+    Parameters
+    ----------
+    in_channels : int
+        Number of input channels.
+    out_channels : int
+        Number of output channels.
+    kernel_size : int
+        Kernel size for both convolutions.
+    downsample_factor : int | None
+        Spatial downsampling factor via GeM pooling. None for identity blocks.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, downsample_factor: int | None = None):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, padding='same')
+        self.bn1 = nn.BatchNorm1d(out_channels, momentum=0.1, eps=1e-5)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, padding='same')
+        self.bn2 = nn.BatchNorm1d(out_channels, momentum=0.1, eps=1e-5)
+        self.act = nn.SiLU()
+        self.pool = GeM(downsample_factor) if downsample_factor else None
+
+        # shortcut: project channels and/or downsample to match main path
+        needs_proj = (in_channels != out_channels)
+        layers = []
+        if needs_proj:
+            layers.append(nn.Conv1d(in_channels, out_channels, 1))
+            layers.append(nn.BatchNorm1d(out_channels, momentum=0.1, eps=1e-5))
+        if downsample_factor:
+            layers.append(GeM(downsample_factor))
+        self.shortcut = nn.Sequential(*layers) if layers else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.shortcut(x)
+        out = self.act(self.bn1(self.conv1(x)))         # first conv + BN + activation
+        out = self.bn2(self.conv2(out))                 # second conv + BN (no activation yet)
+        if self.pool is not None:                       # ablation (GeM)
+            out = self.pool(out)                    
+        return self.act(out + residual)                 # add residual and apply final activation
 
 
 # ============================================================================================
@@ -49,63 +114,88 @@ class GeMPool1d(nn.Module):
 
 class DIYModel(nn.Module):
     """
-    1D CNN model for binary classification of GW signals.
+    Deep residual 1D CNN for binary classification of GW signals.
 
-    Architecture:
-    - Shared 1D conv layers process each detector independently
-    - Concatenated detector features fed to classifier head
-    - Auxiliary per-branch heads supervise individual detector features
+    Architecture (Phase 3, Step 1):
+    - Separate extractors for LIGO (H1/L1 shared) and Virgo
+    - 10 residual blocks with GeM downsampling and channel widening
+    - AdaptiveConcatPool1d (avg + max) for global pooling
+    - 3-layer classifier head
+    - Auxiliary per-branch heads for training supervision
     - All outputs are raw logits (no sigmoid); use BCEWithLogitsLoss
     - Optimizer: AdamW (configured externally in model_runs.py)
+
+    Temporal:  4096 -> 2048 (extractor) -> 512 -> 128 -> 32; 
+    Channels:  1 -> n -> n -> 2n -> 4n -> 4n
 
     Input shape: (batch_size, 3, 4096) - 3 detectors, 4096 time samples
     """
 
-    def __init__(self, n_samples: int = 4096, dropout_rate: float = 0.5):
+    def __init__(self, n_channels: int = 32, dropout_rate: float = 0.5):
         """
         Parameters
         ----------
-        n_samples : int
-            Number of time samples per detector (4096 for 2s at 2048Hz).
+        n_channels : int
+            Base channel width (n). Channels progress as n -> 2n -> 4n.
         dropout_rate : float
-            Dropout rate for regularization.
+            Dropout rate for classifier head.
         """
         super().__init__()
-        self.n_samples = n_samples
-        self.dropout_rate = dropout_rate
+        n = n_channels
 
-        # convolutional layer parameters: (filters, kernel_size, pool_size)
-        self.conv_config = [
-            (32, 64, 4),   # large kernel to capture low-freq patterns
-            (64, 32, 4),
-            (128, 16, 4),
-            (256, 8, 4),
+        # extractors: Conv(1,n,64) -> BN -> SiLU -> Conv(n,n,64) -> GeM(2)
+        # H1/L1 share weights (same instrument type); Virgo is separate
+        self.ligo_extractor = nn.Sequential(
+            nn.Conv1d(1, n, 64, padding='same'),
+            nn.BatchNorm1d(n, momentum=0.1, eps=1e-5),
+            nn.SiLU(),
+            nn.Conv1d(n, n, 64, padding='same'),
+            GeM(2),
+        )
+        self.virgo_extractor = nn.Sequential(
+            nn.Conv1d(1, n, 64, padding='same'),
+            nn.BatchNorm1d(n, momentum=0.1, eps=1e-5),
+            nn.SiLU(),
+            nn.Conv1d(n, n, 64, padding='same'),
+            GeM(2),
+        )
+
+        # residual backbone (shared by all 3 branches)
+        # 5 groups x 2 blocks = 10 residual blocks (20 conv layers)
+        # (out_channels, kernel_size, downsample_factor)
+        # first block in each group gets the downsample; second is identity
+        groups = [
+            (n,     31, 4),     # group 1: 2048 -> 512
+            (n,     31, None),  # group 2: 512 (no downsample)
+            (2 * n, 15, 4),     # group 3: 512 -> 128, widen to 2n
+            (4 * n,  7, 4),     # group 4: 128 -> 32, widen to 4n
+            (4 * n,  7, None),  # group 5: 32 (no downsample)
         ]
 
-        # shared conv blocks (process each detector independently)
-        self.conv_blocks = nn.ModuleList()
-        in_ch = 1
-        for filters, kernel_size, pool_size in self.conv_config:
-            block = nn.Sequential(
-                nn.Conv1d(in_ch, filters, kernel_size, padding='same'),
-                nn.BatchNorm1d(filters, momentum=0.1, eps=1e-5),
-                nn.SiLU(),
-                nn.MaxPool1d(pool_size),
-            )
-            self.conv_blocks.append(block)
-            in_ch = filters
+        blocks = []
+        in_ch = n
+        for out_ch, k, ds in groups:
+            blocks.append(ResBlock(in_ch, out_ch, k, downsample_factor=ds))
+            in_ch = out_ch
+            blocks.append(ResBlock(in_ch, out_ch, k))
 
-        # GeM pooling
-        self.gem_pool = GeMPool1d(p=3.0)
+        self.backbone = nn.Sequential(*blocks)
+
+        # global pooling: (batch, 4n, T) -> (batch, 8n) via concat of avg + max
+        self.global_pool = AdaptiveConcatPool1d()
 
         # auxiliary per-branch classification heads (raw logits)
-        self.branch_head = nn.Linear(256, 1)
+        self.branch_head = nn.Linear(8 * n, 1)
 
-        # classifier head: 3 detectors * 256 features = 768
+        # classifier head: 3 branches * 8n = 24n features
+        feat_dim = 3 * 8 * n
         self.classifier = nn.Sequential(
-            nn.Linear(768, 64),
-            nn.BatchNorm1d(64, momentum=0.1, eps=1e-5),
+            nn.Linear(feat_dim, 128),
+            nn.BatchNorm1d(128, momentum=0.1, eps=1e-5),
+            nn.Dropout(dropout_rate),
             nn.SiLU(),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64, momentum=0.1, eps=1e-5),
             nn.Dropout(dropout_rate),
             nn.Linear(64, 1),
         )
@@ -117,58 +207,35 @@ class DIYModel(nn.Module):
         """Apply Kaiming normal initialization to conv and linear layers."""
         for m in self.modules():
             if isinstance(m, (nn.Conv1d, nn.Linear)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='linear')
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def _process_detector(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Process a single detector through conv layers.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input of shape (batch, time_steps).
-
-        Returns
-        -------
-        torch.Tensor
-            Features of shape (batch, 256).
-        """
-        # (batch, time) -> (batch, 1, time) for Conv1d
-        x = x.unsqueeze(1)
-
-        for block in self.conv_blocks:
-            x = block(x)
-
-        # GeM pooling: (batch, 256, reduced_time) -> (batch, 256)
-        x = self.gem_pool(x)
-        return x
-
     def forward(self, X: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """
-        Perform a forward pass through the network.
-
         Parameters
         ----------
         X : torch.Tensor
-            Input tensor of shape (batch_size, 3, n_samples).
+            Input of shape (batch_size, 3, 4096).
 
         Returns
         -------
         torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]
-            During inference: raw logits of shape (batch_size, 1).
-            During training: tuple of (main logits, list of 3 branch logits).
+            Inference: logits (batch_size, 1).
+            Training: (logits, [h1_logits, l1_logits, v1_logits]).
         """
-        # process each detector through shared conv layers
-        h1_feat = self._process_detector(X[:, 0, :])  # (batch, 256)
-        l1_feat = self._process_detector(X[:, 1, :])
-        v1_feat = self._process_detector(X[:, 2, :])
+        # per-detector extraction
+        h1 = self.ligo_extractor(X[:, 0:1, :])
+        l1 = self.ligo_extractor(X[:, 1:2, :])
+        v1 = self.virgo_extractor(X[:, 2:3, :])
 
-        # concatenate detector features
-        combined = torch.cat([h1_feat, l1_feat, v1_feat], dim=-1)  # (batch, 768)
+        # shared backbone -> global pool -> (batch, 8n)
+        h1_feat = self.global_pool(self.backbone(h1)).squeeze(-1)
+        l1_feat = self.global_pool(self.backbone(l1)).squeeze(-1)
+        v1_feat = self.global_pool(self.backbone(v1)).squeeze(-1)
 
-        # classifier head (raw logits)
+        # classify
+        combined = torch.cat([h1_feat, l1_feat, v1_feat], dim=-1)
         main_logits = self.classifier(combined)
 
         if self.training:
