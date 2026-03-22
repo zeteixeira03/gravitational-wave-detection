@@ -42,11 +42,11 @@ Deep residual backbone with ~10 residual blocks (20 conv layers), GeM pooling, a
 
 | Accuracy | AUC | Precision | Recall | F1 |
 |----------|-----|-----------|--------|----|
-| 0.792 | 0.868 | 0.812 | 0.756 | 0.783 |
+| 0.797 | 0.865 | 0.860 | 0.708 | 0.781 |
 
 <p align="center"><img src="assets/dashboard.png" width="700"></p>
 
-The deep residual backbone (Phase 3, Step 1) brought a meaningful improvement over the Phase 1 plateau at 0.858 AUC. Recall improved substantially (0.64 -> 0.75) with precision coming down from its previously over-conservative 0.91 to a more balanced 0.82.
+The deep residual backbone (Phase 3, Step 1) brought a meaningful improvement over the Phase 1 plateau at 0.858 AUC. Adding stochastic depth (drop_path_rate=0.1) was neutral (0.865 vs 0.866 baseline). Overfitting is visible after epoch ~15; next step is augmentation diversity (spectral dropout, channel shuffle).
 
 ## Installation
 

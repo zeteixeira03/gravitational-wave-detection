@@ -137,7 +137,7 @@ The $S^2$ features concatenate with the CNN backbone output before the classifie
 
 Each step is gated on the previous one showing improvement.
 
-**Step 1: Deep residual backbone (implemented).** Replaced the 4 plain conv blocks with ~10 residual blocks. Added separate Virgo extractor, GeM pooling, stochastic depth. AUC: 0.866 (up from 0.858 plateau). Recall improved substantially (0.64 -> 0.75). Spectral dropout and channel shuffle not yet added.
+**Step 1: Deep residual backbone (implemented).** Replaced the 4 plain conv blocks with ~10 residual blocks. Added separate Virgo extractor, GeM pooling. AUC: 0.866 (up from 0.858 plateau). Recall improved substantially (0.64 -> 0.75). Stochastic depth (drop_path_rate=0.1) was neutral (0.865). Spectral dropout and channel shuffle not yet added.
 
 **Step 1b: Two-stage branch fusion.** After the backbone shows improvement, add a second fusion stage: 4 parallel paths (H1, L1, V1 individually + all-3-concatenated), then all 4 concatenated through more residual blocks.
 
