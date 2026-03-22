@@ -38,7 +38,9 @@
 │        │                       │                           │                │
 │        │                       │ GWTensorDataset           │ Deep residual  │
 │        │                       │ + DataLoader              │ 1D CNN (10     │
-│        │                       │ (shard streaming)         │ res blocks)    │
+│        │                       │ (shard streaming)         │ res blocks,    │
+│        │                       │                           │ stochastic     │
+│        │                       │                           │ depth, GeM)    │
 │        │                       ▼                           │ 3-layer head   │
 │        │                    fit()                          ▼                │
 │        │                       │                      Trained Weights       │

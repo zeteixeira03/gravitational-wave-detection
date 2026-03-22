@@ -36,7 +36,7 @@ Input (3 detectors x 4096 samples)
                                                                           3-layer classifier ---> logits
 ```
 
-Deep residual backbone with ~10 residual blocks (20 conv layers) and GeM pooling. LIGO H1/L1 share extractor weights; Virgo has a separate extractor. Channels progress as 32 -> 32 -> 64 -> 128 -> 128, with kernel sizes decreasing from 64 -> 31 -> 15 -> 7.
+Deep residual backbone with ~10 residual blocks (20 conv layers), GeM pooling, and stochastic depth. LIGO H1/L1 share extractor weights; Virgo has a separate extractor. Channels progress as 32 -> 32 -> 64 -> 128 -> 128, with kernel sizes decreasing from 64 -> 31 -> 15 -> 7.
 
 ## Current Performance
 

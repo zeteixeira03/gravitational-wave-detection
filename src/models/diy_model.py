@@ -61,12 +61,40 @@ class AdaptiveConcatPool1d(nn.Module):
 
 
 # ============================================================================================
+#                                   STOCHASTIC DEPTH
+# ============================================================================================
+
+def drop_path(x: torch.Tensor, drop_prob: float, training: bool) -> torch.Tensor:
+    """
+    Stochastic depth: randomly drop the entire residual branch per sample.
+
+    Uses inverted dropout: surviving samples are scaled by 1/(1-p) during training
+    so that no scaling is needed at inference.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Residual branch output of shape (B, C, T).
+    drop_prob : float
+        Probability of dropping this branch for each sample.
+    training : bool
+        Whether model is in training mode.
+    """
+    if drop_prob == 0.0 or not training:
+        return x
+    keep_prob = 1.0 - drop_prob
+    mask = torch.rand(x.shape[0], 1, 1, dtype=x.dtype, device=x.device)
+    mask = torch.floor(mask + keep_prob)
+    return x * mask / keep_prob
+
+
+# ============================================================================================
 #                                    RESIDUAL BLOCK
 # ============================================================================================
 
 class ResBlock(nn.Module):
     """
-    Residual block with two Conv1d layers and optional GeM downsampling (part of ablation study).
+    Residual block with two Conv1d layers, optional GeM downsampling, and stochastic depth.
 
     Parameters
     ----------
@@ -78,9 +106,11 @@ class ResBlock(nn.Module):
         Kernel size for both convolutions.
     downsample_factor : int | None
         Spatial downsampling factor via GeM pooling. None for identity blocks.
+    drop_prob : float
+        Stochastic depth drop probability for this block.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, downsample_factor: int | None = None):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, downsample_factor: int | None = None, drop_prob: float = 0.0):
         super().__init__()
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, padding='same')
         self.bn1 = nn.BatchNorm1d(out_channels, momentum=0.1, eps=1e-5)
@@ -88,6 +118,7 @@ class ResBlock(nn.Module):
         self.bn2 = nn.BatchNorm1d(out_channels, momentum=0.1, eps=1e-5)
         self.act = nn.SiLU()
         self.pool = GeM(downsample_factor) if downsample_factor else None
+        self.drop_prob = drop_prob
 
         # shortcut: project channels and/or downsample to match main path
         needs_proj = (in_channels != out_channels)
@@ -103,9 +134,10 @@ class ResBlock(nn.Module):
         residual = self.shortcut(x)
         out = self.act(self.bn1(self.conv1(x)))         # first conv + BN + activation
         out = self.bn2(self.conv2(out))                 # second conv + BN (no activation yet)
-        if self.pool is not None:                       # ablation (GeM)
-            out = self.pool(out)                    
-        return self.act(out + residual)                 # add residual and apply final activation
+        if self.pool is not None:
+            out = self.pool(out)
+        out = drop_path(out, self.drop_prob, self.training)
+        return self.act(out + residual)
 
 
 # ============================================================================================
@@ -118,20 +150,20 @@ class DIYModel(nn.Module):
 
     Architecture (Phase 3, Step 1):
     - Separate extractors for LIGO (H1/L1 shared) and Virgo
-    - 10 residual blocks with GeM downsampling and channel widening
+    - 10 residual blocks with GeM downsampling, channel widening, and stochastic depth
     - AdaptiveConcatPool1d (avg + max) for global pooling
     - 3-layer classifier head
     - Auxiliary per-branch heads for training supervision
     - All outputs are raw logits (no sigmoid); use BCEWithLogitsLoss
     - Optimizer: AdamW (configured externally in model_runs.py)
 
-    Temporal:  4096 -> 2048 (extractor) -> 512 -> 128 -> 32; 
+    Temporal:  4096 -> 2048 (extractor) -> 512 -> 128 -> 32;
     Channels:  1 -> n -> n -> 2n -> 4n -> 4n
 
     Input shape: (batch_size, 3, 4096) - 3 detectors, 4096 time samples
     """
 
-    def __init__(self, n_channels: int = 32, dropout_rate: float = 0.5):
+    def __init__(self, n_channels: int = 32, dropout_rate: float = 0.5, drop_path_rate: float = 0.0):
         """
         Parameters
         ----------
@@ -139,6 +171,9 @@ class DIYModel(nn.Module):
             Base channel width (n). Channels progress as n -> 2n -> 4n.
         dropout_rate : float
             Dropout rate for classifier head.
+        drop_path_rate : float
+            Maximum stochastic depth drop probability (applied to last block;
+            linearly increases from 0 at the first block).
         """
         super().__init__()
         n = n_channels
@@ -172,12 +207,18 @@ class DIYModel(nn.Module):
             (4 * n,  7, None),  # group 5: 32 (no downsample)
         ]
 
+        n_blocks = len(groups) * 2
+        drop_probs = np.linspace(0.0, drop_path_rate, n_blocks)
+
         blocks = []
         in_ch = n
+        block_idx = 0
         for out_ch, k, ds in groups:
-            blocks.append(ResBlock(in_ch, out_ch, k, downsample_factor=ds))
+            blocks.append(ResBlock(in_ch, out_ch, k, downsample_factor=ds, drop_prob=drop_probs[block_idx]))
             in_ch = out_ch
-            blocks.append(ResBlock(in_ch, out_ch, k))
+            block_idx += 1
+            blocks.append(ResBlock(in_ch, out_ch, k, drop_prob=drop_probs[block_idx]))
+            block_idx += 1
 
         self.backbone = nn.Sequential(*blocks)
 
@@ -229,10 +270,13 @@ class DIYModel(nn.Module):
         l1 = self.ligo_extractor(X[:, 1:2, :])
         v1 = self.virgo_extractor(X[:, 2:3, :])
 
-        # shared backbone -> global pool -> (batch, 8n)
-        h1_feat = self.global_pool(self.backbone(h1)).squeeze(-1)
-        l1_feat = self.global_pool(self.backbone(l1)).squeeze(-1)
-        v1_feat = self.global_pool(self.backbone(v1)).squeeze(-1)
+        # batched backbone pass: (3*B, C, T) -> split -> global pool
+        stacked = torch.cat([h1, l1, v1], dim=0)
+        stacked = self.backbone(stacked)
+        h1_feat, l1_feat, v1_feat = stacked.chunk(3, dim=0)
+        h1_feat = self.global_pool(h1_feat).squeeze(-1)
+        l1_feat = self.global_pool(l1_feat).squeeze(-1)
+        v1_feat = self.global_pool(v1_feat).squeeze(-1)
 
         # classify
         combined = torch.cat([h1_feat, l1_feat, v1_feat], dim=-1)

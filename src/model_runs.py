@@ -166,7 +166,7 @@ def fit(
 
     # amp setup (CUDA only)
     use_amp = use_amp and (device.type == 'cuda')
-    scaler = torch.cuda.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     history = {
         'train_loss': [], 'train_acc': [],
@@ -201,7 +201,7 @@ def fit(
             shard_dataset = GWTensorDataset(data['signals'], data['labels'], augment=True)
             shard_loader = DataLoader(
                 shard_dataset, batch_size=batch_size, shuffle=True,
-                num_workers=0, pin_memory=(device.type == 'cuda')
+                num_workers=2, pin_memory=(device.type == 'cuda')
             )
 
             desc = f"Epoch {epoch+1}/{epochs}"
@@ -215,7 +215,7 @@ def fit(
                 X_batch, y_batch = mixup_batch(X_batch, y_batch)
 
                 optimizer.zero_grad()
-                with torch.cuda.amp.autocast("cuda", enabled=use_amp):
+                with torch.amp.autocast("cuda", enabled=use_amp):
                     logits, branch_logits = model(X_batch)
                     loss = model.compute_loss(y_batch, logits, branch_logits, aux_loss_weight)
                 scaler.scale(loss).backward()
@@ -249,7 +249,7 @@ def fit(
                 X_batch = X_batch.to(device)
                 y_batch_float = y_batch.float().unsqueeze(1).to(device)
 
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.amp.autocast("cuda", enabled=use_amp):
                     logits = model(X_batch)
                     loss = model.compute_loss(y_batch_float, logits)
                 val_losses.append(loss.item())
@@ -518,6 +518,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     early_stopping_patience = hyperparameters.get('early_stopping_patience', 10)
     warmup_epochs = hyperparameters.get('warmup_epochs', 0)
     aux_loss_weight = hyperparameters.get('aux_loss_weight', 0.0)
+    drop_path_rate = hyperparameters.get('drop_path_rate', 0.0)
 
     print(f"Signal length: {n_samples_config}")
     print(f"Learning rate: {learning_rate}")
@@ -528,6 +529,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     print(f"Early stopping patience: {early_stopping_patience}")
     print(f"Warmup epochs: {warmup_epochs}")
     print(f"Aux loss weight: {aux_loss_weight}")
+    print(f"Drop path rate: {drop_path_rate}")
     print(f"Total samples: {n_samples}")
     print("Mode: TENSOR (preprocessed data, shard streaming)")
 
@@ -608,7 +610,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
 
     # initialize model
     n_channels = hyperparameters.get('n_channels', 32)
-    model = DIYModel(n_channels=n_channels, dropout_rate=dropout_rate).to(device)
+    model = DIYModel(n_channels=n_channels, dropout_rate=dropout_rate, drop_path_rate=drop_path_rate).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: DIYModel ({n_params:,} parameters)")
 
@@ -724,7 +726,7 @@ def lr_range_test(
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr_start, weight_decay=weight_decay)
     use_amp = use_amp and (device.type == 'cuda')
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     lr_mult = (lr_end / lr_start) ** (1.0 / n_steps)
     lrs = []
@@ -747,7 +749,7 @@ def lr_range_test(
             y_batch = y_batch.float().unsqueeze(1).to(device)
 
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp):
                 output = model(X_batch)
                 logits = output[0] if isinstance(output, tuple) else output
                 loss = F.binary_cross_entropy_with_logits(logits, y_batch)
@@ -814,6 +816,7 @@ def run_lr_range_test(data_dir, n_samples, hyperparameters):
     batch_size = hyperparameters.get('batch_size', 64)
     dropout_rate = hyperparameters.get('dropout_rate', 0.5)
     n_channels = hyperparameters.get('n_channels', 32)
+    drop_path_rate = hyperparameters.get('drop_path_rate', 0.0)
 
     # find shards
     shard_files = sorted(data_dir.glob('shard_*.pt'))
@@ -825,7 +828,7 @@ def run_lr_range_test(data_dir, n_samples, hyperparameters):
             raise FileNotFoundError(f"No data files in {data_dir}")
 
     # create model
-    model = DIYModel(n_channels=n_channels, dropout_rate=dropout_rate).to(device)
+    model = DIYModel(n_channels=n_channels, dropout_rate=dropout_rate, drop_path_rate=drop_path_rate).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: DIYModel ({n_params:,} parameters)")
     print(f"Device: {device}")
@@ -899,6 +902,7 @@ def main(mode='train'):
         'aux_loss_weight': 0.2,
         'use_amp': True,
         'clip_grad_norm': 1.0,
+        'drop_path_rate': 0.1,
     }
 
     # ========== SETUP PATHS ==========

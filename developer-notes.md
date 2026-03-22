@@ -116,7 +116,7 @@ The gradient of the loss with respect to any early layer always includes a term 
 
 The second design choice is width. The Phase 1-2 model was wide (32 -> 64 -> 128 -> 256 filters) on the assumption that more filters capture more diverse features. But gravitational wave strain is a one-dimensional scalar quantity, i.e. there is no spatial structure or color channels as in images. The diversity of features at any given scale is limited by the physics: the signal is a chirp with a few parameters (masses, spins, distance, sky position). A narrower network (e.g., 32 filters throughout) with residual connections and many more layers can represent the same feature space more efficiently, because depth allows it to compose simple features into complex ones rather than needing many parallel filters to capture complex patterns in a single layer.
 
-The implemented architecture: ~10 residual blocks (20 convolutional layers) with width 32, decreasing kernel sizes (64 -> 31 -> 15 -> 7), and GeM pooling for learned downsampling.
+The implemented architecture: ~10 residual blocks (20 convolutional layers) with width 32, decreasing kernel sizes (64 -> 31 -> 15 -> 7), GeM pooling for learned downsampling, and stochastic depth. Drop probability increases linearly from 0 at block 0 to `drop_path_rate` at block 9. All 10 blocks are subject to stochastic depth, including the 3 that downsample. When a downsampling block is dropped, the shortcut path still handles projection and GeM, so the sample gets downsampled without learned features rather than skipped entirely. At `drop_path_rate=0.1` the chance of multiple downsampling blocks dropping simultaneously for one sample is negligible.
 
 ### Weight sharing
 
@@ -137,7 +137,7 @@ The $S^2$ features concatenate with the CNN backbone output before the classifie
 
 Each step is gated on the previous one showing improvement.
 
-**Step 1: Deep residual backbone (implemented).** Replaced the 4 plain conv blocks with ~10 residual blocks. Added separate Virgo extractor. AUC: 0.866 (up from 0.858 plateau). Recall improved substantially (0.64 -> 0.75). Spectral dropout and channel shuffle not yet added.
+**Step 1: Deep residual backbone (implemented).** Replaced the 4 plain conv blocks with ~10 residual blocks. Added separate Virgo extractor, GeM pooling, stochastic depth. AUC: 0.866 (up from 0.858 plateau). Recall improved substantially (0.64 -> 0.75). Spectral dropout and channel shuffle not yet added.
 
 **Step 1b: Two-stage branch fusion.** After the backbone shows improvement, add a second fusion stage: 4 parallel paths (H1, L1, V1 individually + all-3-concatenated), then all 4 concatenated through more residual blocks.
 
