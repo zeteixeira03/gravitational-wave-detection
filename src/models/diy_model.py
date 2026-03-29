@@ -1,9 +1,10 @@
 """
 Deep residual 1D CNN for G2Net gravitational wave detection.
 
-Phase 3, Step 1: ~10 residual blocks with progressive downsampling.
-LIGO H1/L1 share extractor weights; Virgo has a separate extractor.
-Residual backbone is shared across all 3 branches.
+Phase 3, Step 1b: V2-style two-stage fusion on top of ~10 residual backbone blocks.
+After the shared backbone, 4 parallel paths (H1, L1, V1, joint) are processed through
+individual branch blocks, then merged and processed through 4 fusion blocks.
+LIGO H1/L1 share extractor and branch weights; Virgo has separate weights.
 """
 
 from __future__ import annotations
@@ -148,17 +149,19 @@ class DIYModel(nn.Module):
     """
     Deep residual 1D CNN for binary classification of GW signals.
 
-    Architecture (Phase 3, Step 1):
+    Architecture (Phase 3, Step 1b — V2 two-stage fusion):
     - Separate extractors for LIGO (H1/L1 shared) and Virgo
-    - 10 residual blocks with GeM downsampling, channel widening, and stochastic depth
-    - AdaptiveConcatPool1d (avg + max) for global pooling
+    - 10 residual backbone blocks with GeM downsampling and channel widening
+    - V2 fusion: 4 parallel branch paths (H1, L1, V1, joint) x 2 ResBlocks each
+    - 4 fusion blocks processing merged branch outputs
+    - AdaptiveConcatPool1d (avg + max) on fused features
     - 3-layer classifier head
     - Auxiliary per-branch heads for training supervision
     - All outputs are raw logits (no sigmoid); use BCEWithLogitsLoss
-    - Optimizer: AdamW (configured externally in model_runs.py)
 
-    Temporal:  4096 -> 2048 (extractor) -> 512 -> 128 -> 32;
-    Channels:  1 -> n -> n -> 2n -> 4n -> 4n
+    Backbone:  4096 -> 2048 (extractor) -> 512 -> 128 -> 32
+    Channels:  1 -> n -> n -> 2n -> 4n (backbone) -> 4n (branches) -> 16n (fused)
+    Fusion:    4 paths x 4n -> concat 16n -> 4 ResBlocks -> ConcatPool -> 32n features
 
     Input shape: (batch_size, 3, 4096) - 3 detectors, 4096 time samples
     """
@@ -178,7 +181,8 @@ class DIYModel(nn.Module):
         super().__init__()
         n = n_channels
 
-        # extractors: Conv(1,n,64) -> BN -> SiLU -> Conv(n,n,64) -> GeM(2)
+        # ---- extractors ----
+        # Conv(1,n,64) -> BN -> SiLU -> Conv(n,n,64) -> GeM(2)
         # H1/L1 share weights (same instrument type); Virgo is separate
         self.ligo_extractor = nn.Sequential(
             nn.Conv1d(1, n, 64, padding='same'),
@@ -195,10 +199,9 @@ class DIYModel(nn.Module):
             GeM(2),
         )
 
-        # residual backbone (shared by all 3 branches)
-        # 5 groups x 2 blocks = 10 residual blocks (20 conv layers)
+        # ---- residual backbone (shared by all 3 branches) ----
+        # 5 groups x 2 blocks = 10 residual blocks
         # (out_channels, kernel_size, downsample_factor)
-        # first block in each group gets the downsample; second is identity
         groups = [
             (n,     31, 4),     # group 1: 2048 -> 512
             (n,     31, None),  # group 2: 512 (no downsample)
@@ -207,8 +210,10 @@ class DIYModel(nn.Module):
             (4 * n,  7, None),  # group 5: 32 (no downsample)
         ]
 
-        n_blocks = len(groups) * 2
-        drop_probs = np.linspace(0.0, drop_path_rate, n_blocks)
+        # stochastic depth schedule across all blocks:
+        # 10 backbone + 2 branch-depth (parallel) + 4 fusion = 16 depth levels
+        n_depth_levels = 16
+        drop_probs = np.linspace(0.0, drop_path_rate, n_depth_levels)
 
         blocks = []
         in_ch = n
@@ -219,29 +224,58 @@ class DIYModel(nn.Module):
             block_idx += 1
             blocks.append(ResBlock(in_ch, out_ch, k, drop_prob=drop_probs[block_idx]))
             block_idx += 1
-
         self.backbone = nn.Sequential(*blocks)
 
-        # global pooling: (batch, 4n, T) -> (batch, 8n) via concat of avg + max
+        # ---- V2 two-stage fusion: individual branch paths ----
+        # H1/L1 share branch weights (same instrument); Virgo separate
+        self.ligo_branch = nn.Sequential(
+            ResBlock(4 * n, 4 * n, 7, drop_prob=drop_probs[10]),
+            ResBlock(4 * n, 4 * n, 7, drop_prob=drop_probs[11]),
+        )
+        self.virgo_branch = nn.Sequential(
+            ResBlock(4 * n, 4 * n, 7, drop_prob=drop_probs[10]),
+            ResBlock(4 * n, 4 * n, 7, drop_prob=drop_probs[11]),
+        )
+
+        # ---- V2 two-stage fusion: joint branch ----
+        # all 3 detectors concatenated -> project down -> 2 ResBlocks
+        self.joint_project = nn.Sequential(
+            nn.Conv1d(3 * 4 * n, 4 * n, 1),
+            nn.BatchNorm1d(4 * n, momentum=0.1, eps=1e-5),
+        )
+        self.joint_branch = nn.Sequential(
+            ResBlock(4 * n, 4 * n, 7, drop_prob=drop_probs[10]),
+            ResBlock(4 * n, 4 * n, 7, drop_prob=drop_probs[11]),
+        )
+
+        # ---- V2 two-stage fusion: post-merge processing ----
+        # 4 paths x 4n channels concatenated = 16n -> 4 ResBlocks
+        self.fusion = nn.Sequential(
+            ResBlock(16 * n, 16 * n, 7, drop_prob=drop_probs[12]),
+            ResBlock(16 * n, 16 * n, 7, drop_prob=drop_probs[13]),
+            ResBlock(16 * n, 16 * n, 7, drop_prob=drop_probs[14]),
+            ResBlock(16 * n, 16 * n, 7, drop_prob=drop_probs[15]),
+        )
+
+        # ---- pooling and heads ----
         self.global_pool = AdaptiveConcatPool1d()
 
-        # auxiliary per-branch classification heads (raw logits)
+        # auxiliary per-branch heads: ConcatPool on 4n -> 8n features
         self.branch_head = nn.Linear(8 * n, 1)
 
-        # classifier head: 3 branches * 8n = 24n features
-        feat_dim = 3 * 8 * n
+        # classifier head: ConcatPool on 16n fusion output = 32n features
+        feat_dim = 32 * n
         self.classifier = nn.Sequential(
-            nn.Linear(feat_dim, 128),
-            nn.BatchNorm1d(128, momentum=0.1, eps=1e-5),
+            nn.Linear(feat_dim, 256),
+            nn.BatchNorm1d(256, momentum=0.1, eps=1e-5),
             nn.Dropout(dropout_rate),
             nn.SiLU(),
-            nn.Linear(128, 64),
+            nn.Linear(256, 64),
             nn.BatchNorm1d(64, momentum=0.1, eps=1e-5),
             nn.Dropout(dropout_rate),
             nn.Linear(64, 1),
         )
 
-        # kaiming initialization
         self._init_weights()
 
     def _init_weights(self):
@@ -270,23 +304,32 @@ class DIYModel(nn.Module):
         l1 = self.ligo_extractor(X[:, 1:2, :])
         v1 = self.virgo_extractor(X[:, 2:3, :])
 
-        # batched backbone pass: (3*B, C, T) -> split -> global pool
+        # batched backbone pass: (3*B, C, T)
         stacked = torch.cat([h1, l1, v1], dim=0)
         stacked = self.backbone(stacked)
         h1_feat, l1_feat, v1_feat = stacked.chunk(3, dim=0)
-        h1_feat = self.global_pool(h1_feat).squeeze(-1)
-        l1_feat = self.global_pool(l1_feat).squeeze(-1)
-        v1_feat = self.global_pool(v1_feat).squeeze(-1)
 
-        # classify
-        combined = torch.cat([h1_feat, l1_feat, v1_feat], dim=-1)
-        main_logits = self.classifier(combined)
+        # individual branch paths (H1/L1 batched through shared LIGO branch)
+        ligo_stacked = torch.cat([h1_feat, l1_feat], dim=0)
+        ligo_stacked = self.ligo_branch(ligo_stacked)
+        h1_branch, l1_branch = ligo_stacked.chunk(2, dim=0)
+        v1_branch = self.virgo_branch(v1_feat)
+
+        # joint branch: backbone outputs concatenated -> project -> 2 ResBlocks
+        joint_in = torch.cat([h1_feat, l1_feat, v1_feat], dim=1)
+        joint_branch = self.joint_branch(self.joint_project(joint_in))
+
+        # merge all 4 paths -> fusion blocks -> pool -> classify
+        fused = torch.cat([h1_branch, l1_branch, v1_branch, joint_branch], dim=1)
+        fused = self.fusion(fused)
+        features = self.global_pool(fused).squeeze(-1)
+        main_logits = self.classifier(features)
 
         if self.training:
             branch_logits = [
-                self.branch_head(h1_feat),
-                self.branch_head(l1_feat),
-                self.branch_head(v1_feat),
+                self.branch_head(self.global_pool(h1_branch).squeeze(-1)),
+                self.branch_head(self.global_pool(l1_branch).squeeze(-1)),
+                self.branch_head(self.global_pool(v1_branch).squeeze(-1)),
             ]
             return main_logits, branch_logits
 

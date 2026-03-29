@@ -30,9 +30,9 @@ $$h(t) := \frac{\Delta L}{L} = F_+(t)\,h_+(t) + F_\times(t)\,h_\times(t),$$
 
 where $F_+$ and $F_\times$ are the beam pattern functions, determined by the detector's location, the source's sky position, and the polarization angle of the wave.
 
-A crucial asymmetry: gravitational wave signals are correlated across detectors (a wave arriving at Hanford at time $t$ reaches Livingston at $t + \Delta t$), but noise is not, depending rather on each detector's local apparatus and environment. Because the noise is uncorrelated, the joint probability of the data across detectors factorizes, and the log-likelihood ratio (signal present vs. noise only) reduces to a sum over individual detectors:
+An asymmetry worth noting: gravitational wave signals are correlated across detectors (a wave arriving at Hanford at time $t$ reaches Livingston at $t + \Delta t$), but noise is not, depending rather on each detector's local apparatus and environment. Because the noise is uncorrelated, the joint probability of the data across detectors factorizes, and the log-likelihood ratio (signal present vs. noise only) reduces to a sum over individual detectors:
 
-$$\log \Lambda[\mathbf{x}] = \sum_{I} \log \Lambda_I[x_I]$$
+$$\log \Lambda[\mathbf{x}] = \sum_{i} \log \Lambda_i[x_i]$$
 
 Each detector contributes independently to the total evidence for a signal. This is the fundamental distinction that the network must learn to exploit.
 
@@ -66,7 +66,7 @@ With the PSD in hand, whitening is straightforward:
 
 This flattens the noise spectrum: colored noise becomes approximately white, with equal power at every frequency. The noise is still present, but it no longer carries structure that a neural network could mistake for signal features. After whitening, SNR contributions are equalized across frequencies, and the network can focus on the actual waveform.
 
-The cross-detector correlation then becomes the decisive feature. After whitening, the remaining noise in each detector is independent, but a real gravitational wave produces a correlated pattern across all three. The model architecture exploits this directly: the convolutional backbone processes each detector's signal through the same residual blocks, and the classifier head combines their features to detect precisely this correlation.
+The cross-detector correlation then becomes the decisive feature. After whitening, the remaining noise in each detector is independent, but a real gravitational wave produces a correlated pattern across all three. The model architecture exploits this at multiple stages: the shared residual backbone extracts per-detector features, then a two-stage fusion topology (individual branch paths plus a joint branch that sees all three detectors concatenated) learns cross-detector interactions through dedicated residual blocks before the final classifier.
 
 ## How the Neural Network Detects Signals
 
@@ -77,37 +77,62 @@ The architecture is a 1D Convolutional Neural Network (CNN). If you've encounter
 ```
 Input (3 detectors x 4096 samples)
     |
-    |---> Detector H1 ---|
-    |                    +---> LIGO Extractor (shared weights)  --------|
-    |---> Detector L1 ---|                                              |
-    |                                                                   +----------> Shared Residual
-    |---> Detector V1 -------> Virgo Extractor (separate weights) ------|            Backbone (10 blocks)
-                                                                                             |
-                                                                                          ConcatPool ---> 256 features each
-                                                                                             |
-                                                                                         Concatenate ---> 768 features
-                                                                                             |
-                                                                                     3-layer classifier ---> logits
+    |---> Detector H1 -----|
+    |                      +---> LIGO Extractor ----------|
+    |---> Detector L1 -----|                              |
+    |                                                     +---> Shared Residual Backbone (10 blocks)
+    |---> Detector V1 ---------> Virgo Extractor ---------|           |
+                                                                      |
+                               +--------------------------------------+--------------------------------------+---------------------------+
+                               |                                      |                                      |                           |
+                          H1 features                            L1 features                           V1 features                       |
+                               |                                      |                                      |                           |
+                    LIGO branch (2 blocks) *                LIGO branch (2 blocks) *               Virgo branch (2 blocks)          Joint branch:
+                               |                                      |                                      |                  concat all 3 -> 1x1 proj
+                               |                                      |                                      |                     -> 2 ResBlocks
+                               |                                      |                                      |                           |
+                               |                                      |                                      |                           |
+                               |                                      |                                      |                           |
+                               +--------------------------------------+--------------------------------------+---------------------------+
+                                                                      |
+                                                     Concatenate 4 paths (256 channels)
+                                                                      |
+                                                          4 Fusion ResBlocks (256 ch)
+                                                                      |
+                                                              ConcatPool (512)
+                                                                      |
+                                                         3-layer classifier -> logits
+
+                                                                                                                   * shared weights (same instrument)
 ```
 
-A critical design choice is weight sharing. LIGO Hanford and Livingston are the same instrument design (4 km arms, similar noise characteristics), so their signals pass through the same extractor with shared parameters. Virgo is a different instrument (3 km arms, different seismic environment, different sensitivity curve) and gets its own extractor with independent weights. This enforces the correct $Z_2$ symmetry by construction: a gravitational wave, once whitened, produces a similar waveform shape in both LIGO detectors (up to arrival time offsets and amplitude differences from beam pattern functions), but Virgo's different characteristics warrant separate learned filters. After extraction, all three branches share the same residual backbone.
+A critical design choice is weight sharing. LIGO Hanford and Livingston are the same instrument design (4 km arms, similar noise characteristics), so their signals pass through the same extractor and branch blocks with shared parameters. Virgo is a different instrument (3 km arms, different seismic environment, different sensitivity curve) and gets its own extractor and branch blocks with independent weights. This enforces the correct $Z_2$ symmetry by construction: a gravitational wave, once whitened, produces a similar waveform shape in both LIGO detectors (up to arrival time offsets and amplitude differences from beam pattern functions), but Virgo's different characteristics warrant separate learned filters. After extraction, all three branches share the same residual backbone.
 
-The architecture is a deep residual backbone: an extractor followed by 10 residual blocks (20 convolutional layers) with progressive downsampling and channel widening:
+The architecture has two stages. First, a deep residual backbone: an extractor followed by 10 residual blocks (20 convolutional layers) with progressive downsampling and channel widening:
 
 | Stage | Channels | Kernel Size | Downsample | Temporal dim |
 |-------|----------|-------------|------------|-------------|
-| Extractor | 1 -> 32 | 64 | GeM(2) | 4096 -> 2048 |
-| Group 1 (2 blocks) | 32 | 31 | GeM(4) + identity | 2048 -> 512 |
-| Group 2 (2 blocks) | 32 | 31 | identity | 512 |
-| Group 3 (2 blocks) | 64 | 15 | GeM(4) + identity | 512 -> 128 |
-| Group 4 (2 blocks) | 128 | 7 | GeM(4) + identity | 128 -> 32 |
-| Group 5 (2 blocks) | 128 | 7 | identity | 32 |
+| Extractor | 1 -> 16 | 64 | GeM(2) | 4096 -> 2048 |
+| Group 1 (2 blocks) | 16 | 31 | GeM(4) + identity | 2048 -> 512 |
+| Group 2 (2 blocks) | 16 | 31 | identity | 512 |
+| Group 3 (2 blocks) | 32 | 15 | GeM(4) + identity | 512 -> 128 |
+| Group 4 (2 blocks) | 64 | 7 | GeM(4) + identity | 128 -> 32 |
+| Group 5 (2 blocks) | 64 | 7 | identity | 32 |
 
 The extractor uses a kernel of 64 samples, corresponding to $\sim31$ ms of data at 2048 Hz. This is deliberate. Gravitational wave chirps from binary mergers have structure on timescales of tens of milliseconds, and a large initial kernel lets the network capture these broad oscillation patterns directly. Subsequent groups use progressively smaller kernels (31, 15, 7) to refine the features, picking up finer temporal details from the patterns already extracted by earlier layers. Residual connections in every block provide direct gradient paths, allowing the network to be this deep without vanishing gradients. Stochastic depth randomly skips residual branches during training, regularizing the network by implicitly training an ensemble of shallower sub-networks and reducing co-adaptation between blocks.
 
-After the residual backbone, AdaptiveConcatPool1d concatenates adaptive average pooling and adaptive max pooling, producing a 256-dimensional feature vector per detector (128 from each pooling mode). This lets the network retain both the overall signal level and the strongest activations.
+Second, a two-stage fusion step. The backbone outputs 64-channel features at 32 time steps per detector. These feed into four parallel paths:
 
-With 256 features extracted from each of the three detectors, the vectors are concatenated into a single 768-dimensional representation. This is where the cross-detector correlation from the previous section becomes relevant. Up to this point, each detector was processed in isolation. Now, the classifier head (a 3-layer MLP: 768 -> 128 -> 64 -> 1) learns to find patterns that span all three feature sets simultaneously. A real gravitational wave produces correlated features across detectors. Noise, being independent, does not. The network outputs a raw logit, which is passed through a sigmoid function at inference time to produce a probability between 0 and 1.
+| Path | Input | Processing | Output |
+|------|-------|-----------|--------|
+| H1 individual | H1 backbone features (64 ch) | 2 ResBlocks(64, k=7) | 64 ch x 32 |
+| L1 individual | L1 backbone features (64 ch) | 2 ResBlocks(64, k=7), shared with H1 | 64 ch x 32 |
+| V1 individual | V1 backbone features (64 ch) | 2 ResBlocks(64, k=7), separate weights | 64 ch x 32 |
+| Joint | concat(H1, L1, V1) = 192 ch | 1x1 Conv projection to 64 ch + 2 ResBlocks(64, k=7) | 64 ch x 32 |
+
+The four path outputs are concatenated (4 x 64 = 256 channels) and processed through 4 fusion ResBlocks(256, k=7). This is the stage where cross-detector correlation becomes relevant. The individual branch paths refine per-detector features while the joint branch captures cross-detector interactions. The fusion blocks then learn from all paths simultaneously: a real gravitational wave produces correlated features across detectors, while noise does not.
+
+After the fusion blocks, AdaptiveConcatPool1d concatenates adaptive average and max pooling, producing a 512-dimensional feature vector (256 from each pooling mode). The classifier head (a 3-layer MLP: 512 -> 256 -> 64 -> 1) maps this to a raw logit, which is passed through a sigmoid function at inference time to produce a probability between 0 and 1.
 
 ### Training
 
@@ -115,7 +140,7 @@ The loss function is binary cross-entropy (BCE):
 
 $$\mathcal{L} = -\frac{1}{N}\sum_{i=1}^{N}\left[y_i \log \hat{y}_i + (1-y_i)\log(1-\hat{y}_i)\right]$$
 
-where $y_i \in \{0,1\}$ is the true label and $\hat{y}_i$ is the model's predicted probability. This is the natural choice for binary classification: it is the negative log-likelihood of a Bernoulli distribution, so minimizing it is equivalent to maximum likelihood estimation. The logarithm means confident wrong answers are penalized far more heavily than uncertain ones — predicting 0.99 when the true label is 0 incurs a much larger loss than predicting 0.6.
+where $y_i \in \{0,1\}$ is the true label and $\hat{y}_i$ is the model's predicted probability. This is the natural choice for binary classification: it is the negative log-likelihood of a Bernoulli distribution, so minimizing it is equivalent to maximum likelihood estimation. The logarithm means confident wrong answers are penalized far more heavily than uncertain ones. Predicting 0.99 when the true label is 0 incurs a much larger loss than predicting 0.6.
 
 In addition to the main classifier loss, each detector branch produces its own auxiliary prediction through a small per-branch head. These auxiliary losses encourage each detector's convolutional features to be independently useful for classification, rather than relying on the other two branches to compensate. The total loss is a weighted sum:
 
@@ -125,7 +150,7 @@ where $w_{\text{aux}}$ controls how much the auxiliary task influences training.
 
 The optimizer is AdamW, which adds weight decay to the Adam framework. Weight decay adds a penalty proportional to the magnitude of the weights, gently pulling them toward zero each step. This discourages the network from fitting too closely to the training data by keeping the learned parameters small. Unlike classical L2 regularization, AdamW applies the decay directly to the weights rather than through the gradient, which interacts more cleanly with adaptive learning rate methods.
 
-The learning rate follows a schedule with two phases. First, a linear warmup ramps the learning rate from near-zero up to the target value over the first few epochs, preventing the large random gradients of an untrained network from causing destructive early updates. After warmup, cosine annealing with warm restarts gradually reduces the learning rate following a cosine curve, periodically resetting it to allow the optimizer to escape local minima and explore new regions of the loss landscape.
+The learning rate follows a schedule with two phases. First, a linear warmup ramps the learning rate from near-zero up to the target value over the first few epochs, preventing the large random gradients of an untrained network from causing destructive early updates. After warmup, cosine annealing smoothly reduces the learning rate following a cosine curve from the target value down to a minimum, giving the optimizer progressively finer control over parameter updates as training proceeds.
 
 Two forms of regularization combat overfitting. Dropout randomly zeroes a fraction of neuron activations during training, forcing the network to learn redundant representations rather than relying on any single feature pathway. Mixup takes pairs of training examples and creates synthetic samples by linearly interpolating both the inputs and their labels: $\tilde{x} = \lambda x_i + (1-\lambda) x_j$, $\tilde{y} = \lambda y_i + (1-\lambda) y_j$, where $\lambda$ is drawn from a Beta distribution. This smooths the decision boundary and reduces the model's tendency to memorize individual training examples.
 

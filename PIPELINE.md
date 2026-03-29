@@ -37,10 +37,10 @@
 │   main()  ───────►  train_from_tensors()  ───────►  DIYModel               │
 │        │                       │                           │                │
 │        │                       │ GWTensorDataset           │ Deep residual  │
-│        │                       │ + DataLoader              │ 1D CNN (10     │
-│        │                       │ (shard streaming)         │ res blocks,    │
-│        │                       │                           │ stochastic     │
-│        │                       │                           │ depth, GeM)    │
+│        │                       │ + DataLoader              │ 1D CNN: 10     │
+│        │                       │ (shard streaming)         │ backbone + V2  │
+│        │                       │                           │ fusion (4 br + │
+│        │                       │                           │ 4 fus blocks)  │
 │        │                       ▼                           │ 3-layer head   │
 │        │                    fit()                          ▼                │
 │        │                       │                      Trained Weights       │

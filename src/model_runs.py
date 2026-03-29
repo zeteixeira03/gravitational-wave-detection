@@ -11,6 +11,7 @@ Training cycle using preprocessed PyTorch tensor shards:
 import copy
 import sys
 import json
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -69,6 +70,12 @@ class GWTensorDataset(Dataset):
             # gaussian noise: scale relative to signal amplitude
             noise_scale = (0.01 + 0.09 * torch.rand(1).item()) * x.std().item()
             x = x + torch.randn_like(x) * noise_scale
+            # spectral dropout: zero random frequency bins (p=0.05)
+            spec = torch.fft.rfft(x, dim=-1)
+            x = torch.fft.irfft(spec * (torch.rand(spec.shape) > 0.05), n=x.shape[-1])
+            # channel shuffle: randomly swap H1/L1 (respects Z2 symmetry; Virgo stays at index 2)
+            if torch.rand(1).item() > 0.5:
+                x = x[[1, 0, 2]]
         return x, self.labels[idx]
 
 
@@ -116,6 +123,7 @@ def fit(
     aux_loss_weight=0.0,
     use_amp=False,
     clip_grad_norm=None,
+    max_train_hours=None,
 ):
     """
     Train model by streaming shards from disk.
@@ -156,13 +164,18 @@ def fit(
         Enable mixed precision training (CUDA only).
     clip_grad_norm : float | None
         Max gradient norm for clipping. None disables.
+    max_train_hours : float | None
+        Wall-clock time budget for training. Stops after completing the
+        current epoch if the next epoch would exceed the budget, leaving
+        time for evaluation and saving. None disables.
 
     Returns
     -------
     dict
         Training history
     """
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=min_lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=min_lr)
+    train_start = time.monotonic()
 
     # amp setup (CUDA only)
     use_amp = use_amp and (device.type == 'cuda')
@@ -267,7 +280,7 @@ def fit(
 
         # LR scheduling (skip during warmup to avoid premature reduction)
         if epoch >= warmup_epochs:
-            scheduler.step(epoch - warmup_epochs)
+            scheduler.step()
 
         # check for improvement
         if val_loss < best_val_loss:
@@ -290,6 +303,16 @@ def fit(
             if verbose:
                 print(f"\nEarly stopping: val_loss hasn't improved for {early_stopping_patience} epochs")
             break
+
+        # time budget check: stop if the next epoch would exceed the budget
+        if max_train_hours is not None:
+            elapsed_h = (time.monotonic() - train_start) / 3600
+            h_per_epoch = elapsed_h / (epoch + 1)
+            if elapsed_h + h_per_epoch > max_train_hours:
+                if verbose:
+                    print(f"\nTime budget: {elapsed_h:.2f}h elapsed, ~{h_per_epoch:.2f}h/epoch, "
+                          f"stopping to stay within {max_train_hours}h limit")
+                break
 
     # restore best weights
     if best_state is not None:
@@ -625,6 +648,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
 
     use_amp = hyperparameters.get('use_amp', False)
     clip_grad_norm = hyperparameters.get('clip_grad_norm', None)
+    max_train_hours = hyperparameters.get('max_train_hours', None)
 
     history = fit(
         model,
@@ -640,6 +664,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
         aux_loss_weight=aux_loss_weight,
         use_amp=use_amp,
         clip_grad_norm=clip_grad_norm,
+        max_train_hours=max_train_hours,
     )
 
     print("\nTraining complete.")
@@ -890,19 +915,20 @@ def main(mode='train'):
 
     # ========== HYPERPARAMETERS ==========
     HYPERPARAMETERS = {
-        'n_channels': 32,
+        'n_channels': 16,
         'n_samples': 4096,
         'learning_rate': 1e-3,
         'dropout_rate': 0.5,
         'weight_decay': 5e-4,
         'epochs': 50,
         'batch_size': 64 if has_gpu else 32,
-        'early_stopping_patience': 15,
+        'early_stopping_patience': 10,
         'warmup_epochs': 5,
         'aux_loss_weight': 0.2,
         'use_amp': True,
         'clip_grad_norm': 1.0,
-        'drop_path_rate': 0.1,
+        'drop_path_rate': 0.2,
+        'max_train_hours': 8.0,
     }
 
     # ========== SETUP PATHS ==========

@@ -41,7 +41,7 @@ The model fits the training data cleanly but cannot extract more signal from it.
 - Gaussian noise injection (1-10% of signal std)
 - Mixup ($\alpha=0.2$)
 - LR warmup (5 epochs, linear from 1e-6 to target LR)
-- Cosine annealing with warm restarts ($T_0$=10, $\eta_{min}$=1e-6)
+- Cosine annealing ($\eta_{min}$=1e-6)
 - AdamW with weight decay 5e-4
 - Early stopping (patience=10)
 
@@ -131,15 +131,15 @@ The residual backbone uses a shared extractor for the LIGO pair and a separate e
 
 The second architectural addition exploits the geometric structure of the multi-detector network. This is described in detail in [THE_SCIENCE.md](THE_SCIENCE.md) (section: Geometric Structure of the Detector Network). In brief: the detector network defines a natural geometric domain (the sky sphere $S^2$), and cross-detector consistency can be represented as a scalar field on that sphere. Decomposing this field into spherical harmonics produces a compact, rotation-equivariant feature vector that encodes detector agreement in a physically-informed way.
 
-The $S^2$ features concatenate with the CNN backbone output before the classifier head. The reasoning being that the CNN captures what each detector sees, while the sky map captures whether the detectors agree in a way that is consistent with a real astrophysical source.
+The $S^2$ features concatenate with the CNN backbone output before the classifier head. The CNN captures what each detector sees; the sky map captures whether the detectors agree in a way that is consistent with a real astrophysical source.
 
 ### Implementation sequence
 
 Each step is gated on the previous one showing improvement.
 
-**Step 1: Deep residual backbone (implemented).** Replaced the 4 plain conv blocks with ~10 residual blocks. Added separate Virgo extractor, GeM pooling. AUC: 0.866 (up from 0.858 plateau). Recall improved substantially (0.64 -> 0.75). Stochastic depth (drop_path_rate=0.1) was neutral (0.865). Spectral dropout and channel shuffle not yet added.
+**Step 1: Deep residual backbone (implemented).** Replaced the 4 plain conv blocks with ~10 residual blocks. Added separate Virgo extractor, GeM pooling. AUC: 0.866 (up from 0.858 plateau). Recall improved substantially (0.64 -> 0.75). Stochastic depth (drop_path_rate=0.2) resolved overfitting (val loss < train loss) without further AUC gain. Spectral dropout and channel shuffle augmentations added.
 
-**Step 1b: Two-stage branch fusion.** After the backbone shows improvement, add a second fusion stage: 4 parallel paths (H1, L1, V1 individually + all-3-concatenated), then all 4 concatenated through more residual blocks.
+**Step 1b: Two-stage branch fusion (implemented).** V2-style fusion with n=16 channels: after the shared backbone, 4 parallel paths (H1, L1, V1 individual branches + joint branch with 1x1 projection) each with 2 ResBlocks, then all 4 concatenated (256 channels) through 4 fusion ResBlocks. LIGO H1/L1 share branch weights. ConcatPool produces 512 features for a 3-layer classifier head (512 -> 256 -> 64 -> 1). Stochastic depth extended across all 16 depth levels. LR schedule switched from cosine warm restarts to plain cosine annealing. Wall-clock time budget (8h) added to prevent Kaggle timeout. AUC: 0.874 (up from 0.866 backbone-only).
 
 **Step 2: $S^2$ cross-correlation features.** Construct the sky consistency map, decompose into spherical harmonics, concatenate with CNN features.
 

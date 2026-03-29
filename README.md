@@ -24,29 +24,45 @@ If you're interested, I included a markdown file ([THE_SCIENCE.md](THE_SCIENCE.m
 Input (3 detectors x 4096 samples)
     |
     |---> Detector H1 -----|
-    |                      +---> LIGO Extractor (shared weights) -----|
-    |---> Detector L1 -----|                                          |
-    |                                                                 +---> Shared Residual
-    |---> Detector V1 ---------> Virgo Extractor (separate weights) --|     Backbone (10 blocks)
-                                                                               |
-                                                                          ConcatPool ---> 256 features each
-                                                                               |
-                                                                          Concatenate (768 features)
-                                                                               |
-                                                                          3-layer classifier ---> logits
+    |                      +---> LIGO Extractor ----------|
+    |---> Detector L1 -----|                              |
+    |                                                     +---> Shared Residual Backbone (10 blocks)
+    |---> Detector V1 ---------> Virgo Extractor ---------|           |
+                                                                      |
+                               +--------------------------------------+--------------------------------------+---------------------------+
+                               |                                      |                                      |                           |
+                          H1 features                            L1 features                           V1 features                       |
+                               |                                      |                                      |                           |
+                    LIGO branch (2 blocks) *                LIGO branch (2 blocks) *               Virgo branch (2 blocks)          Joint branch:
+                               |                                      |                                      |                  concat all 3 -> 1x1 proj
+                               |                                      |                                      |                     -> 2 ResBlocks
+                               |                                      |                                      |                           |
+                               |                                      |                                      |                           |
+                               |                                      |                                      |                           |
+                               +--------------------------------------+--------------------------------------+---------------------------+
+                                                                      |
+                                                     Concatenate 4 paths (256 channels)
+                                                                      |
+                                                          4 Fusion ResBlocks (256 ch)
+                                                                      |
+                                                              ConcatPool (512)
+                                                                      |
+                                                         3-layer classifier -> logits
+
+                                                  * shared weights (same instrument)
 ```
 
-Deep residual backbone with ~10 residual blocks (20 conv layers), GeM pooling, and stochastic depth. LIGO H1/L1 share extractor weights; Virgo has a separate extractor. Channels progress as 32 -> 32 -> 64 -> 128 -> 128, with kernel sizes decreasing from 64 -> 31 -> 15 -> 7.
+V2 two-stage fusion architecture: 10 residual backbone blocks feed into 4 parallel branch paths (H1, L1, V1, joint), which are merged and processed through 4 fusion blocks. LIGO H1/L1 share extractor and branch weights; Virgo is separate.
 
 ## Current Performance
 
 | Accuracy | AUC | Precision | Recall | F1 |
 |----------|-----|-----------|--------|----|
-| 0.797 | 0.865 | 0.860 | 0.708 | 0.781 |
+| 0.807 | 0.874 | 0.921 | 0.671 | 0.777 |
 
 <p align="center"><img src="assets/dashboard.png" width="700"></p>
 
-The deep residual backbone (Phase 3, Step 1) brought a meaningful improvement over the Phase 1 plateau at 0.858 AUC. Adding stochastic depth (drop_path_rate=0.1) was neutral (0.865 vs 0.866 baseline). Overfitting is visible after epoch ~15; next step is augmentation diversity (spectral dropout, channel shuffle).
+Phase 3 Step 1 (deep residual backbone) improved AUC from 0.858 to 0.866. Step 1b (V2 two-stage fusion with n=16 channels) reached 0.874 AUC. LR schedule switched from cosine warm restarts to plain cosine annealing for smoother convergence.
 
 ## Installation
 
