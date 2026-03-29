@@ -49,7 +49,7 @@ Input (3 detectors x 4096 samples)
                                                                       |
                                                          3-layer classifier -> logits
 
-                                                  * shared weights (same instrument)
+                                                                                                                           * shared weights (same instrument)
 ```
 
 V2 two-stage fusion architecture: 10 residual backbone blocks feed into 4 parallel branch paths (H1, L1, V1, joint), which are merged and processed through 4 fusion blocks. LIGO H1/L1 share extractor and branch weights; Virgo is separate.
