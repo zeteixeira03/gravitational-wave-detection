@@ -127,11 +127,13 @@ The Phase 1-2 model shared weights across all three detectors. Phase 2b's failur
 
 The residual backbone uses a shared extractor for the LIGO pair and a separate extractor for Virgo, enforcing the $Z_2$ symmetry by construction.
 
-### $S^2$ geometric cross-correlation
+### $S^2$ geometric cross-correlation (implemented)
 
 The second architectural addition exploits the geometric structure of the multi-detector network. This is described in detail in [THE_SCIENCE.md](THE_SCIENCE.md) (section: Geometric Structure of the Detector Network). In brief: the detector network defines a natural geometric domain (the sky sphere $S^2$), and cross-detector consistency can be represented as a scalar field on that sphere. Decomposing this field into spherical harmonics produces a compact, rotation-equivariant feature vector that encodes detector agreement in a physically-informed way.
 
-The $S^2$ features concatenate with the CNN backbone output before the classifier head. The CNN captures what each detector sees; the sky map captures whether the detectors agree in a way that is consistent with a real astrophysical source.
+The implementation uses a `SkyGeometry` class that precomputes detector positions, time delay tables for 192 HEALPix sky pixels, and the SH basis matrix once. The DataLoader computes sky features on-the-fly: for each sample, it computes normalized cross-correlations via FFT for all three detector pairs, evaluates them at the predicted delays per sky pixel, squares and sums them into a consistency score, and projects the resulting sky map onto the SH basis (l_max=8, 81 coefficients). These coefficients pass through a BatchNorm layer and concatenate with the ConcatPool output (512 + 81 = 593 features) before the classifier head.
+
+The sky features are SO(3)-equivariant intermediate representations; the final detection output is invariant (whether a signal is present does not depend on sky position). The $Z_2$ symmetry (H1-L1 swap) is inherited automatically since cross-correlation is symmetric under pair reordering.
 
 ### Implementation sequence
 
@@ -141,7 +143,13 @@ Each step is gated on the previous one showing improvement.
 
 **Step 1b: Two-stage branch fusion (implemented).** V2-style fusion with n=16 channels: after the shared backbone, 4 parallel paths (H1, L1, V1 individual branches + joint branch with 1x1 projection) each with 2 ResBlocks, then all 4 concatenated (256 channels) through 4 fusion ResBlocks. LIGO H1/L1 share branch weights. ConcatPool produces 512 features for a 3-layer classifier head (512 -> 256 -> 64 -> 1). Stochastic depth extended across all 16 depth levels. LR schedule switched from cosine warm restarts to plain cosine annealing. Wall-clock time budget (8h) added to prevent Kaggle timeout. AUC: 0.874 (up from 0.866 backbone-only).
 
-**Step 2: $S^2$ cross-correlation features.** Construct the sky consistency map, decompose into spherical harmonics, concatenate with CNN features.
+**Step 2: $S^2$ cross-correlation features (implemented, under investigation).** The model requires 81 spherical harmonic coefficients as a second input alongside the signal tensor. A `SkyGeometry` class precomputes 192 HEALPix sky pixels, the time delay model for all detector pairs, and the SH basis matrix (l_max=8). For each sample, normalized cross-correlations between all detector pairs are computed via FFT, evaluated at the predicted time delays per sky pixel, and combined into a consistency score (sum of squared correlations). The resulting sky map is projected onto the SH basis, batch-normalized, and concatenated with the CNN's 512-dimensional ConcatPool output, giving 593 classifier input features. SH coefficients are precomputed and stored in the tensor shards via `create_tensors.py` (or added to existing shards with `--add-sky`). The DataLoader falls back to on-the-fly computation if shards lack precomputed coefficients. Hyperparameters: `sky_n_pix` (default 192), `sky_l_max` (default 8).
+
+First run with SH features: AUC 0.873, no measurable improvement over the Step 1b baseline (0.873-0.874). The offline feasibility gate passed (l=0 monopole AUC ~0.60, roughly half of all coefficients above 0.56), so the SH coefficients carry some discriminative signal. Two suspected attenuators:
+
+1. **Mixup corrupts SH features.** Mixup linearly blends SH coefficient vectors from two unrelated samples (`lam * sky + (1-lam) * sky[perm]`). For CNN inputs this is standard, but SH coefficients encode the sky map of a specific source: mixing two sky maps from different sky positions produces a vector that corresponds to no physical configuration. This teaches the classifier to partially ignore the SH input.
+
+2. **Feature dimension imbalance.** With n=16, ConcatPool produces 512 CNN features vs 81 SH features (13.7% of the 593-dim classifier input). Combined with dropout 0.5 in the classifier head, the SH contribution is structurally disadvantaged.
 
 **Step 3: Training refinements.** MC dropout at inference, pseudo-labeling, rank loss fine-tuning.
 

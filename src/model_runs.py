@@ -30,6 +30,14 @@ if str(SRC_DIR) not in sys.path:
 
 from data.g2net import is_kaggle, get_output_dir
 from models.diy_model import DIYModel
+from sky_feasibility import (
+    make_sky_grid,
+    compute_time_delays,
+    delay_to_sample_index,
+    build_sky_map,
+    compute_sh_matrix,
+    decompose_sky_map,
+)
 from visualization import (
     plot_learning_curves,
     plot_roc_curve,
@@ -46,22 +54,73 @@ np.random.seed(SEED)
 
 
 # =====================================================================
+#                        SKY GEOMETRY
+# =====================================================================
+
+class SkyGeometry:
+    """
+    Precomputed sky grid, time delays, and SH basis for on-the-fly
+    spherical harmonic coefficient extraction from preprocessed signals.
+
+    Precomputes the pseudoinverse of the SH design matrix so that
+    decomposition is a single matrix-vector multiply (~0.006 ms) instead
+    of a least-squares solve (~10 ms).
+    """
+
+    def __init__(self, n_pix: int = 192, l_max: int = 8):
+        theta, phi = make_sky_grid(n_pix)
+        delays = compute_time_delays(theta, phi)
+        self.delay_indices = {pair: delay_to_sample_index(d) for pair, d in delays.items()}
+        sh_matrix = compute_sh_matrix(theta, phi, l_max)
+        self.sh_pinv = np.linalg.pinv(sh_matrix).astype(np.float32)
+        self.n_coeffs = (l_max + 1) ** 2
+
+    def extract(self, signal: np.ndarray) -> np.ndarray:
+        """
+        Compute SH coefficients from a preprocessed signal.
+
+        Parameters
+        ----------
+        signal
+            Whitened signal, shape (3, 4096).
+
+        Returns
+        -------
+        coeffs
+            SH coefficients, shape (n_coeffs,).
+        """
+        sky_map = build_sky_map(signal, self.delay_indices)
+        return self.sh_pinv @ sky_map
+
+
+# =====================================================================
 #                           DATASET
 # =====================================================================
 
 class GWTensorDataset(Dataset):
-    """Wraps signal and label tensors for DataLoader"""
+    """Wraps signal and label tensors for DataLoader, with optional sky feature extraction."""
 
-    def __init__(self, signals: torch.Tensor, labels: torch.Tensor, augment: bool = False):
+    def __init__(self, signals: torch.Tensor, labels: torch.Tensor, augment: bool = False, sky_geometry: SkyGeometry | None = None, precomputed_sh: torch.Tensor | None = None):
         self.signals = signals
         self.labels = labels
         self.augment = augment
+        self.sky_geometry = sky_geometry
+        self.precomputed_sh = precomputed_sh
 
     def __len__(self) -> int:
         return len(self.labels)
 
     def __getitem__(self, idx: int):
         x = self.signals[idx].clone()
+
+        # sky features: use precomputed if available, else compute on-the-fly
+        # from the clean signal before augmentation -- time shifts and channel
+        # shuffles break the physical time-delay relationships the sky map encodes
+        if self.precomputed_sh is not None:
+            sh_coeffs = self.precomputed_sh[idx]
+        else:
+            sh_coeffs = torch.tensor(self.sky_geometry.extract(x.numpy()), dtype=torch.float32)
+
         if self.augment:
             # time shift: roll each detector independently by 0-20 samples
             for ch in range(x.shape[0]):
@@ -70,22 +129,28 @@ class GWTensorDataset(Dataset):
             # gaussian noise: scale relative to signal amplitude
             noise_scale = (0.01 + 0.09 * torch.rand(1).item()) * x.std().item()
             x = x + torch.randn_like(x) * noise_scale
-            # spectral dropout: zero random frequency bins (p=0.05)
+            # spectral dropout: zero random frequency bins independently per detector (p=0.05)
             spec = torch.fft.rfft(x, dim=-1)
             x = torch.fft.irfft(spec * (torch.rand(spec.shape) > 0.05), n=x.shape[-1])
             # channel shuffle: randomly swap H1/L1 (respects Z2 symmetry; Virgo stays at index 2)
             if torch.rand(1).item() > 0.5:
                 x = x[[1, 0, 2]]
-        return x, self.labels[idx]
+
+        return x, self.labels[idx], sh_coeffs
 
 
 # =====================================================================
 #                         TRAINING LOOP
 # =====================================================================
 
-def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.2) -> tuple[torch.Tensor, torch.Tensor]:
+def mixup_batch(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    sky: torch.Tensor,
+    alpha: float = 0.2,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Apply mixup to a batch.
+    Apply mixup to a batch (signals, labels, and sky features).
 
     Parameters
     ----------
@@ -93,18 +158,24 @@ def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.2) -> tuple[t
         Input signals of shape (batch, channels, time).
     y : torch.Tensor
         Labels of shape (batch, 1), may be soft.
+    sky : torch.Tensor
+        Sky features of shape (batch, n_sky_features).
     alpha : float
         Beta distribution concentration parameter.
 
     Returns
     -------
-    tuple[torch.Tensor, torch.Tensor]
-        Mixed signals and soft labels.
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        Mixed signals, soft labels, and mixed sky features.
     """
     lam = float(torch.distributions.Beta(alpha, alpha).sample())
     perm = torch.randperm(x.size(0), device=x.device)
 
-    return (lam * x + (1 - lam) * x[perm], lam * y + (1 - lam) * y[perm])
+    return (
+        lam * x + (1 - lam) * x[perm],
+        lam * y + (1 - lam) * y[perm],
+        lam * sky + (1 - lam) * sky[perm],
+    )
 
 
 def fit(
@@ -124,9 +195,11 @@ def fit(
     use_amp=False,
     clip_grad_norm=None,
     max_train_hours=None,
+    sky_geometry=None,
 ):
     """
-    Train model by streaming shards from disk.
+    Train model by streaming shards from disk. Sky features are computed
+    on-the-fly per sample (or loaded from precomputed shards).
 
     Each epoch iterates over all training shards, loading one at a time to keep
     memory usage constant (~2.4 GB per shard). Works with any number of shards,
@@ -168,6 +241,9 @@ def fit(
         Wall-clock time budget for training. Stops after completing the
         current epoch if the next epoch would exceed the budget, leaving
         time for evaluation and saving. None disables.
+    sky_geometry : SkyGeometry | None
+        Precomputed sky geometry for on-the-fly SH coefficient extraction.
+        None disables sky features.
 
     Returns
     -------
@@ -211,7 +287,8 @@ def fit(
         for shard_num, shard_idx in enumerate(shard_order):
             shard_path = train_shard_paths[shard_idx]
             data = torch.load(str(shard_path), weights_only=True)
-            shard_dataset = GWTensorDataset(data['signals'], data['labels'], augment=True)
+            precomputed_sh = data.get('sh_coeffs', None)
+            shard_dataset = GWTensorDataset(data['signals'], data['labels'], augment=True, sky_geometry=sky_geometry, precomputed_sh=precomputed_sh)
             shard_loader = DataLoader(
                 shard_dataset, batch_size=batch_size, shuffle=True,
                 num_workers=2, pin_memory=(device.type == 'cuda')
@@ -222,14 +299,15 @@ def fit(
                 desc += f" [shard {shard_num+1}/{n_shards}]"
             pbar = tqdm(shard_loader, desc=desc, disable=not verbose)
 
-            for X_batch, y_batch in pbar:
+            for X_batch, y_batch, sky_batch in pbar:
                 X_batch = X_batch.to(device)
+                sky_batch = sky_batch.to(device)
                 y_batch = y_batch.float().unsqueeze(1).to(device)
-                X_batch, y_batch = mixup_batch(X_batch, y_batch)
+                X_batch, y_batch, sky_batch = mixup_batch(X_batch, y_batch, sky_batch)
 
                 optimizer.zero_grad()
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    logits, branch_logits = model(X_batch)
+                    logits, branch_logits = model(X_batch, sky_features=sky_batch)
                     loss = model.compute_loss(y_batch, logits, branch_logits, aux_loss_weight)
                 scaler.scale(loss).backward()
                 if clip_grad_norm:
@@ -258,12 +336,13 @@ def fit(
         val_total = 0
 
         with torch.no_grad():
-            for X_batch, y_batch in val_loader:
+            for X_batch, y_batch, sky_batch in val_loader:
                 X_batch = X_batch.to(device)
+                sky_batch = sky_batch.to(device)
                 y_batch_float = y_batch.float().unsqueeze(1).to(device)
 
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    logits = model(X_batch)
+                    logits = model(X_batch, sky_features=sky_batch)
                     loss = model.compute_loss(y_batch_float, logits)
                 val_losses.append(loss.item())
 
@@ -330,9 +409,10 @@ def evaluate(model, data_loader, device):
     y_proba_all = []
 
     with torch.no_grad():
-        for X_batch, y_batch in data_loader:
+        for X_batch, y_batch, sky_batch in data_loader:
             X_batch = X_batch.to(device)
-            logits = model(X_batch)
+            sky_batch = sky_batch.to(device)
+            logits = model(X_batch, sky_features=sky_batch)
             proba = torch.sigmoid(logits).cpu().numpy().flatten()
             y_proba_all.append(proba)
             y_true_all.append(y_batch.numpy())
@@ -441,16 +521,19 @@ def generate_plots(results, save_dir, base_name, max_plot_samples=10000):
 
     X_list = []
     y_list = []
+    sky_list = []
     collected = 0
-    for X_batch, y_batch in val_loader:
+    for X_batch, y_batch, sky_batch in val_loader:
         X_list.append(X_batch.numpy())
         y_list.append(y_batch.numpy())
+        sky_list.append(sky_batch.numpy())
         collected += len(y_batch)
         if collected >= n_plot:
             break
 
     X_val = np.concatenate(X_list, axis=0)[:n_plot]
     plot_y = np.concatenate(y_list, axis=0)[:n_plot]
+    sky_val = np.concatenate(sky_list, axis=0)[:n_plot]
 
     saved_plots = {}
 
@@ -464,28 +547,28 @@ def generate_plots(results, save_dir, base_name, max_plot_samples=10000):
 
     # 2. ROC curve
     print("  - ROC curve")
-    roc_data = model.roc_curve(X_val, plot_y)
+    roc_data = model.roc_curve(X_val, plot_y, sky_val)
     roc_path = plots_dir / f"{base_name}_roc_curve.png"
     plot_roc_curve(roc_data, save_path=str(roc_path))
     saved_plots['roc_curve'] = roc_path
 
     # 3. Precision-Recall curve
     print("  - Precision-Recall curve")
-    pr_data = model.precision_recall_curve(X_val, plot_y)
+    pr_data = model.precision_recall_curve(X_val, plot_y, sky_val)
     pr_path = plots_dir / f"{base_name}_pr_curve.png"
     plot_precision_recall_curve(pr_data, save_path=str(pr_path))
     saved_plots['pr_curve'] = pr_path
 
     # 4. Confusion matrix
     print("  - Confusion matrix")
-    cm_data = model.confusion_matrix(X_val, plot_y)
+    cm_data = model.confusion_matrix(X_val, plot_y, sky_val)
     cm_path = plots_dir / f"{base_name}_confusion_matrix.png"
     plot_confusion_matrix(cm_data, normalize=True, save_path=str(cm_path))
     saved_plots['confusion_matrix'] = cm_path
 
     # 5. Prediction distribution
     print("  - Prediction distribution")
-    y_proba = model.predict_proba(X_val)
+    y_proba = model.predict_proba(X_val, sky_val)
     dist_path = plots_dir / f"{base_name}_prediction_dist.png"
     plot_prediction_distribution(y_proba, plot_y, save_path=str(dist_path))
     saved_plots['prediction_dist'] = dist_path
@@ -493,7 +576,7 @@ def generate_plots(results, save_dir, base_name, max_plot_samples=10000):
     # 6. Combined dashboard
     print("  - Combined dashboard")
     dashboard_path = plots_dir / f"{base_name}_dashboard.png"
-    plot_all_metrics(model, X_val, plot_y, history=history, save_path=str(dashboard_path))
+    plot_all_metrics(model, X_val, plot_y, sky_val, history=history, save_path=str(dashboard_path))
     saved_plots['dashboard'] = dashboard_path
 
     print(f"Plots saved to: {plots_dir}")
@@ -542,6 +625,8 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     warmup_epochs = hyperparameters.get('warmup_epochs', 0)
     aux_loss_weight = hyperparameters.get('aux_loss_weight', 0.0)
     drop_path_rate = hyperparameters.get('drop_path_rate', 0.0)
+    sky_n_pix = hyperparameters.get('sky_n_pix', 192)
+    sky_l_max = hyperparameters.get('sky_l_max', 8)
 
     print(f"Signal length: {n_samples_config}")
     print(f"Learning rate: {learning_rate}")
@@ -553,6 +638,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     print(f"Warmup epochs: {warmup_epochs}")
     print(f"Aux loss weight: {aux_loss_weight}")
     print(f"Drop path rate: {drop_path_rate}")
+    print(f"Sky: n_pix={sky_n_pix}, l_max={sky_l_max}")
     print(f"Total samples: {n_samples}")
     print("Mode: TENSOR (preprocessed data, shard streaming)")
 
@@ -561,6 +647,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     print(f"Device: {device}")
 
     # split shards into val / train
+    val_sh = None
     single_file = data_dir / "train.pt"
     if single_file.exists():
         # small dataset mode: load entirely into memory
@@ -568,18 +655,24 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
         data = torch.load(str(single_file), weights_only=True)
         all_signals = data['signals']
         all_labels = data['labels']
+        all_sh = data.get('sh_coeffs', None)
 
         n_val = int(len(all_labels) * val_split)
         n_train = len(all_labels) - n_val
 
         val_signals = all_signals[:n_val]
         val_labels = all_labels[:n_val]
+        if all_sh is not None:
+            val_sh = all_sh[:n_val]
 
         # save train split as a temporary shard so fit() streams it from disk
         train_shard = data_dir / "_train_split.pt"
-        torch.save({'signals': all_signals[n_val:], 'labels': all_labels[n_val:]}, str(train_shard))
+        train_data = {'signals': all_signals[n_val:], 'labels': all_labels[n_val:]}
+        if all_sh is not None:
+            train_data['sh_coeffs'] = all_sh[n_val:]
+        torch.save(train_data, str(train_shard))
         train_shard_paths = [train_shard]
-        del all_signals, all_labels
+        del all_signals, all_labels, all_sh
     else:
         # shard mode: split by shard files
         shard_files = sorted(data_dir.glob('shard_*.pt'))
@@ -606,16 +699,26 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
         print(f"\nLoading {len(val_shard_paths)} validation shards into memory...")
         val_signals_list = []
         val_labels_list = []
+        val_sh_list = []
         for f in val_shard_paths:
             print(f"  {f.name}")
             data = torch.load(str(f), weights_only=True)
             val_signals_list.append(data['signals'])
             val_labels_list.append(data['labels'])
+            if 'sh_coeffs' in data:
+                val_sh_list.append(data['sh_coeffs'])
             del data
 
         val_signals = torch.cat(val_signals_list)
         val_labels = torch.cat(val_labels_list)
-        del val_signals_list, val_labels_list
+        if val_sh_list:
+            if len(val_sh_list) != len(val_signals_list):
+                raise ValueError(
+                    f"Inconsistent shards: {len(val_sh_list)}/{len(val_signals_list)} "
+                    f"have sh_coeffs. Regenerate all shards with create_tensors.py."
+                )
+            val_sh = torch.cat(val_sh_list)
+        del val_signals_list, val_labels_list, val_sh_list
 
         n_val = len(val_labels)
         n_train = n_samples - n_val
@@ -624,8 +727,14 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     print(f"Train samples: {n_train}")
     print(f"Val samples: {n_val}")
 
+    # sky geometry (Phase 3, Step 2)
+    print(f"\nInitializing S2 sky geometry (n_pix={sky_n_pix}, l_max={sky_l_max})...")
+    sky_geo = SkyGeometry(n_pix=sky_n_pix, l_max=sky_l_max)
+    n_sky_features = sky_geo.n_coeffs
+    print(f"  SH coefficients per sample: {n_sky_features}")
+
     # validation DataLoader (always in memory)
-    val_dataset = GWTensorDataset(val_signals, val_labels)
+    val_dataset = GWTensorDataset(val_signals, val_labels, sky_geometry=sky_geo, precomputed_sh=val_sh)
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
         num_workers=0, pin_memory=(device.type == 'cuda')
@@ -633,7 +742,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
 
     # initialize model
     n_channels = hyperparameters.get('n_channels', 32)
-    model = DIYModel(n_channels=n_channels, dropout_rate=dropout_rate, drop_path_rate=drop_path_rate).to(device)
+    model = DIYModel(n_channels=n_channels, dropout_rate=dropout_rate, drop_path_rate=drop_path_rate, n_sky_features=n_sky_features).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: DIYModel ({n_params:,} parameters)")
 
@@ -665,6 +774,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
         use_amp=use_amp,
         clip_grad_norm=clip_grad_norm,
         max_train_hours=max_train_hours,
+        sky_geometry=sky_geo,
     )
 
     print("\nTraining complete.")
@@ -718,6 +828,7 @@ def lr_range_test(
     lr_start=1e-5,
     lr_end=1e-1,
     n_steps=1000,
+    sky_geometry=None,
 ):
     """
     Exponentially increase LR over n_steps, record loss at each step.
@@ -763,19 +874,21 @@ def lr_range_test(
         if step >= n_steps:
             break
         data = torch.load(str(shard_path), weights_only=True)
-        dataset = GWTensorDataset(data['signals'], data['labels'], augment=False)
+        precomputed_sh = data.get('sh_coeffs', None)
+        dataset = GWTensorDataset(data['signals'], data['labels'], augment=False, sky_geometry=sky_geometry, precomputed_sh=precomputed_sh)
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
-        for X_batch, y_batch in loader:
+        for X_batch, y_batch, sky_batch in loader:
             if step >= n_steps:
                 break
 
             X_batch = X_batch.to(device)
+            sky_batch = sky_batch.to(device)
             y_batch = y_batch.float().unsqueeze(1).to(device)
 
             optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=use_amp):
-                output = model(X_batch)
+                output = model(X_batch, sky_features=sky_batch)
                 logits = output[0] if isinstance(output, tuple) else output
                 loss = F.binary_cross_entropy_with_logits(logits, y_batch)
             scaler.scale(loss).backward()
@@ -852,8 +965,14 @@ def run_lr_range_test(data_dir, n_samples, hyperparameters):
         else:
             raise FileNotFoundError(f"No data files in {data_dir}")
 
+    # sky geometry
+    sky_n_pix = hyperparameters.get('sky_n_pix', 192)
+    sky_l_max = hyperparameters.get('sky_l_max', 8)
+    sky_geo = SkyGeometry(n_pix=sky_n_pix, l_max=sky_l_max)
+    n_sky_features = sky_geo.n_coeffs
+
     # create model
-    model = DIYModel(n_channels=n_channels, dropout_rate=dropout_rate, drop_path_rate=drop_path_rate).to(device)
+    model = DIYModel(n_channels=n_channels, dropout_rate=dropout_rate, drop_path_rate=drop_path_rate, n_sky_features=n_sky_features).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: DIYModel ({n_params:,} parameters)")
     print(f"Device: {device}")
@@ -865,6 +984,7 @@ def run_lr_range_test(data_dir, n_samples, hyperparameters):
         model, shard_files, device, batch_size,
         use_amp=use_amp,
         weight_decay=hyperparameters.get('weight_decay', 5e-4),
+        sky_geometry=sky_geo,
     )
 
     # save plot
@@ -929,6 +1049,8 @@ def main(mode='train'):
         'clip_grad_norm': 1.0,
         'drop_path_rate': 0.2,
         'max_train_hours': 8.0,
+        'sky_n_pix': 192,
+        'sky_l_max': 8,
     }
 
     # ========== SETUP PATHS ==========

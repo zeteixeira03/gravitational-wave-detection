@@ -514,9 +514,10 @@ def plot_all_metrics(
     model,
     X: np.ndarray,
     y: np.ndarray,
+    sky_features: np.ndarray,
     history: Optional[Dict[str, list]] = None,
     figsize: tuple = (16, 12),
-    save_path: Optional[str] = None
+    save_path: Optional[str] = None,
 ) -> plt.Figure:
     """
     Create a comprehensive dashboard with all performance plots.
@@ -529,6 +530,8 @@ def plot_all_metrics(
         Input features
     y : np.ndarray
         True labels
+    sky_features : np.ndarray
+        S2 SH coefficients of shape (n_samples, n_sky_features).
     history : dict, optional
         Training history for learning curves. If None, skips learning curves.
     figsize : tuple
@@ -542,11 +545,11 @@ def plot_all_metrics(
         The matplotlib figure object
     """
     # compute all metrics
-    roc_data = model.roc_curve(X, y)
-    pr_data = model.precision_recall_curve(X, y)
-    cm_data = model.confusion_matrix(X, y)
-    y_proba = model.predict_proba(X)
-    metrics = model.evaluate(X, y)
+    roc_data = model.roc_curve(X, y, sky_features)
+    pr_data = model.precision_recall_curve(X, y, sky_features)
+    cm_data = model.confusion_matrix(X, y, sky_features)
+    y_proba = model.predict_proba(X, sky_features)
+    metrics = model.evaluate(X, y, sky_features)
 
     # determine layout
     has_history = history is not None and len(history) > 0

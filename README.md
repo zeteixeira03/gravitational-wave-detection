@@ -47,22 +47,26 @@ Input (3 detectors x 4096 samples)
                                                                       |
                                                               ConcatPool (512)
                                                                       |
+                                                                      +-------- S2 sky features (81 SH coefficients) ----+
+                                                                      |                                                |
+                                                                      +----------------------------------------------------+
+                                                                      |
                                                          3-layer classifier -> logits
 
                                                                                                                            * shared weights (same instrument)
 ```
 
-V2 two-stage fusion architecture: 10 residual backbone blocks feed into 4 parallel branch paths (H1, L1, V1, joint), which are merged and processed through 4 fusion blocks. LIGO H1/L1 share extractor and branch weights; Virgo is separate.
+V2 two-stage fusion architecture: 10 residual backbone blocks feed into 4 parallel branch paths (H1, L1, V1, joint), which are merged and processed through 4 fusion blocks. LIGO H1/L1 share extractor and branch weights; Virgo is separate. S2 spherical harmonic coefficients (81 dimensions for l_max=8) are concatenated with the ConcatPool output before the classifier, expanding the input from 512 to 593 features.
 
 ## Current Performance
 
 | Accuracy | AUC | Precision | Recall | F1 |
 |----------|-----|-----------|--------|----|
-| 0.807 | 0.874 | 0.921 | 0.671 | 0.777 |
+| 0.809 | 0.873 | 0.899 | 0.695 | 0.784 |
 
 <p align="center"><img src="assets/dashboard.png" width="700"></p>
 
-Phase 3 Step 1 (deep residual backbone) improved AUC from 0.858 to 0.866. Step 1b (V2 two-stage fusion with n=16 channels) reached 0.874 AUC. LR schedule switched from cosine warm restarts to plain cosine annealing for smoother convergence.
+Phase 3 Step 1 (deep residual backbone) improved AUC from 0.858 to 0.866. Step 1b (V2 two-stage fusion with n=16 channels) reached 0.874 AUC. LR schedule switched from cosine warm restarts to plain cosine annealing for smoother convergence. Step 2 added S2 geometric cross-correlation: a sky consistency map decomposed into spherical harmonic coefficients, concatenated with CNN features before the classifier head. First SH integration showed no AUC improvement (0.873 vs 0.874 baseline); the offline feasibility gate passed, so the features carry signal but are likely attenuated by mixup corruption and feature dimension imbalance. Under investigation.
 
 ## Installation
 
@@ -113,10 +117,11 @@ For local training: `python src/model_runs.py`. You need to have the full datase
 │   │   ├── g2net.py              # Dataset loading
 │   │   ├── preprocessing.py      # Signal preprocessing (whitening, filtering)
 │   │   ├── compute_psd.py        # PSD computation (run once before training)
-│   │   ├── create_tensors.py     # Tensor shard generation for Kaggle
+│   │   ├── create_tensors.py     # Tensor shard generation for Kaggle (includes SH coefficients)
 │   │   └── download_data.py      # Dataset download helper
 │   ├── models/
-│   │   └── diy_model.py          # 1D CNN implementation
+│   │   └── diy_model.py          # 1D CNN implementation (+ S2 sky features)
+│   ├── sky_feasibility.py        # Sky map feasibility analysis (offline diagnostic)
 │   ├── model_runs.py             # Training pipeline
 │   └── visualization.py          # Plotting utilities
 ├── notebooks/

@@ -132,7 +132,9 @@ Second, a two-stage fusion step. The backbone outputs 64-channel features at 32 
 
 The four path outputs are concatenated (4 x 64 = 256 channels) and processed through 4 fusion ResBlocks(256, k=7). This is the stage where cross-detector correlation becomes relevant. The individual branch paths refine per-detector features while the joint branch captures cross-detector interactions. The fusion blocks then learn from all paths simultaneously: a real gravitational wave produces correlated features across detectors, while noise does not.
 
-After the fusion blocks, AdaptiveConcatPool1d concatenates adaptive average and max pooling, producing a 512-dimensional feature vector (256 from each pooling mode). The classifier head (a 3-layer MLP: 512 -> 256 -> 64 -> 1) maps this to a raw logit, which is passed through a sigmoid function at inference time to produce a probability between 0 and 1.
+After the fusion blocks, AdaptiveConcatPool1d concatenates adaptive average and max pooling, producing a 512-dimensional feature vector (256 from each pooling mode).
+
+The model concatenates S2 spherical harmonic coefficients with the ConcatPool output before the classifier. With l_max=8, this adds 81 coefficients (batch-normalized), expanding the feature vector from 512 to 593 dimensions. The sky features are precomputed and stored in the tensor shards alongside the preprocessed signals (see the sky consistency map section below). The classifier head takes 593 inputs: Linear(593, 256) -> BN -> Dropout(0.5) -> SiLU -> Linear(256, 64) -> BN -> Dropout(0.5) -> Linear(64, 1). Output is raw logits; sigmoid is applied at inference time.
 
 ### Training
 
@@ -176,7 +178,7 @@ The detection problem has a natural symmetry: whether a gravitational wave is pr
 
 The detector network also carries a discrete symmetry. LIGO Hanford and Livingston are the same instrument design, so swapping them should not change the detection outcome (the individual signals will differ in amplitude, but not in morphology). This $Z_2$ symmetry is enforced in the CNN backbone by weight sharing between the two LIGO branches (while Virgo, a different instrument, gets its own extractor). The sky consistency map inherits this symmetry automatically, since cross-correlation is symmetric under pair reordering.
 
-In the full architecture (to be developed), the spherical harmonic coefficients are concatenated with the CNN backbone features before the classifier head. The two paths are complementary: the CNN captures signal morphology (what the waveform looks like in each detector), while the sky map captures geometric consistency (whether the detectors agree at delays that correspond to a single astrophysical source). A single detector might exhibit a chirp-like feature due to a noise artifact, but only the sky map can confirm that all three detectors see correlated signal with the correct relative timing for a real source at a specific sky position.
+In the full architecture, the spherical harmonic coefficients are concatenated with the CNN backbone features before the classifier head. The two paths are complementary: the CNN captures signal morphology (what the waveform looks like in each detector), while the sky map captures geometric consistency (whether the detectors agree at delays that correspond to a single astrophysical source). A single detector might exhibit a chirp-like feature due to a noise artifact, but only the sky map can confirm that all three detectors see correlated signal with the correct relative timing for a real source at a specific sky position.
 
 ## But why a Neural Network?
 

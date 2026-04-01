@@ -1,5 +1,5 @@
 """
-Create PyTorch tensor dataset with preprocessed (whitened) signals.
+Create PyTorch tensor dataset with preprocessed (whitened) signals and S2 sky features.
 
 Run this locally once to generate .pt shard files, then upload to Kaggle as a dataset.
 
@@ -7,7 +7,7 @@ Usage:
     python src/data/create_tensors.py --input /path/to/g2net-dataset --output /path/to/output
 
 The output directory will contain:
-    - shard_00.pt, shard_01.pt, ... (preprocessed signals + labels)
+    - shard_00.pt, shard_01.pt, ... (preprocessed signals + labels + sh_coeffs)
     - metadata.json (sample count, shard info)
 """
 
@@ -29,6 +29,14 @@ if str(SRC_DIR) not in sys.path:
 from data.g2net import load_labels, load_sample
 from data.preprocessing import preprocess_sample, load_psd
 from data.compute_psd import compute_and_save_average_psd
+from sky_feasibility import (
+    make_sky_grid,
+    compute_time_delays,
+    delay_to_sample_index,
+    build_sky_map,
+    compute_sh_matrix,
+    decompose_sky_map,
+)
 
 SHARD_SIZE = 50000  # ~2.4 GB per shard
 
@@ -37,12 +45,13 @@ SHARD_SIZE = 50000  # ~2.4 GB per shard
 #                                 MAIN
 # ============================================================================
 
-def _save_shard(signals_list, labels_list, output_dir, shard_idx):
+def _save_shard(signals_list, labels_list, sh_coeffs_list, output_dir, shard_idx):
     """Save a shard to disk and clear the lists."""
     signals = torch.tensor(np.stack(signals_list))
     labels = torch.tensor(np.array(labels_list, dtype=np.int64))
+    sh_coeffs = torch.tensor(np.stack(sh_coeffs_list), dtype=torch.float32)
     path = output_dir / f"shard_{shard_idx:02d}.pt"
-    torch.save({'signals': signals, 'labels': labels}, str(path))
+    torch.save({'signals': signals, 'labels': labels, 'sh_coeffs': sh_coeffs}, str(path))
     print(f"\n  Saved {path.name} ({len(labels_list)} samples)")
     return path
 
@@ -52,6 +61,8 @@ def create_tensors(input_dir: Path, output_dir: Path, psd_path: Path = None):
     Create PyTorch tensor dataset from raw G2Net data.
 
     Writes sharded .pt files to keep memory usage constant (~2.4 GB per shard).
+    Each shard contains preprocessed signals, labels, and S2 spherical harmonic
+    coefficients.
 
     Parameters
     ----------
@@ -81,10 +92,22 @@ def create_tensors(input_dir: Path, output_dir: Path, psd_path: Path = None):
     n_samples = len(df)
     print(f"Total samples: {n_samples}")
 
+    # sky geometry
+    n_pix, l_max = 192, 8
+    print(f"\nInitializing S2 sky geometry (n_pix={n_pix}, l_max={l_max})...")
+    theta, phi = make_sky_grid(n_pix)
+    delays = compute_time_delays(theta, phi)
+    delay_indices = {pair: delay_to_sample_index(d) for pair, d in delays.items()}
+    sh_matrix = compute_sh_matrix(theta, phi, l_max)
+    sh_pinv = np.linalg.pinv(sh_matrix).astype(np.float32)
+    n_coeffs = (l_max + 1) ** 2
+    print(f"  SH coefficients per sample: {n_coeffs}")
+
     # process and save in shards
     print(f"\nProcessing samples (shard size: {SHARD_SIZE})...")
     signals_list = []
     labels_list = []
+    sh_coeffs_list = []
     shard_idx = 0
     shard_paths = []
     written = 0
@@ -104,14 +127,19 @@ def create_tensors(input_dir: Path, output_dir: Path, psd_path: Path = None):
 
             signals_list.append(processed.astype(np.float32))
             labels_list.append(label)
+
+            sky_map = build_sky_map(processed, delay_indices)
+            sh_coeffs_list.append((sh_pinv @ sky_map).astype(np.float32))
+
             written += 1
 
             # flush shard to disk when full
             if len(labels_list) >= SHARD_SIZE:
-                path = _save_shard(signals_list, labels_list, output_dir, shard_idx)
+                path = _save_shard(signals_list, labels_list, sh_coeffs_list, output_dir, shard_idx)
                 shard_paths.append(path.name)
                 signals_list.clear()
                 labels_list.clear()
+                sh_coeffs_list.clear()
                 shard_idx += 1
 
         except Exception as e:
@@ -121,7 +149,7 @@ def create_tensors(input_dir: Path, output_dir: Path, psd_path: Path = None):
 
     # save remaining samples
     if labels_list:
-        path = _save_shard(signals_list, labels_list, output_dir, shard_idx)
+        path = _save_shard(signals_list, labels_list, sh_coeffs_list, output_dir, shard_idx)
         shard_paths.append(path.name)
 
     # save metadata
@@ -132,6 +160,9 @@ def create_tensors(input_dir: Path, output_dir: Path, psd_path: Path = None):
         'shard_files': shard_paths,
         'signal_shape': [3, 4096],
         'dtype': 'float32',
+        'sky_n_coeffs': n_coeffs,
+        'sky_n_pix': n_pix,
+        'sky_l_max': l_max,
     }
     metadata_path = output_dir / "metadata.json"
     with open(metadata_path, 'w') as f:
@@ -144,19 +175,92 @@ def create_tensors(input_dir: Path, output_dir: Path, psd_path: Path = None):
     print(f"  Metadata: {metadata_path}")
 
 
+def add_sky_features(shard_dir: Path, n_pix: int = 192, l_max: int = 8) -> None:
+    """
+    Add SH coefficients to existing shard files that lack them.
+
+    Reads each shard's preprocessed signals, computes sky maps and SH
+    coefficients, and rewrites the shard with sh_coeffs included.
+    Much faster than regenerating from raw data (~1.5 ms/sample vs minutes
+    for full preprocessing).
+
+    Parameters
+    ----------
+    shard_dir
+        Directory containing shard_*.pt files.
+    n_pix
+        Sky grid resolution.
+    l_max
+        Maximum SH degree.
+    """
+    shard_files = sorted(shard_dir.glob('shard_*.pt'))
+    if not shard_files:
+        raise FileNotFoundError(f"No shard files in {shard_dir}")
+
+    # check if already done
+    first = torch.load(str(shard_files[0]), weights_only=True)
+    if 'sh_coeffs' in first:
+        print("Shards already contain sh_coeffs, skipping.")
+        del first
+        return
+    del first
+
+    print(f"Adding SH coefficients to {len(shard_files)} shards (n_pix={n_pix}, l_max={l_max})...")
+    theta, phi = make_sky_grid(n_pix)
+    delays = compute_time_delays(theta, phi)
+    delay_indices = {pair: delay_to_sample_index(d) for pair, d in delays.items()}
+    sh_matrix = compute_sh_matrix(theta, phi, l_max)
+    sh_pinv = np.linalg.pinv(sh_matrix).astype(np.float32)
+
+    for f in shard_files:
+        data = torch.load(str(f), weights_only=True)
+        signals = data['signals'].numpy()
+        n = len(signals)
+        sh_coeffs = np.empty((n, (l_max + 1) ** 2), dtype=np.float32)
+
+        for i in tqdm(range(n), desc=f"  {f.name}"):
+            sky_map = build_sky_map(signals[i], delay_indices)
+            sh_coeffs[i] = sh_pinv @ sky_map
+
+        data['sh_coeffs'] = torch.tensor(sh_coeffs)
+        torch.save(data, str(f))
+        print(f"    {f.name}: {n} samples")
+        del data, signals, sh_coeffs
+
+    # update metadata
+    meta_path = shard_dir / "metadata.json"
+    if meta_path.exists():
+        with open(meta_path) as fh:
+            metadata = json.load(fh)
+        metadata['sky_n_coeffs'] = (l_max + 1) ** 2
+        metadata['sky_n_pix'] = n_pix
+        metadata['sky_l_max'] = l_max
+        with open(meta_path, 'w') as fh:
+            json.dump(metadata, fh, indent=2)
+
+    print("Done.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Create PyTorch tensor dataset from G2Net data")
-    parser.add_argument("--input", type=str, required=True,
-                        help="Path to g2net-gravitational-wave-detection directory")
-    parser.add_argument("--output", type=str, required=True,
-                        help="Path to save tensor files")
+    parser.add_argument("--input", type=str, default=None,
+                        help="Path to g2net-gravitational-wave-detection directory (for full rebuild)")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Path to save tensor files (for full rebuild)")
     parser.add_argument("--psd", type=str, default=None,
                         help="Path to precomputed avg_psd.npz (optional)")
+    parser.add_argument("--add-sky", type=str, default=None,
+                        help="Path to existing shard directory to add SH coefficients to")
 
     args = parser.parse_args()
 
-    create_tensors(
-        input_dir=Path(args.input),
-        output_dir=Path(args.output),
-        psd_path=Path(args.psd) if args.psd else None,
-    )
+    if args.add_sky:
+        add_sky_features(Path(args.add_sky))
+    elif args.input and args.output:
+        create_tensors(
+            input_dir=Path(args.input),
+            output_dir=Path(args.output),
+            psd_path=Path(args.psd) if args.psd else None,
+        )
+    else:
+        parser.error("Either --add-sky or both --input and --output are required")

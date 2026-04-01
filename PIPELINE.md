@@ -17,6 +17,7 @@
 │   4. Tukey window                                        ├── avg_psd.npz    │
 │   5. Normalize                                           └── metadata.json  │
 │   6. Serialize to .pt shard (torch.save)                                    │
+│   7. Compute S2 SH coefficients per sample                                  │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
@@ -38,9 +39,10 @@
 │        │                       │                           │                │
 │        │                       │ GWTensorDataset           │ Deep residual  │
 │        │                       │ + DataLoader              │ 1D CNN: 10     │
-│        │                       │ (shard streaming)         │ backbone + V2  │
-│        │                       │                           │ fusion (4 br + │
-│        │                       │                           │ 4 fus blocks)  │
+│        │                       │ (shard streaming,         │ backbone + V2  │
+│        │                       │  S2 sky features          │ fusion (4 br + │
+│        │                       │  from shards)             │ 4 fus blocks)  │
+│        │                       │                           │ + S2 SH        │
 │        │                       ▼                           │ 3-layer head   │
 │        │                    fit()                          ▼                │
 │        │                       │                      Trained Weights       │

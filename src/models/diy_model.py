@@ -1,9 +1,12 @@
 """
 Deep residual 1D CNN for G2Net gravitational wave detection.
 
-Phase 3, Step 1b: V2-style two-stage fusion on top of ~10 residual backbone blocks.
-After the shared backbone, 4 parallel paths (H1, L1, V1, joint) are processed through
-individual branch blocks, then merged and processed through 4 fusion blocks.
+Phase 3, Steps 1b + 2: V2-style two-stage fusion on top of ~10 residual backbone
+blocks, with optional S2 spherical harmonic sky features. After the shared backbone,
+4 parallel paths (H1, L1, V1, joint) are processed through individual branch blocks,
+then merged and processed through 4 fusion blocks. Sky features (SH coefficients from
+cross-detector consistency maps on S2) are concatenated with CNN features before the
+classifier head.
 LIGO H1/L1 share extractor and branch weights; Virgo has separate weights.
 """
 
@@ -149,12 +152,13 @@ class DIYModel(nn.Module):
     """
     Deep residual 1D CNN for binary classification of GW signals.
 
-    Architecture (Phase 3, Step 1b — V2 two-stage fusion):
+    Architecture (Phase 3, Steps 1b + 2 -- V2 fusion + S2 sky features):
     - Separate extractors for LIGO (H1/L1 shared) and Virgo
     - 10 residual backbone blocks with GeM downsampling and channel widening
     - V2 fusion: 4 parallel branch paths (H1, L1, V1, joint) x 2 ResBlocks each
     - 4 fusion blocks processing merged branch outputs
     - AdaptiveConcatPool1d (avg + max) on fused features
+    - S2 sky features (SH coefficients) -> BN -> concat with CNN features
     - 3-layer classifier head
     - Auxiliary per-branch heads for training supervision
     - All outputs are raw logits (no sigmoid); use BCEWithLogitsLoss
@@ -162,11 +166,13 @@ class DIYModel(nn.Module):
     Backbone:  4096 -> 2048 (extractor) -> 512 -> 128 -> 32
     Channels:  1 -> n -> n -> 2n -> 4n (backbone) -> 4n (branches) -> 16n (fused)
     Fusion:    4 paths x 4n -> concat 16n -> 4 ResBlocks -> ConcatPool -> 32n features
+    Sky:       SH coefficients (l_max=8 -> 81 features) -> BN -> concat with CNN features
 
     Input shape: (batch_size, 3, 4096) - 3 detectors, 4096 time samples
+    Sky input:   (batch_size, n_sky_features) - SH coefficients from S2 sky map
     """
 
-    def __init__(self, n_channels: int = 32, dropout_rate: float = 0.5, drop_path_rate: float = 0.0):
+    def __init__(self, n_channels: int = 32, dropout_rate: float = 0.5, drop_path_rate: float = 0.0, n_sky_features: int = 81):
         """
         Parameters
         ----------
@@ -177,6 +183,9 @@ class DIYModel(nn.Module):
         drop_path_rate : float
             Maximum stochastic depth drop probability (applied to last block;
             linearly increases from 0 at the first block).
+        n_sky_features : int
+            Number of S2 sky features (SH coefficients) concatenated with
+            CNN features. With l_max=8, this is (8+1)^2 = 81.
         """
         super().__init__()
         n = n_channels
@@ -263,8 +272,11 @@ class DIYModel(nn.Module):
         # auxiliary per-branch heads: ConcatPool on 4n -> 8n features
         self.branch_head = nn.Linear(8 * n, 1)
 
-        # classifier head: ConcatPool on 16n fusion output = 32n features
-        feat_dim = 32 * n
+        # ---- S2 sky features (Phase 3, Step 2) ----
+        self.sky_bn = nn.BatchNorm1d(n_sky_features, momentum=0.1, eps=1e-5)
+
+        # classifier head: ConcatPool on 16n fusion output = 32n + sky features
+        feat_dim = 32 * n + n_sky_features
         self.classifier = nn.Sequential(
             nn.Linear(feat_dim, 256),
             nn.BatchNorm1d(256, momentum=0.1, eps=1e-5),
@@ -286,12 +298,14 @@ class DIYModel(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, X: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    def forward(self, X: torch.Tensor, sky_features: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Parameters
         ----------
         X : torch.Tensor
             Input of shape (batch_size, 3, 4096).
+        sky_features : torch.Tensor
+            S2 spherical harmonic coefficients, shape (batch_size, n_sky_features).
 
         Returns
         -------
@@ -323,6 +337,11 @@ class DIYModel(nn.Module):
         fused = torch.cat([h1_branch, l1_branch, v1_branch, joint_branch], dim=1)
         fused = self.fusion(fused)
         features = self.global_pool(fused).squeeze(-1)
+
+        # concatenate S2 sky features with CNN features
+        sky_features = self.sky_bn(sky_features)
+        features = torch.cat([features, sky_features], dim=1)
+
         main_logits = self.classifier(features)
 
         if self.training:
@@ -375,7 +394,7 @@ class DIYModel(nn.Module):
         return main_loss
 
     @torch.no_grad()
-    def predict_proba(self, X: np.ndarray, batch_size: int = 256) -> np.ndarray:
+    def predict_proba(self, X: np.ndarray, sky_features: np.ndarray, batch_size: int = 256) -> np.ndarray:
         """
         Predict probabilities for input samples.
 
@@ -383,6 +402,8 @@ class DIYModel(nn.Module):
         ----------
         X : np.ndarray
             Input features of shape (n_samples, 3, n_time_samples).
+        sky_features : np.ndarray
+            S2 SH coefficients of shape (n_samples, n_sky_features).
         batch_size : int
             Batch size for inference to avoid OOM on large inputs.
 
@@ -398,14 +419,16 @@ class DIYModel(nn.Module):
         n_samples = X.shape[0]
         if n_samples <= batch_size:
             X_t = torch.tensor(X, dtype=torch.float32, device=device)
-            logits = self.forward(X_t)
+            sky_t = torch.tensor(sky_features, dtype=torch.float32, device=device)
+            logits = self.forward(X_t, sky_features=sky_t)
             result = torch.sigmoid(logits).cpu().numpy().flatten()
         else:
             all_predictions = []
             for start_idx in range(0, n_samples, batch_size):
                 end_idx = min(start_idx + batch_size, n_samples)
                 X_batch = torch.tensor(X[start_idx:end_idx], dtype=torch.float32, device=device)
-                logits = self.forward(X_batch)
+                sky_batch = torch.tensor(sky_features[start_idx:end_idx], dtype=torch.float32, device=device)
+                logits = self.forward(X_batch, sky_features=sky_batch)
                 all_predictions.append(torch.sigmoid(logits).cpu().numpy())
             result = np.concatenate(all_predictions, axis=0).flatten()
 
@@ -413,7 +436,7 @@ class DIYModel(nn.Module):
             self.train()
         return result
 
-    def predict(self, X: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+    def predict(self, X: np.ndarray, sky_features: np.ndarray, threshold: float = 0.5) -> np.ndarray:
         """
         Predict binary labels for input samples. 1 = BH merger, 0 = not
 
@@ -421,6 +444,8 @@ class DIYModel(nn.Module):
         ----------
         X : np.ndarray
             Input features of shape (n_samples, n_features).
+        sky_features : np.ndarray
+            S2 SH coefficients of shape (n_samples, n_sky_features).
         threshold : float
             Classification threshold.
 
@@ -429,7 +454,7 @@ class DIYModel(nn.Module):
         np.ndarray
             Predicted binary labels of shape (n_samples,).
         """
-        probas = self.predict_proba(X)
+        probas = self.predict_proba(X, sky_features)
         return (probas >= threshold).astype(int)
 
     def _compute_confusion_values(self, y_pred: np.ndarray, y_true: np.ndarray) -> dict:
@@ -454,7 +479,7 @@ class DIYModel(nn.Module):
         FN = int(np.sum((y_pred == 0) & (y_true == 1)))
         return {'TP': TP, 'TN': TN, 'FP': FP, 'FN': FN}
 
-    def confusion_matrix(self, X: np.ndarray, y: np.ndarray, threshold: float = 0.5) -> dict:
+    def confusion_matrix(self, X: np.ndarray, y: np.ndarray, sky_features: np.ndarray, threshold: float = 0.5) -> dict:
         """
         Compute confusion matrix components.
 
@@ -464,6 +489,8 @@ class DIYModel(nn.Module):
             Input features.
         y : np.ndarray
             True labels.
+        sky_features : np.ndarray
+            S2 SH coefficients of shape (n_samples, n_sky_features).
         threshold : float
             Classification threshold.
 
@@ -472,7 +499,7 @@ class DIYModel(nn.Module):
         dict
             Dictionary containing 'TP', 'TN', 'FP', 'FN' counts.
         """
-        y_pred = self.predict(X, threshold=threshold)
+        y_pred = self.predict(X, sky_features, threshold=threshold)
         return self._compute_confusion_values(y_pred, y)
 
     def _metrics_from_confusion(self, cm: dict, n_samples: int) -> dict:
@@ -507,7 +534,7 @@ class DIYModel(nn.Module):
             'f1': float(f1)
         }
 
-    def evaluate(self, X: np.ndarray, y: np.ndarray, threshold: float = 0.5) -> dict:
+    def evaluate(self, X: np.ndarray, y: np.ndarray, sky_features: np.ndarray, threshold: float = 0.5) -> dict:
         """
         Evaluate model statistics.
 
@@ -517,6 +544,8 @@ class DIYModel(nn.Module):
             Input features.
         y : np.ndarray
             True labels.
+        sky_features : np.ndarray
+            S2 SH coefficients of shape (n_samples, n_sky_features).
         threshold : float
             Classification threshold.
 
@@ -525,10 +554,10 @@ class DIYModel(nn.Module):
         dict
             Dictionary containing accuracy, precision, recall, specificity, f1.
         """
-        cm = self.confusion_matrix(X, y, threshold=threshold)
+        cm = self.confusion_matrix(X, y, sky_features, threshold=threshold)
         return self._metrics_from_confusion(cm, len(y))
 
-    def roc_curve(self, X: np.ndarray, y: np.ndarray, n_thresholds: int = 100) -> dict:
+    def roc_curve(self, X: np.ndarray, y: np.ndarray, sky_features: np.ndarray, n_thresholds: int = 100) -> dict:
         """
         Compute ROC curve data at multiple thresholds.
 
@@ -538,6 +567,8 @@ class DIYModel(nn.Module):
             Input features.
         y : np.ndarray
             True labels.
+        sky_features : np.ndarray
+            S2 SH coefficients of shape (n_samples, n_sky_features).
         n_thresholds : int
             Number of threshold points to evaluate.
 
@@ -546,7 +577,7 @@ class DIYModel(nn.Module):
         dict
             Dictionary containing 'fpr', 'tpr', 'thresholds', 'auc'.
         """
-        y_proba = self.predict_proba(X)
+        y_proba = self.predict_proba(X, sky_features)
         thresholds = np.linspace(0, 1, n_thresholds)
 
         tpr_list = []
@@ -572,7 +603,7 @@ class DIYModel(nn.Module):
 
         return {'fpr': fpr_arr, 'tpr': tpr_arr, 'thresholds': thresholds, 'auc': float(auc)}
 
-    def precision_recall_curve(self, X: np.ndarray, y: np.ndarray, n_thresholds: int = 100) -> dict:
+    def precision_recall_curve(self, X: np.ndarray, y: np.ndarray, sky_features: np.ndarray, n_thresholds: int = 100) -> dict:
         """
         Compute precision-recall curve data at multiple thresholds.
 
@@ -582,6 +613,8 @@ class DIYModel(nn.Module):
             Input features.
         y : np.ndarray
             True labels.
+        sky_features : np.ndarray
+            S2 SH coefficients of shape (n_samples, n_sky_features).
         n_thresholds : int
             Number of threshold points to evaluate.
 
@@ -590,7 +623,7 @@ class DIYModel(nn.Module):
         dict
             Dictionary containing 'precision', 'recall', 'thresholds', 'ap'.
         """
-        y_proba = self.predict_proba(X)
+        y_proba = self.predict_proba(X, sky_features)
         thresholds = np.linspace(0, 1, n_thresholds)
 
         precision_list = []
