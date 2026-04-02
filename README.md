@@ -47,8 +47,8 @@ Input (3 detectors x 4096 samples)
                                                                       |
                                                               ConcatPool (512)
                                                                       |
-                                                                      +-------- S2 sky features (81 SH coefficients) ----+
-                                                                      |                                                |
+                                                                      +-------- S2 sky features (81 SH coefficients) ------+
+                                                                      |                                                    |
                                                                       +----------------------------------------------------+
                                                                       |
                                                          3-layer classifier -> logits
@@ -66,7 +66,7 @@ V2 two-stage fusion architecture: 10 residual backbone blocks feed into 4 parall
 
 <p align="center"><img src="assets/dashboard.png" width="700"></p>
 
-Phase 3 Step 1 (deep residual backbone) improved AUC from 0.858 to 0.866. Step 1b (V2 two-stage fusion with n=16 channels) reached 0.874 AUC. LR schedule switched from cosine warm restarts to plain cosine annealing for smoother convergence. Step 2 added S2 geometric cross-correlation: a sky consistency map decomposed into spherical harmonic coefficients, concatenated with CNN features before the classifier head. First SH integration showed no AUC improvement (0.873 vs 0.874 baseline); the offline feasibility gate passed, so the features carry signal but are likely attenuated by mixup corruption and feature dimension imbalance. Under investigation.
+Phase 3 Step 1 (deep residual backbone) improved AUC from 0.858 to 0.866. Step 1b (V2 two-stage fusion with n=16 channels) reached 0.874 AUC. LR schedule switched from cosine warm restarts to plain cosine annealing for smoother convergence. Step 2 added S2 geometric cross-correlation: a sky consistency map decomposed into spherical harmonic coefficients, concatenated with CNN features before the classifier head. First SH integration showed no AUC improvement (0.873 vs 0.874 baseline); the offline feasibility gate passed, so the features carry signal but are likely attenuated by mixup corruption and feature dimension imbalance. Current plan is to heavily reduce augmentation to isolate sky features contribution.
 
 ## Installation
 

@@ -147,9 +147,12 @@ Each step is gated on the previous one showing improvement.
 
 First run with SH features: AUC 0.873, no measurable improvement over the Step 1b baseline (0.873-0.874). The offline feasibility gate passed (l=0 monopole AUC ~0.60, roughly half of all coefficients above 0.56), so the SH coefficients carry some discriminative signal. Two suspected attenuators:
 
-1. **Mixup corrupts SH features.** Mixup linearly blends SH coefficient vectors from two unrelated samples (`lam * sky + (1-lam) * sky[perm]`). For CNN inputs this is standard, but SH coefficients encode the sky map of a specific source: mixing two sky maps from different sky positions produces a vector that corresponds to no physical configuration. This teaches the classifier to partially ignore the SH input.
+ **Hypothesis:** Six overlapping regularization mechanisms (mixup, spectral dropout, time shift, Gaussian noise, dropout 0.5, aux branch loss) are sabotaging the sky features. Mixup creates sky-signal mismatches, spectral dropout destroys inter-detector phase coherence, and time shifts contradict the precomputed sky geometry.
 
-2. **Feature dimension imbalance.** With n=16, ConcatPool produces 512 CNN features vs 81 SH features (13.7% of the 593-dim classifier input). Combined with dropout 0.5 in the classifier head, the SH contribution is structurally disadvantaged.
+ **Ablation:** isolate whether the sky map adds discriminative signal when the training regime doesn't fight it. The plan is to strip down regularization that conflicts with sky features, keeping only what's safe. Compare against runs completed before adding sky features (AUC 0.8734-0.8737) and with full augmentation:
+        - AUC > 0.876: sky features add real signal when not sabotaged. Strong result.
+        - AUC 0.873-0.876: inconclusive. Could be sky helping but offset by less regularization. Next step: run same stripped config WITHOUT sky features to isolate.
+        - AUC < 0.873: either sky features don't help, or reduced regularization causes overfitting. Check train-val loss gap to distinguish.
 
 **Step 3: Training refinements.** MC dropout at inference, pseudo-labeling, rank loss fine-tuning.
 
