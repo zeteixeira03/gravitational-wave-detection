@@ -100,12 +100,16 @@ class SkyGeometry:
 class GWTensorDataset(Dataset):
     """Wraps signal and label tensors for DataLoader, with optional sky feature extraction."""
 
-    def __init__(self, signals: torch.Tensor, labels: torch.Tensor, augment: bool = False, sky_geometry: SkyGeometry | None = None, precomputed_sh: torch.Tensor | None = None):
+    def __init__(self, signals: torch.Tensor, labels: torch.Tensor, augment: bool = False, sky_geometry: SkyGeometry | None = None, precomputed_sh: torch.Tensor | None = None, aug_config: dict | None = None):
         self.signals = signals
         self.labels = labels
         self.augment = augment
         self.sky_geometry = sky_geometry
         self.precomputed_sh = precomputed_sh
+        self.aug_config = aug_config or {
+            'time_shift': True, 'noise': True,
+            'spectral_dropout': True, 'channel_shuffle': True,
+        }
 
     def __len__(self) -> int:
         return len(self.labels)
@@ -122,18 +126,17 @@ class GWTensorDataset(Dataset):
             sh_coeffs = torch.tensor(self.sky_geometry.extract(x.numpy()), dtype=torch.float32)
 
         if self.augment:
-            # time shift: roll each detector independently by 0-20 samples
-            for ch in range(x.shape[0]):
-                shift = int(torch.randint(0, 21, (1,)).item())
-                x[ch] = torch.roll(x[ch], shift)
-            # gaussian noise: scale relative to signal amplitude
-            noise_scale = (0.01 + 0.09 * torch.rand(1).item()) * x.std().item()
-            x = x + torch.randn_like(x) * noise_scale
-            # spectral dropout: zero random frequency bins independently per detector (p=0.05)
-            spec = torch.fft.rfft(x, dim=-1)
-            x = torch.fft.irfft(spec * (torch.rand(spec.shape) > 0.05), n=x.shape[-1])
-            # channel shuffle: randomly swap H1/L1 (respects Z2 symmetry; Virgo stays at index 2)
-            if torch.rand(1).item() > 0.5:
+            if self.aug_config['time_shift']:
+                for ch in range(x.shape[0]):
+                    shift = int(torch.randint(0, 21, (1,)).item())
+                    x[ch] = torch.roll(x[ch], shift)
+            if self.aug_config['noise']:
+                noise_scale = (0.01 + 0.09 * torch.rand(1).item()) * x.std().item()
+                x = x + torch.randn_like(x) * noise_scale
+            if self.aug_config['spectral_dropout']:
+                spec = torch.fft.rfft(x, dim=-1)
+                x = torch.fft.irfft(spec * (torch.rand(spec.shape) > 0.05), n=x.shape[-1])
+            if self.aug_config['channel_shuffle'] and torch.rand(1).item() > 0.5:
                 x = x[[1, 0, 2]]
 
         return x, self.labels[idx], sh_coeffs
@@ -166,15 +169,20 @@ def mixup_batch(
     Returns
     -------
     tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        Mixed signals, soft labels, and mixed sky features.
+        Mixed signals, soft labels, and dominant sample's sky features.
     """
     lam = float(torch.distributions.Beta(alpha, alpha).sample())
     perm = torch.randperm(x.size(0), device=x.device)
 
+    # sky features encode geometric consistency for a specific source --
+    # blending two unrelated sky maps produces a non-physical vector.
+    # keep the dominant sample's coefficients intact.
+    sky_out = sky if lam >= 0.5 else sky[perm]
+
     return (
         lam * x + (1 - lam) * x[perm],
         lam * y + (1 - lam) * y[perm],
-        lam * sky + (1 - lam) * sky[perm],
+        sky_out,
     )
 
 
@@ -196,6 +204,8 @@ def fit(
     clip_grad_norm=None,
     max_train_hours=None,
     sky_geometry=None,
+    use_mixup=True,
+    aug_config=None,
 ):
     """
     Train model by streaming shards from disk. Sky features are computed
@@ -288,7 +298,7 @@ def fit(
             shard_path = train_shard_paths[shard_idx]
             data = torch.load(str(shard_path), weights_only=True)
             precomputed_sh = data.get('sh_coeffs', None)
-            shard_dataset = GWTensorDataset(data['signals'], data['labels'], augment=True, sky_geometry=sky_geometry, precomputed_sh=precomputed_sh)
+            shard_dataset = GWTensorDataset(data['signals'], data['labels'], augment=True, sky_geometry=sky_geometry, precomputed_sh=precomputed_sh, aug_config=aug_config)
             shard_loader = DataLoader(
                 shard_dataset, batch_size=batch_size, shuffle=True,
                 num_workers=2, pin_memory=(device.type == 'cuda')
@@ -303,7 +313,8 @@ def fit(
                 X_batch = X_batch.to(device)
                 sky_batch = sky_batch.to(device)
                 y_batch = y_batch.float().unsqueeze(1).to(device)
-                X_batch, y_batch, sky_batch = mixup_batch(X_batch, y_batch, sky_batch)
+                if use_mixup:
+                    X_batch, y_batch, sky_batch = mixup_batch(X_batch, y_batch, sky_batch)
 
                 optimizer.zero_grad()
                 with torch.amp.autocast("cuda", enabled=use_amp):
@@ -627,6 +638,13 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     drop_path_rate = hyperparameters.get('drop_path_rate', 0.0)
     sky_n_pix = hyperparameters.get('sky_n_pix', 192)
     sky_l_max = hyperparameters.get('sky_l_max', 8)
+    use_mixup = hyperparameters.get('use_mixup', True)
+    aug_config = {
+        'time_shift': hyperparameters.get('aug_time_shift', True),
+        'noise': hyperparameters.get('aug_noise', True),
+        'spectral_dropout': hyperparameters.get('aug_spectral_dropout', True),
+        'channel_shuffle': hyperparameters.get('aug_channel_shuffle', True),
+    }
 
     print(f"Signal length: {n_samples_config}")
     print(f"Learning rate: {learning_rate}")
@@ -639,6 +657,8 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     print(f"Aux loss weight: {aux_loss_weight}")
     print(f"Drop path rate: {drop_path_rate}")
     print(f"Sky: n_pix={sky_n_pix}, l_max={sky_l_max}")
+    print(f"Mixup: {use_mixup}")
+    print(f"Augmentations: {aug_config}")
     print(f"Total samples: {n_samples}")
     print("Mode: TENSOR (preprocessed data, shard streaming)")
 
@@ -775,6 +795,8 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
         clip_grad_norm=clip_grad_norm,
         max_train_hours=max_train_hours,
         sky_geometry=sky_geo,
+        use_mixup=use_mixup,
+        aug_config=aug_config,
     )
 
     print("\nTraining complete.")
@@ -1038,19 +1060,24 @@ def main(mode='train'):
         'n_channels': 16,
         'n_samples': 4096,
         'learning_rate': 1e-3,
-        'dropout_rate': 0.5,
+        'dropout_rate': 0.3,
         'weight_decay': 5e-4,
         'epochs': 50,
         'batch_size': 64 if has_gpu else 32,
         'early_stopping_patience': 10,
         'warmup_epochs': 5,
-        'aux_loss_weight': 0.2,
+        'aux_loss_weight': 0.0,
         'use_amp': True,
         'clip_grad_norm': 1.0,
         'drop_path_rate': 0.2,
         'max_train_hours': 8.0,
         'sky_n_pix': 192,
         'sky_l_max': 8,
+        'use_mixup': False,
+        'aug_time_shift': False,
+        'aug_noise': False,
+        'aug_spectral_dropout': False,
+        'aug_channel_shuffle': True,
     }
 
     # ========== SETUP PATHS ==========
