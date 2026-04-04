@@ -1060,7 +1060,7 @@ def main(mode='train'):
         'n_channels': 16,
         'n_samples': 4096,
         'learning_rate': 1e-3,
-        'dropout_rate': 0.3,
+        'dropout_rate': 0.5,
         'weight_decay': 5e-4,
         'epochs': 50,
         'batch_size': 64 if has_gpu else 32,
@@ -1075,7 +1075,7 @@ def main(mode='train'):
         'sky_l_max': 8,
         'use_mixup': False,
         'aug_time_shift': False,
-        'aug_noise': False,
+        'aug_noise': True,
         'aug_spectral_dropout': False,
         'aug_channel_shuffle': True,
     }
