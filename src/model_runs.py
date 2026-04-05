@@ -109,6 +109,7 @@ class GWTensorDataset(Dataset):
         self.aug_config = aug_config or {
             'time_shift': True, 'noise': True,
             'spectral_dropout': True, 'channel_shuffle': True,
+            'amplitude_scale': True,
         }
 
     def __len__(self) -> int:
@@ -136,6 +137,9 @@ class GWTensorDataset(Dataset):
             if self.aug_config['spectral_dropout']:
                 spec = torch.fft.rfft(x, dim=-1)
                 x = torch.fft.irfft(spec * (torch.rand(spec.shape) > 0.05), n=x.shape[-1])
+            if self.aug_config.get('amplitude_scale', False):
+                scale = 0.8 + 0.4 * torch.rand(1).item()
+                x = x * scale
             if self.aug_config['channel_shuffle'] and torch.rand(1).item() > 0.5:
                 x = x[[1, 0, 2]]
 
@@ -206,6 +210,7 @@ def fit(
     sky_geometry=None,
     use_mixup=True,
     aug_config=None,
+    label_smoothing=0.0,
 ):
     """
     Train model by streaming shards from disk. Sky features are computed
@@ -319,7 +324,7 @@ def fit(
                 optimizer.zero_grad()
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     logits, branch_logits = model(X_batch, sky_features=sky_batch)
-                    loss = model.compute_loss(y_batch, logits, branch_logits, aux_loss_weight)
+                    loss = model.compute_loss(y_batch, logits, branch_logits, aux_loss_weight, label_smoothing)
                 scaler.scale(loss).backward()
                 if clip_grad_norm:
                     scaler.unscale_(optimizer)
@@ -639,11 +644,13 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     sky_n_pix = hyperparameters.get('sky_n_pix', 192)
     sky_l_max = hyperparameters.get('sky_l_max', 8)
     use_mixup = hyperparameters.get('use_mixup', True)
+    label_smoothing = hyperparameters.get('label_smoothing', 0.0)
     aug_config = {
         'time_shift': hyperparameters.get('aug_time_shift', True),
         'noise': hyperparameters.get('aug_noise', True),
         'spectral_dropout': hyperparameters.get('aug_spectral_dropout', True),
         'channel_shuffle': hyperparameters.get('aug_channel_shuffle', True),
+        'amplitude_scale': hyperparameters.get('aug_amplitude_scale', False),
     }
 
     print(f"Signal length: {n_samples_config}")
@@ -656,6 +663,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     print(f"Warmup epochs: {warmup_epochs}")
     print(f"Aux loss weight: {aux_loss_weight}")
     print(f"Drop path rate: {drop_path_rate}")
+    print(f"Label smoothing: {label_smoothing}")
     print(f"Sky: n_pix={sky_n_pix}, l_max={sky_l_max}")
     print(f"Mixup: {use_mixup}")
     print(f"Augmentations: {aug_config}")
@@ -797,6 +805,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
         sky_geometry=sky_geo,
         use_mixup=use_mixup,
         aug_config=aug_config,
+        label_smoothing=label_smoothing,
     )
 
     print("\nTraining complete.")
@@ -1073,11 +1082,13 @@ def main(mode='train'):
         'max_train_hours': 8.0,
         'sky_n_pix': 192,
         'sky_l_max': 8,
+        'label_smoothing': 0.1,
         'use_mixup': False,
         'aug_time_shift': False,
         'aug_noise': True,
         'aug_spectral_dropout': False,
         'aug_channel_shuffle': True,
+        'aug_amplitude_scale': True,
     }
 
     # ========== SETUP PATHS ==========

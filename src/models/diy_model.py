@@ -360,6 +360,7 @@ class DIYModel(nn.Module):
         logits: torch.Tensor,
         branch_logits: list[torch.Tensor] | None = None,
         aux_loss_weight: float = 0.0,
+        label_smoothing: float = 0.0,
     ) -> torch.Tensor:
         """
         Compute total loss: main BCE + weighted auxiliary per-branch BCE.
@@ -377,12 +378,17 @@ class DIYModel(nn.Module):
             Per-detector logits, each of shape (batch_size, 1).
         aux_loss_weight : float
             Weight for auxiliary branch losses (lambda). 0 disables.
+        label_smoothing : float
+            Smoothing factor. Targets become eps and 1-eps instead of 0 and 1.
 
         Returns
         -------
         torch.Tensor
             Scalar loss value.
         """
+        if label_smoothing > 0:
+            y_true = y_true * (1 - label_smoothing) + 0.5 * label_smoothing
+
         main_loss = F.binary_cross_entropy_with_logits(logits, y_true)
 
         if branch_logits is not None and aux_loss_weight > 0:
