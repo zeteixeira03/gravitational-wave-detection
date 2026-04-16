@@ -66,7 +66,7 @@ With the PSD in hand, whitening is straightforward:
 
 This flattens the noise spectrum: colored noise becomes approximately white, with equal power at every frequency. The noise is still present, but it no longer carries structure that a neural network could mistake for signal features. After whitening, SNR contributions are equalized across frequencies, and the network can focus on the actual waveform.
 
-The cross-detector correlation then becomes the decisive feature. After whitening, the remaining noise in each detector is independent, but a real gravitational wave produces a correlated pattern across all three. The model architecture exploits this at multiple stages: the shared residual backbone extracts per-detector features, then a two-stage fusion topology (individual branch paths plus a joint branch that sees all three detectors concatenated) learns cross-detector interactions through dedicated residual blocks before the final classifier.
+The cross-detector correlation then becomes the decisive feature. After whitening, the remaining noise in each detector is independent, but a real gravitational wave produces a correlated pattern across all three. The model architecture exploits this at multiple stages: a shared residual backbone extracts per-detector features, a two-stage fusion topology (individual branch paths plus a joint branch that sees all three detectors concatenated) learns cross-detector interactions, and a FiLM layer driven by a spherical-harmonic decomposition of the sky consistency map modulates the pooled features before the classifier. The rest of this document walks through each of these stages.
 
 ## How the Neural Network Detects Signals
 
@@ -78,40 +78,44 @@ The architecture is a 1D Convolutional Neural Network (CNN). If you've encounter
 Input (3 detectors x 4096 samples)
     |
     |---> Detector H1 -----|
-    |                      +---> LIGO Extractor ----------|
-    |---> Detector L1 -----|                              |
-    |                                                     +---> Shared Residual Backbone (10 blocks)
-    |---> Detector V1 ---------> Virgo Extractor ---------|           |
-                                                                      |
-                               +--------------------------------------+--------------------------------------+---------------------------+
-                               |                                      |                                      |                           |
-                          H1 features                            L1 features                           V1 features                       |
-                               |                                      |                                      |                           |
-                    LIGO branch (2 blocks) *                LIGO branch (2 blocks) *               Virgo branch (2 blocks)          Joint branch:
-                               |                                      |                                      |                  concat all 3 -> 1x1 proj
-                               |                                      |                                      |                     -> 2 ResBlocks
-                               |                                      |                                      |                           |
-                               |                                      |                                      |                           |
-                               |                                      |                                      |                           |
-                               +--------------------------------------+--------------------------------------+---------------------------+
-                                                                      |
-                                                     Concatenate 4 paths (256 channels)
-                                                                      |
-                                                          4 Fusion ResBlocks (256 ch)
-                                                                      |
-                                                              ConcatPool (512)
-                                                                      |
-                                                         3-layer classifier -> logits
+    |                      +---> LIGO Extractor (shared) ---|
+    |---> Detector L1 -----|                                |
+    |                                                       +---> Shared Residual Backbone (10 blocks)
+    |---> Detector V1 ---------> Virgo Extractor -----------|           |
+                                                                        |
+                              +-----------------------------------------+-----------------------------------+-----------------------+
+                              |                                         |                                   |                       |
+                         H1 features                               L1 features                        V1 features                   |
+                              |                                         |                                   |                       |
+                    LIGO branch (2 blocks) *               LIGO branch (2 blocks) *            Virgo branch (2 blocks)         Joint branch:
+                              |                                         |                                   |              concat all 3 -> 1x1 proj
+                              |                                         |                                   |                 -> 2 ResBlocks
+                              +-----------------------------------------+-----------------------------------+-----------------------+
+                                                                        |
+                                                    Concatenate 4 paths (16n = 256 ch)
+                                                                        |
+                                                         4 Fusion ResBlocks (256 ch)
+                                                                        |
+                                                        AdaptiveConcatPool -> 512 features
+                                                                        |
+                                                              +--------------------+       +--------- 121 SH coefs (l_max=10)
+                                                              |     SkyFiLM        | <-----+       (S2 consistency map)
+                                                              |  (1+gamma)*f+beta  |
+                                                              +--------------------+
+                                                                        |
+                                                           3-layer classifier -> logits
 
-                                                                                                                   * shared weights (same instrument)
+                                                                                                                    * shared weights (same instrument)
 ```
 
 A critical design choice is weight sharing. LIGO Hanford and Livingston are the same instrument design (4 km arms, similar noise characteristics), so their signals pass through the same extractor and branch blocks with shared parameters. Virgo is a different instrument (3 km arms, different seismic environment, different sensitivity curve) and gets its own extractor and branch blocks with independent weights. This enforces the correct $Z_2$ symmetry by construction: a gravitational wave, once whitened, produces a similar waveform shape in both LIGO detectors (up to arrival time offsets and amplitude differences from beam pattern functions), but Virgo's different characteristics warrant separate learned filters. After extraction, all three branches share the same residual backbone.
 
-The architecture has two stages. First, a deep residual backbone: an extractor followed by 10 residual blocks (20 convolutional layers) with progressive downsampling and channel widening:
+The architecture has three stages: a residual backbone, a V2 two-stage fusion block, and a FiLM modulation driven by the sky consistency map.
 
-| Stage | Channels | Kernel Size | Downsample | Temporal dim |
-|-------|----------|-------------|------------|-------------|
+**Residual backbone.** An extractor followed by 10 residual blocks (20 convolutional layers) with progressive downsampling and channel widening. Base width is $n = 16$:
+
+| Stage | Channels | Kernel | Downsample | Temporal dim |
+|-------|----------|--------|------------|--------------|
 | Extractor | 1 -> 16 | 64 | GeM(2) | 4096 -> 2048 |
 | Group 1 (2 blocks) | 16 | 31 | GeM(4) + identity | 2048 -> 512 |
 | Group 2 (2 blocks) | 16 | 31 | identity | 512 |
@@ -119,9 +123,9 @@ The architecture has two stages. First, a deep residual backbone: an extractor f
 | Group 4 (2 blocks) | 64 | 7 | GeM(4) + identity | 128 -> 32 |
 | Group 5 (2 blocks) | 64 | 7 | identity | 32 |
 
-The extractor uses a kernel of 64 samples, corresponding to $\sim31$ ms of data at 2048 Hz. This is deliberate. Gravitational wave chirps from binary mergers have structure on timescales of tens of milliseconds, and a large initial kernel lets the network capture these broad oscillation patterns directly. Subsequent groups use progressively smaller kernels (31, 15, 7) to refine the features, picking up finer temporal details from the patterns already extracted by earlier layers. Residual connections in every block provide direct gradient paths, allowing the network to be this deep without vanishing gradients. Stochastic depth randomly skips residual branches during training, regularizing the network by implicitly training an ensemble of shallower sub-networks and reducing co-adaptation between blocks.
+The extractor uses a kernel of 64 samples, corresponding to $\sim 31$ ms of data at 2048 Hz. Gravitational wave chirps from binary mergers have structure on timescales of tens of milliseconds, and a large initial kernel lets the network capture broad oscillation patterns directly. Subsequent groups use progressively smaller kernels (31, 15, 7) to refine the features, picking up finer temporal details from the patterns extracted by earlier layers. Residual connections provide direct gradient paths, allowing the network to be this deep without vanishing gradients. Stochastic depth randomly drops residual branches during training, implicitly training an ensemble of shallower sub-networks and reducing co-adaptation between blocks. GeM (generalized mean) pooling with a learnable exponent interpolates between average pooling and max pooling, letting the network choose how aggressively to summarize each downsampling step; the exponent is clamped to $[1, 10]$ and the pooling operation runs in float32 even under mixed precision so the $x^p$ step cannot produce NaN.
 
-Second, a two-stage fusion step. The backbone outputs 64-channel features at 32 time steps per detector. These feed into four parallel paths:
+**V2 two-stage fusion.** The backbone outputs 64-channel features at 32 time steps per detector. These feed into four parallel paths:
 
 | Path | Input | Processing | Output |
 |------|-------|-----------|--------|
@@ -130,11 +134,15 @@ Second, a two-stage fusion step. The backbone outputs 64-channel features at 32 
 | V1 individual | V1 backbone features (64 ch) | 2 ResBlocks(64, k=7), separate weights | 64 ch x 32 |
 | Joint | concat(H1, L1, V1) = 192 ch | 1x1 Conv projection to 64 ch + 2 ResBlocks(64, k=7) | 64 ch x 32 |
 
-The four path outputs are concatenated (4 x 64 = 256 channels) and processed through 4 fusion ResBlocks(256, k=7). This is the stage where cross-detector correlation becomes relevant. The individual branch paths refine per-detector features while the joint branch captures cross-detector interactions. The fusion blocks then learn from all paths simultaneously: a real gravitational wave produces correlated features across detectors, while noise does not.
+The four path outputs are concatenated (4 x 64 = 256 channels) and processed through 4 fusion ResBlocks(256, k=7). This is the stage where cross-detector correlation becomes relevant: the individual branch paths refine per-detector features while the joint branch captures cross-detector interactions, and the fusion blocks then learn from all paths simultaneously. After the fusion blocks, AdaptiveConcatPool1d concatenates adaptive average and max pooling, producing a 512-dimensional feature vector.
 
-After the fusion blocks, AdaptiveConcatPool1d concatenates adaptive average and max pooling, producing a 512-dimensional feature vector (256 from each pooling mode).
+**Sky-feature FiLM modulation.** The 512-dim pooled vector is modulated by $S^2$ spherical harmonic coefficients (121 dimensions for $\ell_{\max}=10$; see the next section for how they are computed). The coefficients pass through BatchNorm and a two-layer MLP that outputs a per-channel scale $\gamma$ and shift $\beta$; both are tanh-bounded, and the pooled features become
 
-The model concatenates S2 spherical harmonic coefficients with the ConcatPool output before the classifier. With l_max=8, this adds 81 coefficients (batch-normalized), expanding the feature vector from 512 to 593 dimensions. The sky features are precomputed and stored in the tensor shards alongside the preprocessed signals (see the sky consistency map section below). The classifier head takes 593 inputs: Linear(593, 256) -> BN -> Dropout(0.5) -> SiLU -> Linear(256, 64) -> BN -> Dropout(0.5) -> Linear(64, 1). Output is raw logits; sigmoid is applied at inference time.
+$$\text{features} \leftarrow (1 + \gamma) \cdot \text{features} + \beta .$$
+
+With $\gamma \in (-1, 1)$, the multiplier $(1 + \gamma) \in (0, 2)$, so the modulation can attenuate or mildly amplify each channel but cannot flip sign or run away. The output projection of the MLP is zero-initialized, which means the module starts as the identity: at step 0 the network is the sky-free V2 baseline, and the FiLM path can only contribute if the optimizer learns to use it. The choice of FiLM over concatenation is motivated in the sky-geometry section below: it gives the 121 SH coefficients a direct multiplicative influence over every CNN channel, rather than having a narrow vector compete with a much wider one at the input of the classifier head.
+
+The classifier head takes the 512-dim modulated features: Linear(512, 256) -> BN -> Dropout(0.5) -> SiLU -> Linear(256, 64) -> BN -> Dropout(0.5) -> Linear(64, 1). The output is a raw logit; sigmoid is applied only at inference time.
 
 ### Training
 
@@ -142,25 +150,19 @@ The loss function is binary cross-entropy (BCE):
 
 $$\mathcal{L} = -\frac{1}{N}\sum_{i=1}^{N}\left[y_i \log \hat{y}_i + (1-y_i)\log(1-\hat{y}_i)\right]$$
 
-where $y_i \in \{0,1\}$ is the true label and $\hat{y}_i$ is the model's predicted probability. This is the natural choice for binary classification: it is the negative log-likelihood of a Bernoulli distribution, so minimizing it is equivalent to maximum likelihood estimation. The logarithm means confident wrong answers are penalized far more heavily than uncertain ones. Predicting 0.99 when the true label is 0 incurs a much larger loss than predicting 0.6.
+where $y_i \in \{0,1\}$ is the true label and $\hat{y}_i$ is the model's predicted probability. This is the natural choice for binary classification: it is the negative log-likelihood of a Bernoulli distribution, so minimizing it is equivalent to maximum likelihood estimation. The logarithm means confident wrong answers are penalized far more heavily than uncertain ones: predicting 0.99 when the true label is 0 incurs a much larger loss than predicting 0.6. The model outputs raw logits everywhere and the loss uses `binary_cross_entropy_with_logits`, which is numerically stable in mixed precision.
 
-In addition to the main classifier loss, each detector branch produces its own auxiliary prediction through a small per-branch head. These auxiliary losses encourage each detector's convolutional features to be independently useful for classification, rather than relying on the other two branches to compensate. The total loss is a weighted sum:
+The optimizer is AdamW. Unlike classical L2 regularization, AdamW applies the weight decay directly to the weights rather than through the gradient, which interacts more cleanly with adaptive learning rate methods. Parameters are split into two groups: 2D+ weights (conv and linear layers) get decay, while 1D parameters (BatchNorm weights, biases, and the GeM learnable exponent) get zero decay. Pulling the GeM exponent towards zero each step would drive it into a numerically unstable regime, so the ndim-based split is required for training to remain stable over many epochs.
 
-$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{main}} + w_{\text{aux}} \cdot \frac{1}{3}\sum_{d=1}^{3} \mathcal{L}_{\text{branch},d}$$
+The learning rate follows a schedule with two phases. A linear warmup ramps the learning rate from near-zero up to the target value over the first few epochs, preventing the large random gradients of an untrained network from causing destructive early updates. After warmup, cosine annealing smoothly reduces the learning rate following a cosine curve from the target value down to a minimum, giving the optimizer progressively finer control as training proceeds. In the final phase of training, stochastic weight averaging (SWA) switches the scheduler to a small constant learning rate and averages parameters across the remaining epochs; the averaged weights replace the live model at the end of training and BatchNorm running statistics are recomputed by one more pass over the training data.
 
-where $w_{\text{aux}}$ controls how much the auxiliary task influences training. The intent is to improve gradient flow into the early convolutional layers via deep supervision. In practice, this did not measurably improve performance (see [developer-notes.md](developer-notes.md), Phase 2a), suggesting the bottleneck is in the feature extractor's representational capacity rather than in individual branch quality. The auxiliary heads remain useful as a diagnostic tool.
+Regularization has three layers. Dropout in the classifier head randomly zeroes activations, forcing redundant representations. Stochastic depth randomly drops entire residual branches during training. Manifold mixup operates on the pooled feature vectors after the fusion blocks: two samples' pooled vectors are linearly interpolated with a $\lambda$ drawn from a Beta distribution, and so are their labels. Standard input-space mixup would destroy the cross-detector timing and phase coherence that the sky map encodes (a convex combination of two signals from different sky positions corresponds to no physical source), so the mixing is deferred until after the conv stack has already collapsed the time axis. The sky features themselves are never blended; the dominant sample's coefficients ($\lambda \ge 0.5$) are kept intact.
 
-The optimizer is AdamW, which adds weight decay to the Adam framework. Weight decay adds a penalty proportional to the magnitude of the weights, gently pulling them toward zero each step. This discourages the network from fitting too closely to the training data by keeping the learned parameters small. Unlike classical L2 regularization, AdamW applies the decay directly to the weights rather than through the gradient, which interacts more cleanly with adaptive learning rate methods.
-
-The learning rate follows a schedule with two phases. First, a linear warmup ramps the learning rate from near-zero up to the target value over the first few epochs, preventing the large random gradients of an untrained network from causing destructive early updates. After warmup, cosine annealing smoothly reduces the learning rate following a cosine curve from the target value down to a minimum, giving the optimizer progressively finer control over parameter updates as training proceeds.
-
-Two forms of regularization combat overfitting. Dropout randomly zeroes a fraction of neuron activations during training, forcing the network to learn redundant representations rather than relying on any single feature pathway. Mixup takes pairs of training examples and creates synthetic samples by linearly interpolating both the inputs and their labels: $\tilde{x} = \lambda x_i + (1-\lambda) x_j$, $\tilde{y} = \lambda y_i + (1-\lambda) y_j$, where $\lambda$ is drawn from a Beta distribution. This smooths the decision boundary and reduces the model's tendency to memorize individual training examples.
-
-Finally, early stopping monitors validation loss and halts training when it stops improving, restoring the model weights from the best-performing epoch. This prevents the network from training past the point of diminishing returns into pure overfitting.
+Training uses mixed precision (AMP) to fit the model within the Kaggle GPU budget, with GeM forced to float32 internally. Gradients are clipped to norm 1.0 as a cheap guard against the spikes a deep residual network can produce early in training. Early stopping monitors validation loss and halts training when it stops improving; during the SWA phase the early-stopping check is disabled so the average can actually accumulate.
 
 ### Geometric Structure of the Detector Network
 
-The CNN architecture described above processes each detector independently and combines them by concatenation. This captures what each detector sees, but it does not explicitly encode a fundamental physical constraint: a real gravitational wave must arrive at the three detectors with specific, geometrically determined time delays. A gravitational wave source at sky position $\hat{n}(\theta, \varphi)$ reaches detectors $i$ and $j$ with a time delay
+The CNN backbone and fusion stages described above process each detector independently and then combine their features. This captures what each detector sees, but it does not explicitly encode a fundamental physical constraint: a real gravitational wave must arrive at the three detectors with specific, geometrically determined time delays. A gravitational wave source at sky position $\hat{n}(\theta, \varphi)$ reaches detectors $i$ and $j$ with a time delay
 
 $$\tau_{ij} = \frac{(\mathbf{r}_i - \mathbf{r}_j) \cdot \hat{n}(\theta, \varphi)}{c}$$
 
@@ -172,13 +174,13 @@ This sky consistency map is a function on $S^2$, and therefore admits a natural 
 
 $$C(\theta, \varphi) = \sum_{\ell=0}^{\ell_{\max}} \sum_{m=-\ell}^{\ell} a_{\ell m} \, Y_{\ell m}(\theta, \varphi)$$
 
-Truncating at $\ell_{\max} \sim 12$ gives $(\ell_{\max}+1)^2 = 169$ real coefficients, giving a compact representation of the sky map's angular structure. The $\ell = 0$ coefficient is the average consistency across the entire sky. Higher multipoles encode progressively finer angular structure, with a strong signal producing power at multipoles corresponding to the angular resolution set by the detector baselines.
+Truncating at $\ell_{\max} = 10$ gives $(\ell_{\max}+1)^2 = 121$ real coefficients, a compact representation of the sky map's angular structure. The $\ell = 0$ coefficient is the average consistency across the entire sky. Higher multipoles encode progressively finer angular structure, with a strong signal producing power at multipoles corresponding to the angular resolution set by the detector baselines. The 121-coefficient basis is chosen to sit on the same order of magnitude as the 512-dim CNN feature vector it modulates, so the sky side has enough capacity to meaningfully condition the CNN features rather than being swallowed by their width.
 
 The detection problem has a natural symmetry: whether a gravitational wave is present does not depend on where on the sky it came from. But the *evidence* for a signal does depend on direction: it lives on $S^2$ and transforms under rotations. The spherical harmonic coefficients form what is called an equivariant representation: under an SO(3) rotation of the sky, each multipole $\ell$ transforms independently (via the Wigner $D$-matrices), and the full set of coefficients transforms in a known, structured way rather than being scrambled arbitrarily. The classifier head then collapses this structured representation into a single invariant output: the probability that a signal is present regardless of its origin. The aim is to process the data through intermediate representations that respect the symmetries of the domain, rather than hoping the network discovers those symmetries from the data alone.
 
 The detector network also carries a discrete symmetry. LIGO Hanford and Livingston are the same instrument design, so swapping them should not change the detection outcome (the individual signals will differ in amplitude, but not in morphology). This $Z_2$ symmetry is enforced in the CNN backbone by weight sharing between the two LIGO branches (while Virgo, a different instrument, gets its own extractor). The sky consistency map inherits this symmetry automatically, since cross-correlation is symmetric under pair reordering.
 
-In the full architecture, the spherical harmonic coefficients are concatenated with the CNN backbone features before the classifier head. The two paths are complementary: the CNN captures signal morphology (what the waveform looks like in each detector), while the sky map captures geometric consistency (whether the detectors agree at delays that correspond to a single astrophysical source). A single detector might exhibit a chirp-like feature due to a noise artifact, but only the sky map can confirm that all three detectors see correlated signal with the correct relative timing for a real source at a specific sky position.
+In the full architecture, the spherical harmonic coefficients drive a FiLM modulation of the pooled CNN features rather than being concatenated with them. FiLM produces a per-channel $(\gamma, \beta)$ pair from the SH coefficients and rescales every CNN channel as $(1+\gamma) \cdot f + \beta$. This gives a small, physics-grounded feature vector direct multiplicative control over a much wider learned representation: the geometric evidence either amplifies, attenuates, or offsets each CNN channel according to how consistent the detectors are with a single sky origin. Concatenation would have forced the 121-dim sky vector to compete with the 512-dim CNN vector at the first layer of the classifier, where the wider pathway tends to dominate. Modulation sidesteps that asymmetry: the CNN captures what the waveform looks like in each detector, and the sky map conditions how much the classifier should trust it. A single detector might exhibit a chirp-like feature due to a noise artifact, but only the sky map can confirm that all three detectors see correlated signal with the correct relative timing for a real source at a specific sky position.
 
 ## But why a Neural Network?
 

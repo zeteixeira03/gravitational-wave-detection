@@ -281,6 +281,46 @@ def decompose_sky_map(sky_map: np.ndarray, sh_matrix: np.ndarray) -> np.ndarray:
 
 
 # ============================================================================================
+#                                       sky geometry
+# ============================================================================================
+
+class SkyGeometry:
+    """
+    Precomputed sky grid, time delays, and SH basis for on-the-fly
+    spherical harmonic coefficient extraction from preprocessed signals.
+
+    Precomputes the pseudoinverse of the SH design matrix so that
+    decomposition is a single matrix-vector multiply (~0.006 ms) instead
+    of a least-squares solve (~10 ms).
+    """
+
+    def __init__(self, n_pix: int = 192, l_max: int = 8):
+        theta, phi = make_sky_grid(n_pix)
+        delays = compute_time_delays(theta, phi)
+        self.delay_indices = {pair: delay_to_sample_index(d) for pair, d in delays.items()}
+        sh_matrix = compute_sh_matrix(theta, phi, l_max)
+        self.sh_pinv = np.linalg.pinv(sh_matrix).astype(np.float32)
+        self.n_coeffs = (l_max + 1) ** 2
+
+    def extract(self, signal: np.ndarray) -> np.ndarray:
+        """
+        Compute SH coefficients from a preprocessed signal.
+
+        Parameters
+        ----------
+        signal
+            Whitened signal, shape (3, 4096).
+
+        Returns
+        -------
+        coeffs
+            SH coefficients, shape (n_coeffs,).
+        """
+        sky_map = build_sky_map(signal, self.delay_indices)
+        return self.sh_pinv @ sky_map
+
+
+# ============================================================================================
 #                                       visualization
 # ============================================================================================
 
@@ -496,7 +536,7 @@ def run_feasibility(n_samples: int = 5000, n_pix: int = 192, l_max: int = 8) -> 
     # gate test: compare scalar features
     monopole = all_sh_coeffs[:, 0]
 
-    print(f"\nscalar feature AUCs:")
+    print("\nscalar feature AUCs:")
     for name, feat in [("l=0 monopole", monopole), ("max(C(k))", sky_map_max), ("std(C(k))", sky_map_std)]:
         auc = roc_auc_score(labels, feat)
         mp = feat[labels == 1].mean()

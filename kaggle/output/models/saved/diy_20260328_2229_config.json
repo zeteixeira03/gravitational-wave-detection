@@ -1,0 +1,15 @@
+{
+  "n_channels": 16,
+  "n_samples": 4096,
+  "learning_rate": 0.001,
+  "dropout_rate": 0.5,
+  "weight_decay": 0.0005,
+  "epochs": 50,
+  "batch_size": 64,
+  "early_stopping_patience": 10,
+  "warmup_epochs": 5,
+  "aux_loss_weight": 0.2,
+  "use_amp": true,
+  "clip_grad_norm": 1.0,
+  "drop_path_rate": 0.2
+}

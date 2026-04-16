@@ -6,17 +6,13 @@ This branch uses PyTorch. It builds on an earlier TensorFlow implementation pres
 
 ## About This Project
 
-I've taken some classes on Machine Learning, and done some academic projects, but I didn't *learn*. That was my goal here: I wanted to build something real, from scratch. 
+I've taken some classes on Machine Learning, and done some academic projects, but I didn't *learn*. That was my goal here: I wanted to build something real, from scratch.
 
-But why gravitational waves? I have a Physics degree, and did my thesis on Numerical Relativity. It was a modest, though complex project: modelling the Einstein Field Equations in a spherically symmetric system. I learned quite a lot about Relativity doing it, and became somewhat obsessed with the idea of teaching a machine to understand the code that I'd built. Before actually sitting down to research and implement, my goal was then to build a Physics-Informed Neural Network to detect gravitational wave signals. It turned out that the world is a bit more complicated: coming from no experience building a neural network to building a PINN informed on General Relativity was, alas, too big a step initially. 
+But why gravitational waves? I have a Physics degree, and did my thesis on Numerical Relativity. It was a modest, though complex project: modelling the Einstein Field Equations in a spherically symmetric system. I learned quite a lot about Relativity doing it, and became somewhat obsessed with the idea of teaching a machine to understand the code that I'd built. The initial goal was a Physics-Informed Neural Network to detect gravitational waves, but that turned out to be too big a step without prior experience building neural networks. So I started with a binary classifier, and introduce physics into the architecture as I go.
 
-So I decided to start with a binary classifier, and introduce physics into the architecture as I go. I began with a "normal" 1D CNN, which after optimization worked reasonably well ($\sim 0.85$ AUC), but failed to extract the "ambiguous" signals. It resulted in a network that was quite confident in the signals that it detected, but reverted to classifying the non-obvious signals as noise. I tried to add domain knowledge via a small GNN at the end of the CNN backbone and before the classifier head to have the network learn the correlations between signals from different detectors (gravitational waves travel at the speed of light), but it gave me no measurable improvement.
+The current iteration is built around two ideas. First, the CNN backbone has to be deep: a chirp has hierarchical temporal structure (individual cycles, frequency evolution, amplitude envelope) and a shallow network cannot compose features across those timescales. Second, the meaningful geometric structure in this problem lives on the sky sphere $S^2$: a gravitational wave from a given direction arrives at each detector with specific time delays, and for a real signal all three pairwise delays must be consistent with a single point on the sky. Noise doesn't have this property. The model packages that consistency constraint as a scalar field on $S^2$, decomposes it into spherical harmonics, and uses the coefficients to modulate the CNN features through a FiLM layer before the classifier. The CNN captures what each detector sees; the sky map captures whether they agree in a way that is geometrically consistent with an astrophysical source.
 
-As a consequence of the stuff that I'm doing outside of this project, I started learning about Geometric Deep Learning (check out Bronstein's book on this), and found a way to properly formalize my reasoning for this problem. The GNN failed because a complete graph on 3 nodes has no meaningful geometry to learn from. In fact, the real geometric structure in this problem lives on the sky sphere $S^2$: a gravitational wave from a given direction arrives at each detector with specific time delays, and for a real signal all three pairwise delays must be consistent with a single point on the sky. Noise doesn't have this property. That consistency constraint is far richer than anything a 3-node graph can capture, and it's what I'm building towards now: a sky consistency map decomposed into spherical harmonics, concatenated with the CNN         features before the classifier. The CNN captures what each detector sees; the sky map captures whether they agree in a way that is geometrically consistent with an astrophysical source.  
-
-But first, the CNN backbone itself needs work. A gravitational wave chirp has hierarchical temporal structure: it begins as a slow, low-frequency inspiral and accelerates into a rapid high-frequency merger. Resolving this requires a deep feature hierarchy where early layers capture broad oscillation patterns and deeper layers refine progressively finer temporal structure. With only 4 convolutional blocks, the network can't represent the full range of timescales present in a chirp. The next step is a deep (residual, to avoid vanishing gradients) backbone, and only then the geometric layer on top.
-
-If you're interested, I included a markdown file ([THE_SCIENCE.md](THE_SCIENCE.md)) explaining detector Physics, the pre-processing pipeline, and the full description of the Neural Network as it is right now. Additionally, if you want to jump straight to the fun, there are two Jupyter notebooks you can interact with to explore the dataset ([01_data_exploration.ipynb](notebooks/01_data_exploration.ipynb)), and to play with the model ([02_model_explorer.ipynb](notebooks/02_model_explorer.ipynb)). Future development plans are in [developer-notes.md](developer-notes.md). For a visual overview of the preprocessing and training pipeline, check out [PIPELINE.md](PIPELINE.md).
+If you're interested, [THE_SCIENCE.md](THE_SCIENCE.md) explains the detector physics, the preprocessing pipeline, and the full description of the network. Two Jupyter notebooks cover the dataset ([01_data_exploration.ipynb](notebooks/01_data_exploration.ipynb)) and let you poke at the model ([02_model_explorer.ipynb](notebooks/02_model_explorer.ipynb)). The record of experiments, what worked, and what did not is in [developer-notes.md](developer-notes.md). For a visual overview of the preprocessing and training pipeline, check out [PIPELINE.md](PIPELINE.md).
 
 ## Architecture
 
@@ -24,49 +20,47 @@ If you're interested, I included a markdown file ([THE_SCIENCE.md](THE_SCIENCE.m
 Input (3 detectors x 4096 samples)
     |
     |---> Detector H1 -----|
-    |                      +---> LIGO Extractor ----------|
-    |---> Detector L1 -----|                              |
-    |                                                     +---> Shared Residual Backbone (10 blocks)
-    |---> Detector V1 ---------> Virgo Extractor ---------|           |
-                                                                      |
-                               +--------------------------------------+--------------------------------------+---------------------------+
-                               |                                      |                                      |                           |
-                          H1 features                            L1 features                           V1 features                       |
-                               |                                      |                                      |                           |
-                    LIGO branch (2 blocks) *                LIGO branch (2 blocks) *               Virgo branch (2 blocks)          Joint branch:
-                               |                                      |                                      |                  concat all 3 -> 1x1 proj
-                               |                                      |                                      |                     -> 2 ResBlocks
-                               |                                      |                                      |                           |
-                               |                                      |                                      |                           |
-                               |                                      |                                      |                           |
-                               +--------------------------------------+--------------------------------------+---------------------------+
-                                                                      |
-                                                     Concatenate 4 paths (256 channels)
-                                                                      |
-                                                          4 Fusion ResBlocks (256 ch)
-                                                                      |
-                                                              ConcatPool (512)
-                                                                      |
-                                                                      +-------- S2 sky features (81 SH coefficients) ------+
-                                                                      |                                                    |
-                                                                      +----------------------------------------------------+
-                                                                      |
-                                                         3-layer classifier -> logits
+    |                      +---> LIGO Extractor (shared) ---|
+    |---> Detector L1 -----|                                |
+    |                                                       +---> Shared Residual Backbone (10 blocks)
+    |---> Detector V1 ---------> Virgo Extractor -----------|           |
+                                                                        |
+                              +-----------------------------------------+-----------------------------------+-----------------------+
+                              |                                         |                                   |                       |
+                         H1 features                               L1 features                        V1 features                   |
+                              |                                         |                                   |                       |
+                    LIGO branch (2 blocks) *               LIGO branch (2 blocks) *            Virgo branch (2 blocks)         Joint branch:
+                              |                                         |                                   |              concat all 3 -> 1x1 proj
+                              |                                         |                                   |                 -> 2 ResBlocks
+                              +-----------------------------------------+-----------------------------------+-----------------------+
+                                                                        |
+                                                    Concatenate 4 paths (16n = 256 ch)
+                                                                        |
+                                                         4 Fusion ResBlocks (256 ch)
+                                                                        |
+                                                        AdaptiveConcatPool -> 512 features
+                                                                        |
+                                                              +--------------------+       +--------- 121 SH coefs (l_max=10)
+                                                              |     SkyFiLM        | <-----+       (S2 consistency map)
+                                                              |  (1+gamma)*f+beta  |
+                                                              +--------------------+
+                                                                        |
+                                                           3-layer classifier -> logits
 
-                                                                                                                           * shared weights (same instrument)
+                                                                                                                    * shared weights (same instrument)
 ```
 
-V2 two-stage fusion architecture: 10 residual backbone blocks feed into 4 parallel branch paths (H1, L1, V1, joint), which are merged and processed through 4 fusion blocks. LIGO H1/L1 share extractor and branch weights; Virgo is separate. S2 spherical harmonic coefficients (81 dimensions for l_max=8) are concatenated with the ConcatPool output before the classifier, expanding the input from 512 to 593 features.
+V2 two-stage fusion: shared LIGO extractor + separate Virgo extractor feed a 10-block residual backbone. After the backbone, 4 parallel paths (H1, L1, V1 individual branches + a joint branch with a 1x1 projection) each run 2 residual blocks, are concatenated, and processed through 4 fusion blocks. AdaptiveConcatPool produces a 512-dim feature vector. S2 spherical harmonic coefficients (121 dimensions for l_max=10) are passed through a BatchNorm + 2-layer MLP that produces per-channel (gamma, beta); the pooled features become `(1 + gamma) * features + beta`. Both gamma and beta are tanh-bounded so (1+gamma) stays in (0, 2); the output projection is zero-initialized so the module starts as identity. Base channel width is n=16.
 
 ## Current Performance
 
 | Accuracy | AUC | Precision | Recall | F1 |
 |----------|-----|-----------|--------|----|
-| 0.809 | 0.873 | 0.899 | 0.695 | 0.784 |
+| 0.798 | 0.865 | 0.933 | 0.640 | 0.759 |
 
 <p align="center"><img src="assets/dashboard.png" width="700"></p>
 
-Phase 3 Step 1 (deep residual backbone) improved AUC from 0.858 to 0.866. Step 1b (V2 two-stage fusion with n=16 channels) reached 0.874 AUC. LR schedule switched from cosine warm restarts to plain cosine annealing for smoother convergence. Step 2 added S2 geometric cross-correlation: a sky consistency map decomposed into spherical harmonic coefficients, concatenated with CNN features before the classifier head. First SH integration showed no AUC improvement (0.873 vs 0.874 baseline); the offline feasibility gate passed, so the features carry signal but are likely attenuated by mixup corruption and feature dimension imbalance. Current plan is to heavily reduce augmentation to isolate sky features contribution.
+These numbers are the final run of the project: V2 fusion with the sky-feature FiLM layer on, 121 spherical-harmonic coefficients ($\ell_{\max} = 10$), manifold mixup, and stochastic weight averaging over the last stretch of training. The deep residual backbone lifted AUC from the 0.858 plateau to 0.866, V2 two-stage fusion reached 0.874 without sky features, and every run with sky features turned on has landed in the 0.865-0.871 band. The sky-consistency features never pushed past the no-sky baseline on this dataset: stripping sky-incompatible augmentations (input-space mixup, spectral dropout, time shift) cost more generalization than the physics-grounded features could recover, and every sky-compatible replacement stack traded one failure mode for another. The features stay in the code regardless, because the construction is a small contribution worth keeping on the record: a physical cross-detector consistency map projected onto the sky sphere $S^2$, decomposed in spherical harmonics, and used to modulate a learned 1D CNN through FiLM. Ground-based networks like G2Net are not where it pays off (three detectors, short baselines, already strong timing coincidence), but LISA is exactly where this kind of geometric conditioning could matter: three spacecraft arms, millions of kilometres apart, sources that dwell in band for months. The full development story is in [developer-notes.md](developer-notes.md).
 
 ## Installation
 
@@ -107,7 +101,7 @@ kaggle kernels push -p kaggle
 kaggle kernels output zeteixeira/gw-training -p kaggle/output
 ```
 
-For local training: `python src/model_runs.py`. You need to have the full dataset on disk and access to a GPU (or not, if you don't mind having your machine running a program for days) 
+For local training: `python src/model_runs.py`. You need the full dataset on disk and access to a GPU (or enough patience for a CPU run that will take days).
 
 ## Project Structure
 

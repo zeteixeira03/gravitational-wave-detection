@@ -1,5 +1,5 @@
 """
-Compute and save the avreage Power Spectral Density (PSD) from noise samples.
+Compute and save the average Power Spectral Density (PSD) from noise samples.
 
 This script must be run ONCE before training the 1D CNN model.
 It computes the average noise spectrum which is used for whitening.

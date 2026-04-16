@@ -20,6 +20,7 @@ from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
+from torch.optim.swa_utils import AveragedModel, SWALR
 from torch.utils.data import Dataset, DataLoader
 
 # add project root to path
@@ -30,13 +31,14 @@ if str(SRC_DIR) not in sys.path:
 
 from data.g2net import is_kaggle, get_output_dir
 from models.diy_model import DIYModel
-from sky_feasibility import (
-    make_sky_grid,
-    compute_time_delays,
-    delay_to_sample_index,
-    build_sky_map,
-    compute_sh_matrix,
-    decompose_sky_map,
+from sky_feasibility import SkyGeometry
+from evaluation import (
+    compute_confusion_values,
+    metrics_from_confusion,
+    confusion_matrix as compute_cm,
+    evaluate_metrics,
+    roc_curve,
+    precision_recall_curve,
 )
 from visualization import (
     plot_learning_curves,
@@ -51,46 +53,6 @@ from visualization import (
 SEED = 426425
 torch.manual_seed(SEED)
 np.random.seed(SEED)
-
-
-# =====================================================================
-#                        SKY GEOMETRY
-# =====================================================================
-
-class SkyGeometry:
-    """
-    Precomputed sky grid, time delays, and SH basis for on-the-fly
-    spherical harmonic coefficient extraction from preprocessed signals.
-
-    Precomputes the pseudoinverse of the SH design matrix so that
-    decomposition is a single matrix-vector multiply (~0.006 ms) instead
-    of a least-squares solve (~10 ms).
-    """
-
-    def __init__(self, n_pix: int = 192, l_max: int = 8):
-        theta, phi = make_sky_grid(n_pix)
-        delays = compute_time_delays(theta, phi)
-        self.delay_indices = {pair: delay_to_sample_index(d) for pair, d in delays.items()}
-        sh_matrix = compute_sh_matrix(theta, phi, l_max)
-        self.sh_pinv = np.linalg.pinv(sh_matrix).astype(np.float32)
-        self.n_coeffs = (l_max + 1) ** 2
-
-    def extract(self, signal: np.ndarray) -> np.ndarray:
-        """
-        Compute SH coefficients from a preprocessed signal.
-
-        Parameters
-        ----------
-        signal
-            Whitened signal, shape (3, 4096).
-
-        Returns
-        -------
-        coeffs
-            SH coefficients, shape (n_coeffs,).
-        """
-        sky_map = build_sky_map(signal, self.delay_indices)
-        return self.sh_pinv @ sky_map
 
 
 # =====================================================================
@@ -190,6 +152,116 @@ def mixup_batch(
     )
 
 
+def manifold_mixup_pooled(
+    pooled: torch.Tensor,
+    y: torch.Tensor,
+    sky: torch.Tensor,
+    alpha: float = 0.4,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Mix pooled CNN features (post-fusion, post-pool) instead of raw signals.
+
+    Mixing happens after the convolutional path has condensed each sample to
+    a single feature vector, so the mix never touches the time domain and
+    cannot interfere with the cross-detector phase coherence the sky map
+    encodes. Sky features still belong to a single physical source: we keep
+    the dominant sample's coefficients (lam >= 0.5) intact, the same rule
+    used by ``mixup_batch``.
+
+    Parameters
+    ----------
+    pooled : torch.Tensor
+        Pooled feature vectors of shape (batch, feat_dim).
+    y : torch.Tensor
+        Labels of shape (batch, 1), may be soft.
+    sky : torch.Tensor
+        Sky features of shape (batch, n_sky_features).
+    alpha : float
+        Beta distribution concentration. 0.4 puts more mass at the extremes
+        than mixup's 0.2 default, which works better for feature-space mixing.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        Mixed features, soft labels, dominant sample's sky features.
+    """
+    lam = float(torch.distributions.Beta(alpha, alpha).sample())
+    perm = torch.randperm(pooled.size(0), device=pooled.device)
+    sky_out = sky if lam >= 0.5 else sky[perm]
+    return (
+        lam * pooled + (1 - lam) * pooled[perm],
+        lam * y + (1 - lam) * y[perm],
+        sky_out,
+    )
+
+
+def update_swa_bn(
+    swa_model,
+    train_shard_paths,
+    device,
+    batch_size,
+    sky_geometry,
+    verbose: bool = True,
+    max_shards: int = 2,
+):
+    """
+    Recompute BatchNorm running stats for an SWA-averaged model.
+
+    PyTorch's stock ``torch.optim.swa_utils.update_bn`` assumes the loader
+    yields tensors directly compatible with ``model(x)``. Our loaders yield
+    ``(signals, labels, sky)`` triples and the model takes two named
+    arguments, so we iterate the shards by hand. BatchNorm layers are reset
+    to a cumulative average (momentum=None) so the new statistics depend
+    only on this pass over the data, not on whatever they had during the
+    last pre-SWA epoch.
+    """
+    bn_layers = [m for m in swa_model.modules()
+                 if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    if not bn_layers:
+        return
+
+    momenta = [m.momentum for m in bn_layers]
+    for m in bn_layers:
+        m.reset_running_stats()
+        m.momentum = None
+
+    was_training = swa_model.training
+    swa_model.train()
+
+    # BN running stats converge after ~10k samples under cumulative
+    # averaging (momentum=None); 2 shards (~120k) is overkill but cheap.
+    # Using all 9 shards was both wasteful (~3min) and enlarged the window
+    # for CUDA faults seen once on Kaggle P100.
+    shards_to_use = list(train_shard_paths)[:max_shards]
+    if verbose:
+        print(f"Updating BN running stats over {len(shards_to_use)} shards "
+              f"(of {len(train_shard_paths)} available)...")
+
+    with torch.no_grad():
+        for shard_path in shards_to_use:
+            data = torch.load(str(shard_path), weights_only=True)
+            precomputed_sh = data.get('sh_coeffs', None)
+            ds = GWTensorDataset(
+                data['signals'], data['labels'],
+                augment=False, sky_geometry=sky_geometry,
+                precomputed_sh=precomputed_sh,
+            )
+            loader = DataLoader(
+                ds, batch_size=batch_size, shuffle=False,
+                num_workers=0, pin_memory=(device.type == 'cuda'),
+            )
+            for X_batch, _y_batch, sky_batch in loader:
+                X_batch = X_batch.to(device)
+                sky_batch = sky_batch.to(device)
+                swa_model(X_batch, sky_features=sky_batch)
+            del data, ds, loader
+
+    for m, mom in zip(bn_layers, momenta):
+        m.momentum = mom
+    if not was_training:
+        swa_model.eval()
+
+
 def fit(
     model,
     train_shard_paths,
@@ -209,8 +281,12 @@ def fit(
     max_train_hours=None,
     sky_geometry=None,
     use_mixup=True,
+    use_manifold_mixup=False,
+    use_swa=False,
+    swa_start_epoch=None,
     aug_config=None,
     label_smoothing=0.0,
+    checkpoint_dir=None,
 ):
     """
     Train model by streaming shards from disk. Sky features are computed
@@ -265,7 +341,29 @@ def fit(
     dict
         Training history
     """
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=min_lr)
+    # cosine schedule covers the pre-SWA window (or all of training when
+    # SWA is disabled). After swa_start_epoch we hand off to SWALR.
+    target_lr = optimizer.param_groups[0]['lr']
+    if use_swa and swa_start_epoch is None:
+        swa_start_epoch = max(warmup_epochs, int(epochs * 0.7))
+    cosine_t_max = (swa_start_epoch if use_swa else epochs) - warmup_epochs
+    cosine_t_max = max(cosine_t_max, 1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cosine_t_max, eta_min=min_lr)
+
+    swa_model = None
+    swa_scheduler = None
+    if use_swa:
+        swa_model = AveragedModel(model)
+        swa_scheduler = SWALR(
+            optimizer,
+            swa_lr=target_lr * 0.1,
+            anneal_epochs=3,
+            anneal_strategy='cos',
+        )
+        if verbose:
+            print(f"SWA enabled: averaging from epoch {swa_start_epoch + 1} "
+                  f"to epoch {epochs} at LR {target_lr * 0.1:.2e}")
+
     train_start = time.monotonic()
 
     # amp setup (CUDA only)
@@ -274,14 +372,31 @@ def fit(
 
     history = {
         'train_loss': [], 'train_acc': [],
-        'val_loss': [], 'val_acc': []
+        'val_loss': [], 'val_acc': [], 'val_auc': [],
     }
 
     best_val_loss = float('inf')
     best_state = None
     epochs_without_improvement = 0
+
+    # on-disk checkpoint paths. best.pt is overwritten whenever val_loss
+    # improves so a crash inside SWA finalization still leaves usable
+    # weights in /kaggle/working (which the kaggle runner commits even
+    # on script failure). swa_pre_bn.pt is a snapshot of the averaged
+    # weights taken before the BN recompute pass, so a CUDA fault in
+    # update_swa_bn doesn't wipe out the SWA result.
+    best_ckpt_path = None
+    swa_pre_bn_path = None
+    if checkpoint_dir is not None:
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        best_ckpt_path = checkpoint_dir / "checkpoint_best.pt"
+        swa_pre_bn_path = checkpoint_dir / "checkpoint_swa_pre_bn.pt"
     n_shards = len(train_shard_paths)
-    target_lr = optimizer.param_groups[0]['lr']
+    nan_batches_total = 0
+    nan_batches_consecutive = 0
+    max_consecutive_nan = 100
+    first_nan_reported = False
 
     for epoch in range(epochs):
         # linear LR warmup
@@ -323,8 +438,38 @@ def fit(
 
                 optimizer.zero_grad()
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    logits, branch_logits = model(X_batch, sky_features=sky_batch)
-                    loss = model.compute_loss(y_batch, logits, branch_logits, aux_loss_weight, label_smoothing)
+                    if use_manifold_mixup:
+                        # mix in feature space after pool. aux heads are
+                        # bypassed because the per-branch tensors here are
+                        # unmixed and would carry the wrong labels.
+                        pooled, _ = model._extract_pooled(X_batch)
+                        pooled, y_batch, sky_batch = manifold_mixup_pooled(pooled, y_batch, sky_batch)
+                        logits = model.classify_from_pooled(pooled, sky_batch)
+                        loss = model.compute_loss(y_batch, logits, None, 0.0, label_smoothing)
+                    else:
+                        logits, branch_logits = model(X_batch, sky_features=sky_batch)
+                        loss = model.compute_loss(y_batch, logits, branch_logits, aux_loss_weight, label_smoothing)
+
+                # NaN guard: skip the batch if the loss is not finite. logs
+                # the first occurrence with context, counts consecutive NaNs,
+                # and aborts training if they keep coming so we don't waste
+                # compute on a collapsed model.
+                loss_val = loss.item()
+                if not np.isfinite(loss_val):
+                    nan_batches_total += 1
+                    nan_batches_consecutive += 1
+                    if not first_nan_reported:
+                        print(f"\n[NaN] first non-finite loss at epoch {epoch+1}, "
+                              f"shard {shard_num+1}/{n_shards}, step in shard {pbar.n}. "
+                              f"Skipping this batch.", flush=True)
+                        first_nan_reported = True
+                    if nan_batches_consecutive >= max_consecutive_nan:
+                        print(f"\n[NaN] {nan_batches_consecutive} consecutive NaN batches, "
+                              f"aborting training.", flush=True)
+                        raise RuntimeError("training collapsed (NaN loss)")
+                    continue
+
+                nan_batches_consecutive = 0
                 scaler.scale(loss).backward()
                 if clip_grad_norm:
                     scaler.unscale_(optimizer)
@@ -332,12 +477,12 @@ def fit(
                 scaler.step(optimizer)
                 scaler.update()
 
-                epoch_losses.append(loss.item())
+                epoch_losses.append(loss_val)
                 with torch.no_grad():
                     pred_labels = (logits.float() >= 0.0).int().flatten()
                     train_correct += (pred_labels == y_batch.flatten().int()).sum().item()
                     train_total += len(y_batch)
-                pbar.set_postfix(loss=f"{loss.item():.4f}")
+                pbar.set_postfix(loss=f"{loss_val:.4f}")
 
             del data, shard_dataset, shard_loader
 
@@ -350,6 +495,8 @@ def fit(
         val_losses = []
         val_correct = 0
         val_total = 0
+        val_probas = []
+        val_labels_all = []
 
         with torch.no_grad():
             for X_batch, y_batch, sky_batch in val_loader:
@@ -362,19 +509,36 @@ def fit(
                     loss = model.compute_loss(y_batch_float, logits)
                 val_losses.append(loss.item())
 
-                pred_labels = (logits.float().cpu().numpy() >= 0.0).astype(int).flatten()
-                val_correct += (pred_labels == y_batch.numpy()).sum()
+                logits_np = logits.float().cpu().numpy().flatten()
+                pred_labels = (logits_np >= 0.0).astype(int)
+                y_np = y_batch.numpy()
+                val_correct += (pred_labels == y_np).sum()
                 val_total += len(y_batch)
+                val_probas.append(1.0 / (1.0 + np.exp(-logits_np)))
+                val_labels_all.append(y_np)
 
         val_loss = np.mean(val_losses)
         val_acc = val_correct / val_total if val_total > 0 else 0.0
+        try:
+            val_auc = roc_auc_score(
+                np.concatenate(val_labels_all),
+                np.concatenate(val_probas),
+            )
+        except ValueError:
+            val_auc = float('nan')
 
         history['val_loss'].append(val_loss)
         history['val_acc'].append(val_acc)
+        history['val_auc'].append(float(val_auc))
         history['train_acc'].append(train_acc)
 
-        # LR scheduling (skip during warmup to avoid premature reduction)
-        if epoch >= warmup_epochs:
+        # LR scheduling (skip during warmup to avoid premature reduction).
+        # SWA phase uses SWALR + parameter averaging instead of cosine.
+        in_swa_phase = use_swa and epoch >= swa_start_epoch
+        if in_swa_phase:
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
+        elif epoch >= warmup_epochs:
             scheduler.step()
 
         # check for improvement
@@ -383,18 +547,33 @@ def fit(
             best_state = copy.deepcopy(model.state_dict())
             epochs_without_improvement = 0
             improvement_marker = " *"
+            if best_ckpt_path is not None:
+                torch.save(
+                    {
+                        'model_state_dict': best_state,
+                        'epoch': epoch + 1,
+                        'val_loss': float(val_loss),
+                        'val_acc': float(val_acc),
+                    },
+                    str(best_ckpt_path),
+                )
         else:
             epochs_without_improvement += 1
             improvement_marker = ""
+
+        if checkpoint_dir is not None:
+            torch.save(history, str(Path(checkpoint_dir) / "history.pt"))
 
         if verbose:
             current_lr = optimizer.param_groups[0]['lr']
             print(f"Epoch {epoch + 1}/{epochs} - Loss: {train_loss:.4f} - "
                   f"Val Loss: {val_loss:.4f} - Val Acc: {val_acc:.4f} - "
+                  f"Val AUC: {val_auc:.4f} - "
                   f"LR: {current_lr:.2e}{improvement_marker}", flush=True)
 
-        # early stopping
-        if epochs_without_improvement >= early_stopping_patience:
+        # early stopping (disabled during the SWA phase: we want a stable
+        # window to average over, not an early bailout on noise)
+        if not in_swa_phase and epochs_without_improvement >= early_stopping_patience:
             if verbose:
                 print(f"\nEarly stopping: val_loss hasn't improved for {early_stopping_patience} epochs")
             break
@@ -409,8 +588,37 @@ def fit(
                           f"stopping to stay within {max_train_hours}h limit")
                 break
 
-    # restore best weights
-    if best_state is not None:
+    # SWA: recompute BN stats over the training data and copy averaged
+    # weights into the live model. SWA replaces best-weight restoration --
+    # the averaged model is the final model regardless of its last
+    # epoch's val loss.
+    if use_swa and swa_model is not None and epoch >= swa_start_epoch:
+        # snapshot the averaged weights to disk BEFORE the BN recompute
+        # pass. a CUDA fault during update_swa_bn (seen once on Kaggle P100)
+        # is otherwise fatal: the averaged params live only in GPU memory
+        # inside swa_model.module, and the crash wipes everything.
+        if swa_pre_bn_path is not None:
+            torch.save(
+                {'model_state_dict': swa_model.module.state_dict()},
+                str(swa_pre_bn_path),
+            )
+        if verbose:
+            print("\nFinalizing SWA: updating BN running stats over training data...")
+        try:
+            update_swa_bn(swa_model, train_shard_paths, device, batch_size, sky_geometry, verbose=verbose)
+            model.load_state_dict(swa_model.module.state_dict())
+            if verbose:
+                print("SWA averaged weights copied into model.")
+        except Exception as e:
+            # BN pass failed (CUDA fault, OOM, etc). fall back to the best
+            # per-epoch weights so the run still produces something usable.
+            # the pre-BN SWA snapshot is on disk for manual recovery if the
+            # user wants to retry the BN pass in a separate job.
+            print(f"\n[SWA] update_swa_bn failed: {type(e).__name__}: {e}", flush=True)
+            print("[SWA] Falling back to best per-epoch weights.", flush=True)
+            if best_state is not None:
+                model.load_state_dict(best_state)
+    elif best_state is not None:
         if verbose:
             print(f"Restoring best weights (val_loss: {best_val_loss:.4f})")
         model.load_state_dict(best_state)
@@ -553,6 +761,14 @@ def generate_plots(results, save_dir, base_name, max_plot_samples=10000):
 
     saved_plots = {}
 
+    # single prediction pass for all plots
+    print("Computing predictions...")
+    y_proba = model.predict_proba(X_val, sky_val)
+
+    roc_data = roc_curve(y_proba, plot_y)
+    pr_data = precision_recall_curve(y_proba, plot_y)
+    cm_data = compute_cm(y_proba, plot_y)
+
     print("Generating plots...")
 
     # 1. Learning curves
@@ -563,28 +779,24 @@ def generate_plots(results, save_dir, base_name, max_plot_samples=10000):
 
     # 2. ROC curve
     print("  - ROC curve")
-    roc_data = model.roc_curve(X_val, plot_y, sky_val)
     roc_path = plots_dir / f"{base_name}_roc_curve.png"
     plot_roc_curve(roc_data, save_path=str(roc_path))
     saved_plots['roc_curve'] = roc_path
 
     # 3. Precision-Recall curve
     print("  - Precision-Recall curve")
-    pr_data = model.precision_recall_curve(X_val, plot_y, sky_val)
     pr_path = plots_dir / f"{base_name}_pr_curve.png"
     plot_precision_recall_curve(pr_data, save_path=str(pr_path))
     saved_plots['pr_curve'] = pr_path
 
     # 4. Confusion matrix
     print("  - Confusion matrix")
-    cm_data = model.confusion_matrix(X_val, plot_y, sky_val)
     cm_path = plots_dir / f"{base_name}_confusion_matrix.png"
     plot_confusion_matrix(cm_data, normalize=True, save_path=str(cm_path))
     saved_plots['confusion_matrix'] = cm_path
 
     # 5. Prediction distribution
     print("  - Prediction distribution")
-    y_proba = model.predict_proba(X_val, sky_val)
     dist_path = plots_dir / f"{base_name}_prediction_dist.png"
     plot_prediction_distribution(y_proba, plot_y, save_path=str(dist_path))
     saved_plots['prediction_dist'] = dist_path
@@ -592,7 +804,7 @@ def generate_plots(results, save_dir, base_name, max_plot_samples=10000):
     # 6. Combined dashboard
     print("  - Combined dashboard")
     dashboard_path = plots_dir / f"{base_name}_dashboard.png"
-    plot_all_metrics(model, X_val, plot_y, sky_val, history=history, save_path=str(dashboard_path))
+    plot_all_metrics(y_proba, plot_y, history=history, save_path=str(dashboard_path))
     saved_plots['dashboard'] = dashboard_path
 
     print(f"Plots saved to: {plots_dir}")
@@ -604,7 +816,7 @@ def generate_plots(results, save_dir, base_name, max_plot_samples=10000):
 #                       TENSOR LOADING
 # =====================================================================
 
-def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
+def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2, checkpoint_dir=None):
     """
     Train DIY 1D CNN model from preprocessed .pt tensor shards.
 
@@ -642,8 +854,11 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     aux_loss_weight = hyperparameters.get('aux_loss_weight', 0.0)
     drop_path_rate = hyperparameters.get('drop_path_rate', 0.0)
     sky_n_pix = hyperparameters.get('sky_n_pix', 192)
-    sky_l_max = hyperparameters.get('sky_l_max', 8)
+    sky_l_max = hyperparameters.get('sky_l_max', 10)
     use_mixup = hyperparameters.get('use_mixup', True)
+    use_manifold_mixup = hyperparameters.get('use_manifold_mixup', False)
+    use_swa = hyperparameters.get('use_swa', False)
+    swa_start_epoch = hyperparameters.get('swa_start_epoch', None)
     label_smoothing = hyperparameters.get('label_smoothing', 0.0)
     aug_config = {
         'time_shift': hyperparameters.get('aug_time_shift', True),
@@ -666,6 +881,8 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     print(f"Label smoothing: {label_smoothing}")
     print(f"Sky: n_pix={sky_n_pix}, l_max={sky_l_max}")
     print(f"Mixup: {use_mixup}")
+    print(f"Manifold mixup: {use_manifold_mixup}")
+    print(f"SWA: {use_swa} (start epoch: {swa_start_epoch})")
     print(f"Augmentations: {aug_config}")
     print(f"Total samples: {n_samples}")
     print("Mode: TENSOR (preprocessed data, shard streaming)")
@@ -769,14 +986,33 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     )
 
     # initialize model
-    n_channels = hyperparameters.get('n_channels', 32)
+    n_channels = hyperparameters.get('n_channels', 16)
     model = DIYModel(n_channels=n_channels, dropout_rate=dropout_rate, drop_path_rate=drop_path_rate, n_sky_features=n_sky_features).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: DIYModel ({n_params:,} parameters)")
 
+    # split params: decay 2D+ weights (conv/linear matmul), skip biases,
+    # norms, and any 1-D scalar (which includes GeM's learnable p).
+    # Applying WD to GeM p was the cause of the epoch-5 divergence in the
+    # previous runs -- p drifts each step and after a few epochs GeM becomes
+    # numerically unstable regardless of the peak LR.
+    decay_params, no_decay_params = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim <= 1 or name.endswith('.bias'):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+        [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': no_decay_params, 'weight_decay': 0.0},
+        ],
+        lr=learning_rate,
     )
+    print(f"Param groups: decay={sum(p.numel() for p in decay_params):,}, "
+          f"no_decay={sum(p.numel() for p in no_decay_params):,}")
 
     # train
     print("\n" + "="*60)
@@ -804,8 +1040,12 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
         max_train_hours=max_train_hours,
         sky_geometry=sky_geo,
         use_mixup=use_mixup,
+        use_manifold_mixup=use_manifold_mixup,
+        use_swa=use_swa,
+        swa_start_epoch=swa_start_epoch,
         aug_config=aug_config,
         label_smoothing=label_smoothing,
+        checkpoint_dir=checkpoint_dir,
     )
 
     print("\nTraining complete.")
@@ -819,10 +1059,10 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2):
     y_val_pred = (y_val_proba >= 0.5).astype(int)
 
     val_auc = roc_auc_score(y_val, y_val_proba)
-    cm = model._compute_confusion_values(y_val_pred, y_val)
-    val_metrics = model._metrics_from_confusion(cm, len(y_val))
+    cm = compute_confusion_values(y_val_pred, y_val)
+    val_metrics = metrics_from_confusion(cm, len(y_val))
 
-    print(f"\nValidation Set:")
+    print("\nValidation Set:")
     print(f"  Accuracy:    {val_metrics['accuracy']:.4f}")
     print(f"  AUC:         {val_auc:.4f}")
     print(f"  Precision:   {val_metrics['precision']:.4f}")
@@ -984,7 +1224,7 @@ def run_lr_range_test(data_dir, n_samples, hyperparameters):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     batch_size = hyperparameters.get('batch_size', 64)
     dropout_rate = hyperparameters.get('dropout_rate', 0.5)
-    n_channels = hyperparameters.get('n_channels', 32)
+    n_channels = hyperparameters.get('n_channels', 16)
     drop_path_rate = hyperparameters.get('drop_path_rate', 0.0)
 
     # find shards
@@ -998,7 +1238,7 @@ def run_lr_range_test(data_dir, n_samples, hyperparameters):
 
     # sky geometry
     sky_n_pix = hyperparameters.get('sky_n_pix', 192)
-    sky_l_max = hyperparameters.get('sky_l_max', 8)
+    sky_l_max = hyperparameters.get('sky_l_max', 10)
     sky_geo = SkyGeometry(n_pix=sky_n_pix, l_max=sky_l_max)
     n_sky_features = sky_geo.n_coeffs
 
@@ -1065,30 +1305,41 @@ def main(mode='train'):
     has_gpu = check_gpu()
 
     # ========== HYPERPARAMETERS ==========
+    # Phase 3 Step 2 + sky-compatible regularization stack.
+    # Sky-incompatible aug (time-domain mixup, spectral dropout, time shift)
+    # remain off because they break cross-detector phase/timing coherence.
+    # New regularizers added: manifold mixup at the pooled-feature level
+    # (sky-compatible -- mixing happens after the conv path collapses time),
+    # SWA over the last ~15 epochs, drop_path_rate bumped to 0.3.
+    # sky_l_max bumped to 10 -> 121 SH coefficients (was 81). Requires
+    # regenerating sh_coeffs in the shards via create_tensors.py --add-sky.
     HYPERPARAMETERS = {
         'n_channels': 16,
         'n_samples': 4096,
-        'learning_rate': 1e-3,
+        'learning_rate': 2e-3,
         'dropout_rate': 0.5,
-        'weight_decay': 5e-4,
+        'weight_decay': 1e-3,
         'epochs': 50,
         'batch_size': 64 if has_gpu else 32,
         'early_stopping_patience': 10,
-        'warmup_epochs': 5,
+        'warmup_epochs': 7,
         'aux_loss_weight': 0.0,
         'use_amp': True,
         'clip_grad_norm': 1.0,
-        'drop_path_rate': 0.2,
+        'drop_path_rate': 0.3,
         'max_train_hours': 8.0,
         'sky_n_pix': 192,
-        'sky_l_max': 8,
-        'label_smoothing': 0.1,
+        'sky_l_max': 10,
+        'label_smoothing': 0.0,
         'use_mixup': False,
+        'use_manifold_mixup': True,
+        'use_swa': True,
+        'swa_start_epoch': 15,
         'aug_time_shift': False,
         'aug_noise': True,
         'aug_spectral_dropout': False,
         'aug_channel_shuffle': True,
-        'aug_amplitude_scale': True,
+        'aug_amplitude_scale': False,
     }
 
     # ========== SETUP PATHS ==========
@@ -1144,11 +1395,15 @@ def main(mode='train'):
     print(f"Models directory: {models_dir}")
 
     # ========== TRAIN MODEL ==========
+    # checkpoint_dir is /kaggle/working/models/saved on kaggle; the kernel
+    # runner commits this directory to the output bundle even when the
+    # script exits with an error, so best.pt survives a late-stage crash.
     results = train_from_tensors(
         data_dir,
         n_samples,
         hyperparameters=HYPERPARAMETERS,
-        val_split=0.2
+        val_split=0.2,
+        checkpoint_dir=models_dir,
     )
 
     # ========== SAVE RESULTS ==========
@@ -1178,17 +1433,17 @@ def main(mode='train'):
     print("TRAINING COMPLETE")
     print("="*60)
     print(f"\nModel: {saved_paths['base_name']}")
-    print(f"\nFinal Validation Metrics:")
+    print("\nFinal Validation Metrics:")
     print(f"  Accuracy:    {results['val_metrics']['accuracy']:.4f}")
     print(f"  AUC:         {results['val_metrics']['auc']:.4f}")
     print(f"  Precision:   {results['val_metrics']['precision']:.4f}")
     print(f"  Recall:      {results['val_metrics']['recall']:.4f}")
     print(f"  Specificity: {results['val_metrics']['specificity']:.4f}")
-    print(f"\nFiles saved:")
+    print("\nFiles saved:")
     print(f"  Weights: {saved_paths['weights'].name}")
     print(f"  Config:  {saved_paths['config'].name}")
     print(f"  Metrics: {saved_paths['metrics'].name}")
-    print(f"\nPlots saved:")
+    print("\nPlots saved:")
     for name, path in saved_plots.items():
         print(f"  {name}: {path.name}")
 

@@ -2,11 +2,12 @@
 Deep residual 1D CNN for G2Net gravitational wave detection.
 
 Phase 3, Steps 1b + 2: V2-style two-stage fusion on top of ~10 residual backbone
-blocks, with optional S2 spherical harmonic sky features. After the shared backbone,
+blocks, with S2 spherical harmonic sky features. After the shared backbone,
 4 parallel paths (H1, L1, V1, joint) are processed through individual branch blocks,
 then merged and processed through 4 fusion blocks. Sky features (SH coefficients from
-cross-detector consistency maps on S2) are concatenated with CNN features before the
-classifier head.
+cross-detector consistency maps on S2) modulate the pooled CNN features through a
+residual FiLM layer, so the geometric evidence conditions the detection decision
+rather than sitting alongside it as additional concatenated bins.
 LIGO H1/L1 share extractor and branch weights; Virgo has separate weights.
 """
 
@@ -30,6 +31,13 @@ class GeM(nn.Module):
     average pooling (p=1) and max pooling (p->inf). Negative activations from
     BatchNorm are clamped to eps. Forces float32 to prevent NaN under AMP.
 
+    The effective p is clamped to [p_min, p_max] inside the forward pass so
+    that drift in the underlying learnable parameter cannot push the pooling
+    operation into a numerically unstable regime. The clamp does not block
+    gradients -- p still trains freely via the straight-through nature of
+    the clamp's gradient (zero only at the boundary) -- but the forward
+    computation always sees a valid exponent.
+
     Parameters
     ----------
     kernel_size : int
@@ -38,20 +46,28 @@ class GeM(nn.Module):
         Initial value for the learnable exponent.
     eps : float
         Clamping floor for negative/zero activations.
+    p_min : float
+        Lower bound on the effective exponent.
+    p_max : float
+        Upper bound on the effective exponent.
     """
 
-    def __init__(self, kernel_size: int, p: float = 3.0, eps: float = 1e-6):
+    def __init__(self, kernel_size: int, p: float = 3.0, eps: float = 1e-6,
+                 p_min: float = 1.0, p_max: float = 10.0):
         super().__init__()
         self.kernel_size = kernel_size
         self.p = nn.Parameter(torch.tensor(p))
         self.eps = eps
+        self.p_min = p_min
+        self.p_max = p_max
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.autocast(device_type=x.device.type, enabled=False):
             x = x.float()
-            x = x.clamp(min=self.eps).pow(self.p)
+            p = self.p.clamp(self.p_min, self.p_max)
+            x = x.clamp(min=self.eps).pow(p)
             x = F.avg_pool1d(x, self.kernel_size)
-            return x.pow(1.0 / self.p)
+            return x.pow(1.0 / p)
 
 
 class AdaptiveConcatPool1d(nn.Module):
@@ -62,6 +78,60 @@ class AdaptiveConcatPool1d(nn.Module):
             F.adaptive_avg_pool1d(x, 1),
             F.adaptive_max_pool1d(x, 1),
         ], dim=1)
+
+
+# ============================================================================================
+#                                       SKY FILM
+# ============================================================================================
+
+class SkyFiLM(nn.Module):
+    """
+    Feature-wise linear modulation of CNN features by S2 sky SH coefficients.
+
+    Sky coefficients pass through BatchNorm and a 2-layer MLP that produces a
+    per-channel scale and shift. Outputs are tanh-bounded so that
+    gamma in (-1, 1) and beta in (-1, 1), and CNN features are modulated as
+    features = (1 + gamma) * features + beta. The (1 + gamma) factor stays
+    in (0, 2), keeping the modulation stable: no sign flips, no runaway
+    amplification that could destabilize the classifier head.
+
+    The output projection is zero-initialized so the module starts as the
+    identity (tanh(0)=0, so gamma=0 and beta=0). At step 0 the model is
+    exactly the V2 fusion baseline; the FiLM path can only contribute if the
+    optimizer learns to use it. The first training run without the tanh
+    bound diverged at epoch 5 with NaN loss, which traced back to unbounded
+    gamma amplifying CNN features faster than the classifier head could
+    adapt. The bound is cheap insurance against that failure mode.
+
+    Parameters
+    ----------
+    n_sky_features : int
+        Number of input SH coefficients.
+    feat_dim : int
+        Dimension of the CNN feature vector to modulate (= 32 * n_channels).
+    hidden_dim : int
+        Hidden width of the projection MLP.
+    """
+
+    def __init__(self, n_sky_features: int, feat_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.bn = nn.BatchNorm1d(n_sky_features, momentum=0.1, eps=1e-5)
+        self.fc1 = nn.Linear(n_sky_features, hidden_dim)
+        self.act = nn.SiLU()
+        self.fc2 = nn.Linear(hidden_dim, 2 * feat_dim)
+        self.feat_dim = feat_dim
+
+    def reset_to_identity(self):
+        """Zero the output projection so the module is identity at init."""
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, features: torch.Tensor, sky: torch.Tensor) -> torch.Tensor:
+        gamma_beta = self.fc2(self.act(self.fc1(self.bn(sky))))
+        gamma, beta = gamma_beta.chunk(2, dim=1)
+        gamma = torch.tanh(gamma)
+        beta = torch.tanh(beta)
+        return (1.0 + gamma) * features + beta
 
 
 # ============================================================================================
@@ -152,27 +222,28 @@ class DIYModel(nn.Module):
     """
     Deep residual 1D CNN for binary classification of GW signals.
 
-    Architecture (Phase 3, Steps 1b + 2 -- V2 fusion + S2 sky features):
+    Architecture (Phase 3, Steps 1b + 2 -- V2 fusion + S2 sky features via FiLM):
     - Separate extractors for LIGO (H1/L1 shared) and Virgo
     - 10 residual backbone blocks with GeM downsampling and channel widening
     - V2 fusion: 4 parallel branch paths (H1, L1, V1, joint) x 2 ResBlocks each
     - 4 fusion blocks processing merged branch outputs
     - AdaptiveConcatPool1d (avg + max) on fused features
-    - S2 sky features (SH coefficients) -> BN -> concat with CNN features
+    - S2 sky features (SH coefficients) -> SkyFiLM modulation of pooled features
     - 3-layer classifier head
-    - Auxiliary per-branch heads for training supervision
+    - Optional auxiliary per-branch heads (disabled in the final config with
+      aux_loss_weight=0; kept for compatibility with earlier ablation runs)
     - All outputs are raw logits (no sigmoid); use BCEWithLogitsLoss
 
     Backbone:  4096 -> 2048 (extractor) -> 512 -> 128 -> 32
     Channels:  1 -> n -> n -> 2n -> 4n (backbone) -> 4n (branches) -> 16n (fused)
     Fusion:    4 paths x 4n -> concat 16n -> 4 ResBlocks -> ConcatPool -> 32n features
-    Sky:       SH coefficients (l_max=8 -> 81 features) -> BN -> concat with CNN features
+    Sky:       (l_max + 1)^2 SH coefficients -> BN -> MLP -> (gamma, beta) -> FiLM
 
     Input shape: (batch_size, 3, 4096) - 3 detectors, 4096 time samples
     Sky input:   (batch_size, n_sky_features) - SH coefficients from S2 sky map
     """
 
-    def __init__(self, n_channels: int = 32, dropout_rate: float = 0.5, drop_path_rate: float = 0.0, n_sky_features: int = 81):
+    def __init__(self, n_channels: int = 16, dropout_rate: float = 0.5, drop_path_rate: float = 0.0, n_sky_features: int = 121):
         """
         Parameters
         ----------
@@ -184,8 +255,8 @@ class DIYModel(nn.Module):
             Maximum stochastic depth drop probability (applied to last block;
             linearly increases from 0 at the first block).
         n_sky_features : int
-            Number of S2 sky features (SH coefficients) concatenated with
-            CNN features. With l_max=8, this is (8+1)^2 = 81.
+            Number of S2 sky features (SH coefficients). With l_max=10,
+            this is (10+1)^2 = 121.
         """
         super().__init__()
         n = n_channels
@@ -272,11 +343,12 @@ class DIYModel(nn.Module):
         # auxiliary per-branch heads: ConcatPool on 4n -> 8n features
         self.branch_head = nn.Linear(8 * n, 1)
 
-        # ---- S2 sky features (Phase 3, Step 2) ----
-        self.sky_bn = nn.BatchNorm1d(n_sky_features, momentum=0.1, eps=1e-5)
+        # ---- S2 sky features (Phase 3, Step 2): FiLM modulation ----
+        # gamma/beta produced from SH coefs modulate the 32n CNN features.
+        feat_dim = 32 * n
+        self.sky_film = SkyFiLM(n_sky_features, feat_dim, hidden_dim=128)
 
-        # classifier head: ConcatPool on 16n fusion output = 32n + sky features
-        feat_dim = 32 * n + n_sky_features
+        # classifier head: takes the modulated 32n CNN features
         self.classifier = nn.Sequential(
             nn.Linear(feat_dim, 256),
             nn.BatchNorm1d(256, momentum=0.1, eps=1e-5),
@@ -289,6 +361,10 @@ class DIYModel(nn.Module):
         )
 
         self._init_weights()
+        # restore identity init for the FiLM output projection so the
+        # FiLM path starts as a no-op (gamma=0, beta=0); _init_weights
+        # has just overwritten it with Kaiming above.
+        self.sky_film.reset_to_identity()
 
     def _init_weights(self):
         """Apply Kaiming normal initialization to conv and linear layers."""
@@ -298,20 +374,13 @@ class DIYModel(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, X: torch.Tensor, sky_features: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    def _extract_pooled(self, X: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """
-        Parameters
-        ----------
-        X : torch.Tensor
-            Input of shape (batch_size, 3, 4096).
-        sky_features : torch.Tensor
-            S2 spherical harmonic coefficients, shape (batch_size, n_sky_features).
+        Run extractor -> backbone -> branches -> fusion -> global pool.
 
-        Returns
-        -------
-        torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]
-            Inference: logits (batch_size, 1).
-            Training: (logits, [h1_logits, l1_logits, v1_logits]).
+        Returns the pooled feature vector together with the per-detector
+        branch tensors (needed by the auxiliary heads). Manifold mixup
+        interposes between this method and ``classify_from_pooled``.
         """
         # per-detector extraction
         h1 = self.ligo_extractor(X[:, 0:1, :])
@@ -333,18 +402,38 @@ class DIYModel(nn.Module):
         joint_in = torch.cat([h1_feat, l1_feat, v1_feat], dim=1)
         joint_branch = self.joint_branch(self.joint_project(joint_in))
 
-        # merge all 4 paths -> fusion blocks -> pool -> classify
+        # merge all 4 paths -> fusion blocks -> pool
         fused = torch.cat([h1_branch, l1_branch, v1_branch, joint_branch], dim=1)
         fused = self.fusion(fused)
-        features = self.global_pool(fused).squeeze(-1)
+        pooled = self.global_pool(fused).squeeze(-1)
 
-        # concatenate S2 sky features with CNN features
-        sky_features = self.sky_bn(sky_features)
-        features = torch.cat([features, sky_features], dim=1)
+        return pooled, [h1_branch, l1_branch, v1_branch]
 
-        main_logits = self.classifier(features)
+    def classify_from_pooled(self, pooled: torch.Tensor, sky_features: torch.Tensor) -> torch.Tensor:
+        """Apply FiLM modulation and the classifier head to pooled features."""
+        features = self.sky_film(pooled, sky_features)
+        return self.classifier(features)
+
+    def forward(self, X: torch.Tensor, sky_features: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """
+        Parameters
+        ----------
+        X : torch.Tensor
+            Input of shape (batch_size, 3, 4096).
+        sky_features : torch.Tensor
+            S2 spherical harmonic coefficients, shape (batch_size, n_sky_features).
+
+        Returns
+        -------
+        torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]
+            Inference: logits (batch_size, 1).
+            Training: (logits, [h1_logits, l1_logits, v1_logits]).
+        """
+        pooled, branches = self._extract_pooled(X)
+        main_logits = self.classify_from_pooled(pooled, sky_features)
 
         if self.training:
+            h1_branch, l1_branch, v1_branch = branches
             branch_logits = [
                 self.branch_head(self.global_pool(h1_branch).squeeze(-1)),
                 self.branch_head(self.global_pool(l1_branch).squeeze(-1)),
@@ -462,198 +551,6 @@ class DIYModel(nn.Module):
         """
         probas = self.predict_proba(X, sky_features)
         return (probas >= threshold).astype(int)
-
-    def _compute_confusion_values(self, y_pred: np.ndarray, y_true: np.ndarray) -> dict:
-        """
-        Compute confusion matrix values from predictions and labels.
-
-        Parameters
-        ----------
-        y_pred : np.ndarray
-            Predicted binary labels.
-        y_true : np.ndarray
-            True binary labels.
-
-        Returns
-        -------
-        dict
-            Dictionary containing 'TP', 'TN', 'FP', 'FN' counts.
-        """
-        TP = int(np.sum((y_pred == 1) & (y_true == 1)))
-        TN = int(np.sum((y_pred == 0) & (y_true == 0)))
-        FP = int(np.sum((y_pred == 1) & (y_true == 0)))
-        FN = int(np.sum((y_pred == 0) & (y_true == 1)))
-        return {'TP': TP, 'TN': TN, 'FP': FP, 'FN': FN}
-
-    def confusion_matrix(self, X: np.ndarray, y: np.ndarray, sky_features: np.ndarray, threshold: float = 0.5) -> dict:
-        """
-        Compute confusion matrix components.
-
-        Parameters
-        ----------
-        X : np.ndarray
-            Input features.
-        y : np.ndarray
-            True labels.
-        sky_features : np.ndarray
-            S2 SH coefficients of shape (n_samples, n_sky_features).
-        threshold : float
-            Classification threshold.
-
-        Returns
-        -------
-        dict
-            Dictionary containing 'TP', 'TN', 'FP', 'FN' counts.
-        """
-        y_pred = self.predict(X, sky_features, threshold=threshold)
-        return self._compute_confusion_values(y_pred, y)
-
-    def _metrics_from_confusion(self, cm: dict, n_samples: int) -> dict:
-        """
-        Compute all metrics from confusion matrix values.
-
-        Parameters
-        ----------
-        cm : dict
-            Confusion matrix dict with 'TP', 'TN', 'FP', 'FN' keys.
-        n_samples : int
-            Total number of samples.
-
-        Returns
-        -------
-        dict
-            Dictionary containing accuracy, precision, recall, specificity, f1.
-        """
-        TP, TN, FP, FN = cm['TP'], cm['TN'], cm['FP'], cm['FN']
-
-        accuracy = (TP + TN) / n_samples
-        precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
-        recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-        specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0
-        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-
-        return {
-            'accuracy': float(accuracy),
-            'precision': float(precision),
-            'recall': float(recall),
-            'specificity': float(specificity),
-            'f1': float(f1)
-        }
-
-    def evaluate(self, X: np.ndarray, y: np.ndarray, sky_features: np.ndarray, threshold: float = 0.5) -> dict:
-        """
-        Evaluate model statistics.
-
-        Parameters
-        ----------
-        X : np.ndarray
-            Input features.
-        y : np.ndarray
-            True labels.
-        sky_features : np.ndarray
-            S2 SH coefficients of shape (n_samples, n_sky_features).
-        threshold : float
-            Classification threshold.
-
-        Returns
-        -------
-        dict
-            Dictionary containing accuracy, precision, recall, specificity, f1.
-        """
-        cm = self.confusion_matrix(X, y, sky_features, threshold=threshold)
-        return self._metrics_from_confusion(cm, len(y))
-
-    def roc_curve(self, X: np.ndarray, y: np.ndarray, sky_features: np.ndarray, n_thresholds: int = 100) -> dict:
-        """
-        Compute ROC curve data at multiple thresholds.
-
-        Parameters
-        ----------
-        X : np.ndarray
-            Input features.
-        y : np.ndarray
-            True labels.
-        sky_features : np.ndarray
-            S2 SH coefficients of shape (n_samples, n_sky_features).
-        n_thresholds : int
-            Number of threshold points to evaluate.
-
-        Returns
-        -------
-        dict
-            Dictionary containing 'fpr', 'tpr', 'thresholds', 'auc'.
-        """
-        y_proba = self.predict_proba(X, sky_features)
-        thresholds = np.linspace(0, 1, n_thresholds)
-
-        tpr_list = []
-        fpr_list = []
-
-        for thresh in thresholds:
-            y_pred = (y_proba >= thresh).astype(int)
-            cm = self._compute_confusion_values(y_pred, y)
-
-            tpr = cm['TP'] / (cm['TP'] + cm['FN']) if (cm['TP'] + cm['FN']) > 0 else 0.0
-            fpr = cm['FP'] / (cm['FP'] + cm['TN']) if (cm['FP'] + cm['TN']) > 0 else 0.0
-
-            tpr_list.append(tpr)
-            fpr_list.append(fpr)
-
-        fpr_arr = np.array(fpr_list)
-        tpr_arr = np.array(tpr_list)
-
-        sorted_indices = np.argsort(fpr_arr)
-        fpr_sorted = fpr_arr[sorted_indices]
-        tpr_sorted = tpr_arr[sorted_indices]
-        auc = np.trapezoid(tpr_sorted, fpr_sorted)
-
-        return {'fpr': fpr_arr, 'tpr': tpr_arr, 'thresholds': thresholds, 'auc': float(auc)}
-
-    def precision_recall_curve(self, X: np.ndarray, y: np.ndarray, sky_features: np.ndarray, n_thresholds: int = 100) -> dict:
-        """
-        Compute precision-recall curve data at multiple thresholds.
-
-        Parameters
-        ----------
-        X : np.ndarray
-            Input features.
-        y : np.ndarray
-            True labels.
-        sky_features : np.ndarray
-            S2 SH coefficients of shape (n_samples, n_sky_features).
-        n_thresholds : int
-            Number of threshold points to evaluate.
-
-        Returns
-        -------
-        dict
-            Dictionary containing 'precision', 'recall', 'thresholds', 'ap'.
-        """
-        y_proba = self.predict_proba(X, sky_features)
-        thresholds = np.linspace(0, 1, n_thresholds)
-
-        precision_list = []
-        recall_list = []
-
-        for thresh in thresholds:
-            y_pred = (y_proba >= thresh).astype(int)
-            cm = self._compute_confusion_values(y_pred, y)
-
-            precision = cm['TP'] / (cm['TP'] + cm['FP']) if (cm['TP'] + cm['FP']) > 0 else 1.0
-            recall = cm['TP'] / (cm['TP'] + cm['FN']) if (cm['TP'] + cm['FN']) > 0 else 0.0
-
-            precision_list.append(precision)
-            recall_list.append(recall)
-
-        precision_arr = np.array(precision_list)
-        recall_arr = np.array(recall_list)
-
-        sorted_indices = np.argsort(recall_arr)
-        recall_sorted = recall_arr[sorted_indices]
-        precision_sorted = precision_arr[sorted_indices]
-        ap = np.trapezoid(precision_sorted, recall_sorted)
-
-        return {'precision': precision_arr, 'recall': recall_arr, 'thresholds': thresholds, 'ap': float(ap)}
 
     def save_weights(self, filepath: str) -> None:
         """

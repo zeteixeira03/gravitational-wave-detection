@@ -28,6 +28,9 @@ build/
 # Model outputs (weights, metrics, configs)
 models/saved/
 
+# Kaggle output (plots, logs, intermediate checkpoints)
+kaggle/output/
+
 # OS
 .DS_Store
 Thumbs.db

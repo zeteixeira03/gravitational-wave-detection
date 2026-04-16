@@ -57,7 +57,7 @@ def create_sample_dataset(input_dir: Path, output_dir: Path) -> None:
 
     # write subset labels
     subset.to_csv(output_dir / "training_labels.csv", index=False)
-    print(f"Wrote training_labels.csv")
+    print("Wrote training_labels.csv")
 
     # copy .npy files preserving nested layout
     train_in = input_dir / "train"
@@ -93,12 +93,12 @@ def create_sample_dataset(input_dir: Path, output_dir: Path) -> None:
         model_out.mkdir(parents=True, exist_ok=True)
 
         # find latest model by date in filename
-        weight_files = sorted(models_dir.glob("diy_*_weights.npz"))
+        weight_files = sorted(models_dir.glob("diy_*_weights.pt"))
         if weight_files:
             latest = weight_files[-1]
             date_tag = latest.stem.replace("diy_", "").replace("_weights", "")
 
-            for suffix in ["_weights.npz", "_config.json", "_metrics.json"]:
+            for suffix in ["_weights.pt", "_config.json", "_metrics.json"]:
                 src = models_dir / f"diy_{date_tag}{suffix}"
                 if src.exists():
                     shutil.copy2(src, model_out / src.name)

@@ -29,14 +29,7 @@ if str(SRC_DIR) not in sys.path:
 from data.g2net import load_labels, load_sample
 from data.preprocessing import preprocess_sample, load_psd
 from data.compute_psd import compute_and_save_average_psd
-from sky_feasibility import (
-    make_sky_grid,
-    compute_time_delays,
-    delay_to_sample_index,
-    build_sky_map,
-    compute_sh_matrix,
-    decompose_sky_map,
-)
+from sky_feasibility import SkyGeometry
 
 SHARD_SIZE = 50000  # ~2.4 GB per shard
 
@@ -93,15 +86,10 @@ def create_tensors(input_dir: Path, output_dir: Path, psd_path: Path = None):
     print(f"Total samples: {n_samples}")
 
     # sky geometry
-    n_pix, l_max = 192, 8
+    n_pix, l_max = 192, 10
     print(f"\nInitializing S2 sky geometry (n_pix={n_pix}, l_max={l_max})...")
-    theta, phi = make_sky_grid(n_pix)
-    delays = compute_time_delays(theta, phi)
-    delay_indices = {pair: delay_to_sample_index(d) for pair, d in delays.items()}
-    sh_matrix = compute_sh_matrix(theta, phi, l_max)
-    sh_pinv = np.linalg.pinv(sh_matrix).astype(np.float32)
-    n_coeffs = (l_max + 1) ** 2
-    print(f"  SH coefficients per sample: {n_coeffs}")
+    sky_geo = SkyGeometry(n_pix=n_pix, l_max=l_max)
+    print(f"  SH coefficients per sample: {sky_geo.n_coeffs}")
 
     # process and save in shards
     print(f"\nProcessing samples (shard size: {SHARD_SIZE})...")
@@ -127,9 +115,7 @@ def create_tensors(input_dir: Path, output_dir: Path, psd_path: Path = None):
 
             signals_list.append(processed.astype(np.float32))
             labels_list.append(label)
-
-            sky_map = build_sky_map(processed, delay_indices)
-            sh_coeffs_list.append((sh_pinv @ sky_map).astype(np.float32))
+            sh_coeffs_list.append(sky_geo.extract(processed))
 
             written += 1
 
@@ -160,7 +146,7 @@ def create_tensors(input_dir: Path, output_dir: Path, psd_path: Path = None):
         'shard_files': shard_paths,
         'signal_shape': [3, 4096],
         'dtype': 'float32',
-        'sky_n_coeffs': n_coeffs,
+        'sky_n_coeffs': sky_geo.n_coeffs,
         'sky_n_pix': n_pix,
         'sky_l_max': l_max,
     }
@@ -168,14 +154,14 @@ def create_tensors(input_dir: Path, output_dir: Path, psd_path: Path = None):
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
 
-    print(f"\nDone!")
+    print("\nDone!")
     print(f"  Written: {written}")
     print(f"  Failed: {failed}")
     print(f"  Shards: {len(shard_paths)}")
     print(f"  Metadata: {metadata_path}")
 
 
-def add_sky_features(shard_dir: Path, n_pix: int = 192, l_max: int = 8) -> None:
+def add_sky_features(shard_dir: Path, n_pix: int = 192, l_max: int = 10) -> None:
     """
     Add SH coefficients to existing shard files that lack them.
 
@@ -197,30 +183,30 @@ def add_sky_features(shard_dir: Path, n_pix: int = 192, l_max: int = 8) -> None:
     if not shard_files:
         raise FileNotFoundError(f"No shard files in {shard_dir}")
 
-    # check if already done
+    # skip only if shards already contain sh_coeffs at the requested l_max.
+    # different l_max -> recompute and overwrite.
+    target_n_coeffs = (l_max + 1) ** 2
     first = torch.load(str(shard_files[0]), weights_only=True)
-    if 'sh_coeffs' in first:
-        print("Shards already contain sh_coeffs, skipping.")
+    if 'sh_coeffs' in first and first['sh_coeffs'].shape[1] == target_n_coeffs:
+        print(f"Shards already contain sh_coeffs at l_max={l_max} ({target_n_coeffs} coefs), skipping.")
         del first
         return
+    if 'sh_coeffs' in first:
+        existing = first['sh_coeffs'].shape[1]
+        print(f"Overwriting sh_coeffs: existing has {existing} coefs, target l_max={l_max} -> {target_n_coeffs} coefs.")
     del first
 
     print(f"Adding SH coefficients to {len(shard_files)} shards (n_pix={n_pix}, l_max={l_max})...")
-    theta, phi = make_sky_grid(n_pix)
-    delays = compute_time_delays(theta, phi)
-    delay_indices = {pair: delay_to_sample_index(d) for pair, d in delays.items()}
-    sh_matrix = compute_sh_matrix(theta, phi, l_max)
-    sh_pinv = np.linalg.pinv(sh_matrix).astype(np.float32)
+    sky_geo = SkyGeometry(n_pix=n_pix, l_max=l_max)
 
     for f in shard_files:
         data = torch.load(str(f), weights_only=True)
         signals = data['signals'].numpy()
         n = len(signals)
-        sh_coeffs = np.empty((n, (l_max + 1) ** 2), dtype=np.float32)
+        sh_coeffs = np.empty((n, sky_geo.n_coeffs), dtype=np.float32)
 
         for i in tqdm(range(n), desc=f"  {f.name}"):
-            sky_map = build_sky_map(signals[i], delay_indices)
-            sh_coeffs[i] = sh_pinv @ sky_map
+            sh_coeffs[i] = sky_geo.extract(signals[i])
 
         data['sh_coeffs'] = torch.tensor(sh_coeffs)
         torch.save(data, str(f))
@@ -251,11 +237,13 @@ if __name__ == "__main__":
                         help="Path to precomputed avg_psd.npz (optional)")
     parser.add_argument("--add-sky", type=str, default=None,
                         help="Path to existing shard directory to add SH coefficients to")
+    parser.add_argument("--l-max", type=int, default=10,
+                        help="Maximum SH degree (used with --add-sky). Default 10.")
 
     args = parser.parse_args()
 
     if args.add_sky:
-        add_sky_features(Path(args.add_sky))
+        add_sky_features(Path(args.add_sky), l_max=args.l_max)
     elif args.input and args.output:
         create_tensors(
             input_dir=Path(args.input),

@@ -1,18 +1,13 @@
 """
 Visualization utilities for data exploration and model performance assessment.
 
-Provides plotting functions for:
-- Preprocessing pipeline step-by-step
-- Cross-detector correlation
-- Learning curves (loss, accuracy, metrics over epochs)
-- ROC curve
-- Precision-Recall curve
-- Confusion matrix heatmap
-- Prediction distribution histogram
+Plotting functions for preprocessing pipeline, cross-detector correlation,
+learning curves, ROC, precision-recall, confusion matrix, and prediction
+distribution. Performance plots accept pre-computed predictions (from
+model.predict_proba) and metrics (from the evaluation module).
 """
 
 from __future__ import annotations
-from typing import Optional, Dict, Any
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -20,6 +15,12 @@ import matplotlib.pyplot as plt
 from data.preprocessing import (
     bandpass_filter, whiten_signal, apply_tukey_window, preprocess_sample,
     FS, N,
+)
+from evaluation import (
+    roc_curve,
+    precision_recall_curve,
+    confusion_matrix,
+    evaluate_metrics,
 )
 
 DETECTOR_NAMES = ["Hanford (H1)", "Livingston (L1)", "Virgo (V1)"]
@@ -36,7 +37,7 @@ def plot_preprocessing_pipeline(
     label: int,
     sample_id: str,
     figsize: tuple = (16, 12),
-    save_path: Optional[str] = None,
+    save_path: str | None = None,
 ) -> plt.Figure:
     """
     Show each preprocessing stage for all 3 detectors.
@@ -107,7 +108,7 @@ def plot_cross_detector_correlation(
     sample_id: str,
     max_lag: int = 100,
     figsize: tuple = (14, 5),
-    save_path: Optional[str] = None,
+    save_path: str | None = None,
 ) -> plt.Figure:
     """
     Cross-correlation between all detector pairs after preprocessing.
@@ -185,10 +186,10 @@ def plot_cross_detector_correlation(
 
 
 def plot_learning_curves(
-    history: Dict[str, list],
-    metrics: Optional[list] = None,
+    history: dict[str, list],
+    metrics: list | None = None,
     figsize: tuple = (12, 8),
-    save_path: Optional[str] = None
+    save_path: str | None = None,
 ) -> plt.Figure:
     """
     Plot learning curves from training history.
@@ -276,17 +277,17 @@ def plot_learning_curves(
 
 
 def plot_roc_curve(
-    roc_data: Dict[str, Any],
+    roc_data: dict,
     figsize: tuple = (8, 6),
-    save_path: Optional[str] = None
+    save_path: str | None = None,
 ) -> plt.Figure:
     """
-    Plot ROC curve from model.roc_curve() output.
+    Plot ROC curve from evaluation.roc_curve() output.
 
     Parameters
     ----------
     roc_data : dict
-        Output from model.roc_curve() containing 'fpr', 'tpr', 'auc'
+        Output from roc_curve() containing 'fpr', 'tpr', 'auc'
     figsize : tuple
         Figure size (width, height)
     save_path : str, optional
@@ -324,18 +325,17 @@ def plot_roc_curve(
 
 
 def plot_precision_recall_curve(
-    pr_data: Dict[str, Any],
+    pr_data: dict,
     figsize: tuple = (8, 6),
-    save_path: Optional[str] = None
+    save_path: str | None = None,
 ) -> plt.Figure:
     """
-    Plot Precision-Recall curve from model.precision_recall_curve() output.
+    Plot Precision-Recall curve from evaluation.precision_recall_curve() output.
 
     Parameters
     ----------
     pr_data : dict
-        Output from model.precision_recall_curve() containing
-        'precision', 'recall', 'ap'
+        Output from precision_recall_curve() containing 'precision', 'recall', 'ap'
     figsize : tuple
         Figure size (width, height)
     save_path : str, optional
@@ -378,18 +378,18 @@ def plot_precision_recall_curve(
 
 
 def plot_confusion_matrix(
-    cm_data: Dict[str, int],
+    cm_data: dict[str, int],
     figsize: tuple = (8, 6),
     normalize: bool = False,
-    save_path: Optional[str] = None
+    save_path: str | None = None,
 ) -> plt.Figure:
     """
-    Plot confusion matrix heatmap from model.confusion_matrix() output.
+    Plot confusion matrix heatmap from evaluation.confusion_matrix() output.
 
     Parameters
     ----------
     cm_data : dict
-        Output from model.confusion_matrix() containing 'TP', 'TN', 'FP', 'FN'
+        Output from confusion_matrix() containing 'TP', 'TN', 'FP', 'FN'
     figsize : tuple
         Figure size (width, height)
     normalize : bool
@@ -412,15 +412,13 @@ def plot_confusion_matrix(
 
     if normalize:
         cm_display = cm.astype(float) / cm.sum() * 100
-        fmt = '.1f'
         title = 'Confusion Matrix (Normalized %)'
     else:
         cm_display = cm
-        fmt = 'd'
         title = 'Confusion Matrix'
 
     im = ax.imshow(cm_display, cmap='Blues')
-    cbar = ax.figure.colorbar(im, ax=ax)
+    ax.figure.colorbar(im, ax=ax)
 
     # labels
     classes = ['Noise (0)', 'Signal (1)']
@@ -458,7 +456,7 @@ def plot_prediction_distribution(
     y_true: np.ndarray,
     bins: int = 50,
     figsize: tuple = (10, 6),
-    save_path: Optional[str] = None
+    save_path: str | None = None,
 ) -> plt.Figure:
     """
     Plot histogram of predicted probabilities for each class.
@@ -511,49 +509,37 @@ def plot_prediction_distribution(
 
 
 def plot_all_metrics(
-    model,
-    X: np.ndarray,
+    y_proba: np.ndarray,
     y: np.ndarray,
-    sky_features: np.ndarray,
-    history: Optional[Dict[str, list]] = None,
+    history: dict[str, list] | None = None,
     figsize: tuple = (16, 12),
-    save_path: Optional[str] = None,
+    save_path: str | None = None,
 ) -> plt.Figure:
     """
     Create a comprehensive dashboard with all performance plots.
 
     Parameters
     ----------
-    model : DIYModel
-        Trained model instance with evaluate methods
-    X : np.ndarray
-        Input features
+    y_proba : np.ndarray
+        Predicted probabilities from model.predict_proba().
     y : np.ndarray
-        True labels
-    sky_features : np.ndarray
-        S2 SH coefficients of shape (n_samples, n_sky_features).
+        True labels.
     history : dict, optional
         Training history for learning curves. If None, skips learning curves.
     figsize : tuple
-        Figure size (width, height)
     save_path : str, optional
-        Path to save the figure
 
     Returns
     -------
     plt.Figure
-        The matplotlib figure object
     """
-    # compute all metrics
-    roc_data = model.roc_curve(X, y, sky_features)
-    pr_data = model.precision_recall_curve(X, y, sky_features)
-    cm_data = model.confusion_matrix(X, y, sky_features)
-    y_proba = model.predict_proba(X, sky_features)
-    metrics = model.evaluate(X, y, sky_features)
+    roc_data = roc_curve(y_proba, y)
+    pr_data = precision_recall_curve(y_proba, y)
+    cm_data = confusion_matrix(y_proba, y)
+    metrics = evaluate_metrics(y_proba, y)
 
     # determine layout
     has_history = history is not None and len(history) > 0
-    n_plots = 5 if has_history else 4
 
     if has_history:
         fig = plt.figure(figsize=figsize)
@@ -607,7 +593,7 @@ def plot_all_metrics(
     # confusion matrix
     cm = np.array([[cm_data['TN'], cm_data['FP']],
                    [cm_data['FN'], cm_data['TP']]])
-    im = ax_cm.imshow(cm, cmap='Blues')
+    ax_cm.imshow(cm, cmap='Blues')
     ax_cm.set_xticks([0, 1])
     ax_cm.set_yticks([0, 1])
     ax_cm.set_xticklabels(['Noise', 'Signal'])
@@ -653,7 +639,7 @@ def plot_all_metrics(
 #                         LR RANGE TEST
 # =====================================================================
 
-def plot_lr_range_test(lr_data: dict, save_path: Optional[str] = None):
+def plot_lr_range_test(lr_data: dict, save_path: str | None = None):
     """
     Plot LR range test results: loss vs learning rate (log scale).
 

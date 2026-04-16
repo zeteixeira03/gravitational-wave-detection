@@ -84,17 +84,13 @@ First, the $S_3$ symmetry argument was wrong. The three detectors are *not* exch
 
 Second, a complete graph on 3 nodes is topologically trivial. One round of message passing on $K_3$ is equivalent to a fully connected layer that happens to share weights across node positions (essentially an MLP with extra steps). There is no graph structure for the GNN to exploit. The cross-correlation edge features (113-dimensional vectors per pair) added compute cost but no information the network could not already access through the concatenated features.
 
-### Phase 2c: Loss constraints (delayed)
-
-Three auxiliary loss terms were planned (cross-detector consistency, time-delay prior, SNR-aware weighting). These were deprioritized after Phase 2b showed that the bottleneck is not in how features are combined but in the features themselves. Loss-level constraints cannot help if the feature extractor lacks the capacity to produce the features they would constrain. SNR-aware weighting could still become useful later.
-
 ### Phase 2 Summary:
 
 The failure of both per-branch losses (2a) and GNN aggregation (2b) narrowed the diagnosis. The bottleneck is not in per-detector feature quality (2a showed features are already as good as the architecture allows) and not in the fusion method (2b showed that more sophisticated aggregation adds nothing). The remaining explanation is the **feature extractor itself**: four plain convolutional blocks without residual connections cannot represent the hierarchical structure of gravitational wave signals.
 
 ---
 
-## Phase 3: Deep residual backbone + geometric cross-correlation (current)
+## Phase 3: Deep residual backbone + geometric cross-correlation (concluded)
 
 ### Why depth matters: a first-principles argument
 
@@ -114,9 +110,9 @@ $$\mathbf{y} = \mathcal{F}(\mathbf{x}) + \mathbf{x}$$
 
 The gradient of the loss with respect to any early layer always includes a term that bypasses all intermediate layers. This makes the optimization landscape smoother and allows training networks with tens or hundreds of layers.
 
-The second design choice is width. The Phase 1-2 model was wide (32 -> 64 -> 128 -> 256 filters) on the assumption that more filters capture more diverse features. But gravitational wave strain is a one-dimensional scalar quantity, i.e. there is no spatial structure or color channels as in images. The diversity of features at any given scale is limited by the physics: the signal is a chirp with a few parameters (masses, spins, distance, sky position). A narrower network (e.g., 32 filters throughout) with residual connections and many more layers can represent the same feature space more efficiently, because depth allows it to compose simple features into complex ones rather than needing many parallel filters to capture complex patterns in a single layer.
+The second design choice is width. The Phase 1-2 model was wide (32 -> 64 -> 128 -> 256 filters) on the assumption that more filters capture more diverse features. But gravitational wave strain is a one-dimensional scalar quantity: there is no spatial structure or color channels as in images. The diversity of features at any given scale is limited by the physics -- the signal is a chirp with a few parameters (masses, spins, distance, sky position). A narrower network with residual connections and many more layers can represent the same feature space more efficiently, because depth allows it to compose simple features into complex ones rather than needing many parallel filters to capture complex patterns in a single layer. Current runs use base width n=16 (progressing 16 -> 32 -> 64 through the backbone, then 256 channels in the fusion stage), which fits the Kaggle GPU budget comfortably and leaves room for the depth increase.
 
-The implemented architecture: ~10 residual blocks (20 convolutional layers) with width 32, decreasing kernel sizes (64 -> 31 -> 15 -> 7), GeM pooling for learned downsampling, and stochastic depth. Drop probability increases linearly from 0 at block 0 to `drop_path_rate` at block 9. All 10 blocks are subject to stochastic depth, including the 3 that downsample. When a downsampling block is dropped, the shortcut path still handles projection and GeM, so the sample gets downsampled without learned features rather than skipped entirely. At `drop_path_rate=0.1` the chance of multiple downsampling blocks dropping simultaneously for one sample is negligible.
+The implemented architecture: 10 residual blocks (20 convolutional layers) with base width n=16, decreasing kernel sizes (64 -> 31 -> 15 -> 7), GeM pooling for learned downsampling, and stochastic depth. Drop probability increases linearly from 0 at the first block to `drop_path_rate` at the last block of the 16-level schedule (10 backbone + 2 parallel branch + 4 fusion). All 10 backbone blocks are subject to stochastic depth, including the 3 that downsample. When a downsampling block is dropped, the shortcut path still handles projection and GeM, so the sample gets downsampled without learned features rather than skipped entirely.
 
 ### Weight sharing
 
@@ -131,36 +127,56 @@ The residual backbone uses a shared extractor for the LIGO pair and a separate e
 
 The second architectural addition exploits the geometric structure of the multi-detector network. This is described in detail in [THE_SCIENCE.md](THE_SCIENCE.md) (section: Geometric Structure of the Detector Network). In brief: the detector network defines a natural geometric domain (the sky sphere $S^2$), and cross-detector consistency can be represented as a scalar field on that sphere. Decomposing this field into spherical harmonics produces a compact, rotation-equivariant feature vector that encodes detector agreement in a physically-informed way.
 
-The implementation uses a `SkyGeometry` class that precomputes detector positions, time delay tables for 192 HEALPix sky pixels, and the SH basis matrix once. The DataLoader computes sky features on-the-fly: for each sample, it computes normalized cross-correlations via FFT for all three detector pairs, evaluates them at the predicted delays per sky pixel, squares and sums them into a consistency score, and projects the resulting sky map onto the SH basis (l_max=8, 81 coefficients). These coefficients pass through a BatchNorm layer and concatenate with the ConcatPool output (512 + 81 = 593 features) before the classifier head.
-
-The sky features are SO(3)-equivariant intermediate representations; the final detection output is invariant (whether a signal is present does not depend on sky position). The $Z_2$ symmetry (H1-L1 swap) is inherited automatically since cross-correlation is symmetric under pair reordering.
+The implementation uses a `SkyGeometry` class that precomputes detector positions, time delay tables for 192 HEALPix sky pixels, and the SH basis matrix once. SH coefficients are precomputed at shard creation time via `create_tensors.py` (or added to existing shards with `--add-sky --l-max <n>`); the DataLoader falls back to on-the-fly computation from a clean (pre-augmentation) copy of the signal when shards lack coefficients. The coefficients condition the pooled CNN features through a FiLM layer (see below), not through concatenation.
 
 ### Implementation sequence
 
-Each step is gated on the previous one showing improvement.
+Each step was gated on the previous one showing improvement.
 
-**Step 1: Deep residual backbone (implemented).** Replaced the 4 plain conv blocks with ~10 residual blocks. Added separate Virgo extractor, GeM pooling. AUC: 0.866 (up from 0.858 plateau). Recall improved substantially (0.64 -> 0.75). Stochastic depth (drop_path_rate=0.2) resolved overfitting (val loss < train loss) without further AUC gain. Spectral dropout and channel shuffle augmentations added.
+**Step 1: Deep residual backbone.** Replaced the 4 plain conv blocks with ~10 residual blocks. Added separate Virgo extractor, GeM pooling. AUC: 0.866 (up from the 0.858 plateau). Recall improved substantially (0.64 -> 0.75). Stochastic depth (drop_path_rate=0.2) resolved overfitting (val loss < train loss) without further AUC gain. Spectral dropout and channel shuffle augmentations added alongside.
 
-**Step 1b: Two-stage branch fusion (implemented).** V2-style fusion with n=16 channels: after the shared backbone, 4 parallel paths (H1, L1, V1 individual branches + joint branch with 1x1 projection) each with 2 ResBlocks, then all 4 concatenated (256 channels) through 4 fusion ResBlocks. LIGO H1/L1 share branch weights. ConcatPool produces 512 features for a 3-layer classifier head (512 -> 256 -> 64 -> 1). Stochastic depth extended across all 16 depth levels. LR schedule switched from cosine warm restarts to plain cosine annealing. Wall-clock time budget (8h) added to prevent Kaggle timeout. AUC: 0.874 (up from 0.866 backbone-only).
+**Step 1b: Two-stage branch fusion.** V2-style fusion with n=16 channels: after the shared backbone, 4 parallel paths (H1, L1, V1 individual branches + joint branch with 1x1 projection) each with 2 ResBlocks, then all 4 concatenated (256 channels) through 4 fusion ResBlocks. LIGO H1/L1 share branch weights. ConcatPool produces 512 features for a 3-layer classifier head. Stochastic depth extended across all 16 depth levels. LR schedule switched from cosine warm restarts to plain cosine annealing. Wall-clock time budget (8h) added to prevent Kaggle timeout. AUC: 0.874 (no-sky baseline, up from 0.866 backbone-only).
 
-**Step 2: $S^2$ cross-correlation features (implemented, under investigation).** The model requires 81 spherical harmonic coefficients as a second input alongside the signal tensor. A `SkyGeometry` class precomputes 192 HEALPix sky pixels, the time delay model for all detector pairs, and the SH basis matrix (l_max=8). For each sample, normalized cross-correlations between all detector pairs are computed via FFT, evaluated at the predicted time delays per sky pixel, and combined into a consistency score (sum of squared correlations). The resulting sky map is projected onto the SH basis, batch-normalized, and concatenated with the CNN's 512-dimensional ConcatPool output, giving 593 classifier input features. SH coefficients are precomputed and stored in the tensor shards via `create_tensors.py` (or added to existing shards with `--add-sky`). The DataLoader falls back to on-the-fly computation if shards lack precomputed coefficients. Hyperparameters: `sky_n_pix` (default 192), `sky_l_max` (default 8).
+**Step 2: $S^2$ cross-correlation features.** The offline feasibility gate passed cleanly: the $\ell = 0$ monopole of the sky consistency map reaches AUC $\sim 0.60$ as a univariate classifier, and roughly half of the remaining SH coefficients exceed AUC 0.56 individually. The features carry discriminative signal. In spite of that, every run with sky features turned on landed in the 0.865-0.871 band, just under the 0.874 no-sky baseline.
 
-First run with SH features: AUC 0.873, no measurable improvement over the Step 1b baseline (0.873-0.874). The offline feasibility gate passed (l=0 monopole AUC ~0.60, roughly half of all coefficients above 0.56), so the SH coefficients carry some discriminative signal. Two suspected attenuators:
+The first sky run (concatenation, all augmentations on) reached 0.873, within the no-sky error bar. The working hypothesis was that several of the Phase 1 augmentations were actively hostile to the sky map: input-space mixup blends signals from different sky positions (the interpolation corresponds to no physical source), spectral dropout randomly zeroes FFT bins and destroys inter-detector phase coherence, and time shift per detector breaks the precomputed delay geometry the sky map depends on. Stripping those three augmentations should have let the sky features express themselves. The rest of Phase 3 was a regularization ablation to find out whether a sky-compatible replacement stack could push past the baseline.
 
- **Hypothesis:** Six overlapping regularization mechanisms (mixup, spectral dropout, time shift, Gaussian noise, dropout 0.5, aux branch loss) are sabotaging the sky features. Mixup creates sky-signal mismatches, spectral dropout destroys inter-detector phase coherence, and time shifts contradict the precomputed sky geometry.
+| Run | Config changes vs. no-sky baseline | Train loss | Val loss | AUC |
+|-----|------------------------------------|------------|----------|-----|
+| Baseline (no sky) | all augs on | 0.59 | 0.42 | 0.874 |
+| First sky run (concat) | + sky concat, all augs on | -- | -- | 0.873 |
+| Exp E | strip mixup / spectral / time-shift / noise, dropout 0.3, no aux | 0.34 | 0.46 | 0.870 |
+| Exp F | restore dropout 0.5 + Gaussian noise | 0.33 | 0.43 | 0.872 |
+| Exp G | + label smoothing 0.1 + amplitude scaling | 0.45 | 0.43 | 0.868 |
+| FiLM pivot | concat -> FiLM fusion, $\ell_{\max}=8$, no-decay param group | 0.34 | 0.46 | 0.871 |
+| Final | manifold mixup + SWA + drop_path 0.3 + $\ell_{\max}=10$ | 0.43 | 0.47 | 0.865 |
 
- **Ablation:** isolate whether the sky map adds discriminative signal when the training regime doesn't fight it. The plan is to strip down regularization that conflicts with sky features, keeping only what's safe. Compare against runs completed before adding sky features (AUC 0.8734-0.8737) and with full augmentation:
-        - AUC > 0.876: sky features add real signal when not sabotaged. Strong result.
-        - AUC 0.873-0.876: inconclusive. Could be sky helping but offset by less regularization. Next step: run same stripped config WITHOUT sky features to isolate.
-        - AUC < 0.873: either sky features don't help, or reduced regularization causes overfitting. Check train-val loss gap to distinguish.
+Each row taught something specific:
 
-**Step 3: Training refinements.** MC dropout at inference, pseudo-labeling, rank loss fine-tuning.
+- *Stripping augmentations hurts generalization.* Exp E removed mixup, spectral dropout, time shift, and Gaussian noise together. Train loss collapsed to 0.34 (pure memorization) while val loss climbed to 0.46. The regularization deficit swallowed whatever contribution the sky features could have made; the run did not isolate the sky effect.
+- *Dropout and Gaussian noise alone do not replace the stripped stack.* Exp F restored dropout 0.5 and input-space Gaussian noise (both sky-compatible). The train-val gap improved, but AUC only recovered to 0.872, still below the no-sky 0.874.
+- *Label smoothing fixed overfitting but hurt AUC.* Exp G added label smoothing 0.1 and amplitude scaling. Train loss rose to 0.45, val loss held at 0.43, but AUC dropped to 0.868. Smoothing prevents the model from committing to confident correct predictions on low-SNR positives, which is exactly the regime where the sky map is supposed to help most.
+- *Concatenation was not the bottleneck, but FiLM is still the right call.* Swapping concat for FiLM at $\ell_{\max}=8$ reached 0.871, within the same band. The fusion mechanism was not what kept sky features from helping. FiLM stays in the final model because it is the structurally cleaner way to combine a narrow physics-derived vector with a much wider learned representation: the 121-dim SH vector gets direct multiplicative control over every CNN channel instead of being swallowed by the 512-dim CNN path at the input of the classifier.
 
----
+The final run stacked four sky-compatible changes, each targeting a different failure mode from the ablations above: *manifold mixup* (alpha=0.4) on the pooled feature vectors, which restores mixup-strength regularization without touching the phase-sensitive time-domain representation; *stochastic weight averaging* over the last $\sim 15$ epochs with an SWALR constant LR schedule, chosen to smooth out the noise in the final solution; *drop_path_rate* 0.2 $\to$ 0.3, a cheap bump to the already-present stochastic depth; and *$\ell_{\max}$* 8 $\to$ 10, which grows the SH basis from 81 to 121 coefficients so the sky side matches the order of magnitude of the 512-dim CNN features the FiLM MLP conditions. AUC landed at 0.865 on the SWA-averaged model (peak single-epoch AUC was 0.871 at epoch 11), worse than the no-sky 0.874 baseline and within the same 0.865-0.871 band every sky-on run has occupied.
 
-### Please Help Out!
+### What the sky features cost, and why they stay
 
-If you read my code and found a bug, or a possible improvement that I didn't think of, please contact me so we can discuss this further. I'd love to hear about it!
+The empirical story is simple: on this dataset, the sky features do not help. Three detectors, an already-saturated cross-detector fusion block, and a training set where the augmentations most effective at regularizing 1D CNNs happen to be precisely the ones that destroy cross-detector phase coherence. None of the sky-compatible replacements tried in the Phase 3 ablation recovered the generalization that the stripped augmentations provided. Every sky-on configuration paid a regularization tax that the geometric features could not repay.
+
+The construction itself is still worth keeping on the record. The sky consistency map is a physical object: for each direction on the sphere, it asks how well the three detectors agree that a signal came from there, using only cross-correlations at the geometrically predicted time delays. The spherical harmonic decomposition turns that function into a compact, rotation-structured feature vector. The FiLM layer lets those coefficients modulate a learned CNN representation channel-by-channel rather than compete with it at a concatenation point. The whole pipeline is bounded ($\gamma \in (-1, 1)$), starts at identity (zero-init output projection), and is trivially toggled on and off. It is also general: any detector network that can be mapped to sky-direction-dependent time delays admits the same construction.
+
+LISA is the obvious place where this kind of geometric conditioning could matter. A ground-based network of three detectors with short baselines already extracts nearly all the cross-detector coincidence information through simple time-domain fusion. LISA is a very different regime: three spacecraft in a 2.5 million km triangle, sources that dwell in band for weeks to months, a strong source-direction dependence in the time-delay interferometry combinations, and a detection problem where geometric consistency across the network is central rather than incidental. The sky-map + SH + FiLM construction is left in the code as a small contribution in that direction -- a testable, physics-grounded way to inject geometric evidence into a learned detection pipeline, even if the G2Net dataset was not the right testbed for it.
+
+### Final model
+
+The saved model for this project is the final run: V2 residual backbone + V2 two-stage fusion + SkyFiLM driven by 121 SH coefficients, trained with manifold mixup, SWA, and the sky-compatible augmentation stack. Validation metrics (full 112k-sample split):
+
+| Accuracy | AUC | Precision | Recall | Specificity |
+|----------|-----|-----------|--------|-------------|
+| 0.798 | 0.865 | 0.933 | 0.640 | 0.954 |
+
+The high precision / low recall profile is a direct consequence of the training objective: BCE on a mildly imbalanced dataset with no calibration step, so the threshold-0.5 operating point sits deep in the high-precision corner of the ROC curve. The full curves and the dashboard are in [assets/dashboard.png](assets/dashboard.png).
 
 ---
 
@@ -172,3 +188,4 @@ If you read my code and found a bug, or a possible improvement that I didn't thi
 - Ta et al. (2023) -- Dropout and Gaussian noise for 1D CNNs
 - Nair et al. (2023) -- Skip connections in GW detection architectures
 - Sacco et al. (2022) -- Cosine annealing with warm restarts
+- ZiyueWang25 / Kaggle_G2Net (GitHub) -- V2 two-stage fusion reference implementation
