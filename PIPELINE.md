@@ -73,5 +73,5 @@
 | Raw G2Net dataset | ~70 GB |
 | Preprocessed tensor shards | ~2.4 GB/shard |
 | avg_psd.npz | ~45 KB |
-| Model weights | ~6 MB |
+| Model weights | ~18 MB |
 | src/ code (zipped) | ~150 KB |

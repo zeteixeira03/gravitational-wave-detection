@@ -12,7 +12,7 @@ But why gravitational waves? I have a Physics degree, and did my thesis on Numer
 
 The current iteration is built around two ideas. First, the CNN backbone has to be deep: a chirp has hierarchical temporal structure (individual cycles, frequency evolution, amplitude envelope) and a shallow network cannot compose features across those timescales. Second, the meaningful geometric structure in this problem lives on the sky sphere $S^2$: a gravitational wave from a given direction arrives at each detector with specific time delays, and for a real signal all three pairwise delays must be consistent with a single point on the sky. Noise doesn't have this property. The model packages that consistency constraint as a scalar field on $S^2$, decomposes it into spherical harmonics, and uses the coefficients to modulate the CNN features through a FiLM layer before the classifier. The CNN captures what each detector sees; the sky map captures whether they agree in a way that is geometrically consistent with an astrophysical source.
 
-If you're interested, [THE_SCIENCE.md](THE_SCIENCE.md) explains the detector physics, the preprocessing pipeline, and the full description of the network. Two Jupyter notebooks cover the dataset ([01_data_exploration.ipynb](notebooks/01_data_exploration.ipynb)) and let you poke at the model ([02_model_explorer.ipynb](notebooks/02_model_explorer.ipynb)). The record of experiments, what worked, and what did not is in [developer-notes.md](developer-notes.md). For a visual overview of the preprocessing and training pipeline, check out [PIPELINE.md](PIPELINE.md).
+If you're interested, [THE_SCIENCE.md](THE_SCIENCE.md) explains the detector physics, the preprocessing pipeline, and the full description of the network. Four Jupyter notebooks walk through the project: the dataset ([01_data_exploration](notebooks/01_data_exploration.ipynb)), the architecture ([02_architecture_tour](notebooks/02_architecture_tour.ipynb)), the sky-feature construction ([03_sky_features](notebooks/03_sky_features.ipynb)), and a comparison of model runs with error analysis ([04_results_and_errors](notebooks/04_results_and_errors.ipynb)). The record of experiments, what worked, and what did not is in [developer-notes.md](developer-notes.md). For a visual overview of the preprocessing and training pipeline, check out [PIPELINE.md](PIPELINE.md).
 
 ## Architecture
 
@@ -114,17 +114,19 @@ For local training: `python src/model_runs.py`. You need the full dataset on dis
 │   │   ├── create_tensors.py     # Tensor shard generation for Kaggle (includes SH coefficients)
 │   │   └── download_data.py      # Dataset download helper
 │   ├── models/
-│   │   └── diy_model.py          # 1D CNN implementation (+ S2 sky features)
-│   ├── sky_feasibility.py        # Sky map feasibility analysis (offline diagnostic)
+│   │   └── diy_model.py          # 1D CNN architecture (residual backbone, V2 fusion, SkyFiLM)
+│   ├── evaluation.py             # Standalone metrics (ROC, PR curve, confusion matrix)
+│   ├── sky_feasibility.py        # Sky geometry, SH decomposition, feasibility analysis
 │   ├── model_runs.py             # Training pipeline
 │   └── visualization.py          # Plotting utilities
 ├── notebooks/
-│   ├── 01_data_exploration.ipynb
-│   ├── 02_model_explorer.ipynb
+│   ├── 01_data_exploration.ipynb  # Dataset structure and preprocessing walkthrough
+│   ├── 02_architecture_tour.ipynb # Model architecture and layer dimensions
+│   ├── 03_sky_features.ipynb      # Sky map construction and SH decomposition
+│   └── 04_results_and_errors.ipynb # Model comparison and error analysis
 ├── kaggle/
 │   ├── train.py                  # Kaggle kernel entry point
 │   └── kernel-metadata.json      # Kernel configuration
-├── models/saved/                  # Trained model weights
 └── requirements.txt
 ```
 

@@ -210,4 +210,4 @@ The ROC curve captures the tradeoff between these errors across all classificati
 
 ---
 
-For visualizations of the data and preprocessing pipeline, see the [data exploration notebook](notebooks/01_data_exploration.ipynb). For model analysis and interpretability, see the [model explorer notebook](notebooks/02_model_explorer.ipynb). For the reasoning behind architectural decisions, see [developer-notes.md](developer-notes.md).
+For visualizations of the data and preprocessing pipeline, see the [data exploration notebook](notebooks/01_data_exploration.ipynb). For a walkthrough of the model architecture, see [02_architecture_tour](notebooks/02_architecture_tour.ipynb). The sky-feature construction is in [03_sky_features](notebooks/03_sky_features.ipynb), and a comparison of model runs with error analysis is in [04_results_and_errors](notebooks/04_results_and_errors.ipynb). For the reasoning behind architectural decisions, see [developer-notes.md](developer-notes.md).
