@@ -16,8 +16,22 @@ import argparse
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.special import sph_harm
 from sklearn.metrics import roc_auc_score
+
+# scipy.special.sph_harm was deprecated in scipy 1.15 and removed thereafter in
+# favour of sph_harm_y, which takes (l, m, theta, phi) instead of (m, l, phi, theta).
+# Kaggle images track a newer scipy than local, so bind a single sph_harm(m, l, phi, theta)
+# callable that works on both.
+try:
+    from scipy.special import sph_harm as _sph_harm
+
+    def sph_harm(m, l, phi, theta):
+        return _sph_harm(m, l, phi, theta)
+except ImportError:
+    from scipy.special import sph_harm_y as _sph_harm_y
+
+    def sph_harm(m, l, phi, theta):
+        return _sph_harm_y(l, m, theta, phi)
 
 from data import FS, N, load_psd, preprocess_sample
 from data.g2net import find_dataset_dir, load_labels, load_sample
@@ -318,6 +332,253 @@ class SkyGeometry:
         """
         sky_map = build_sky_map(signal, self.delay_indices)
         return self.sh_pinv @ sky_map
+
+
+# ============================================================================================
+#                        spherical harmonic algebra (readout variants + tests)
+# ============================================================================================
+#
+# The real SH coefficients a_j (j = l^2 + l + m) transform covariantly under SO(3):
+# each degree l rotates within its own (2l+1)-dimensional block by a real Wigner-D
+# matrix. The angular power spectrum p_l = sum_m a_{lm}^2 is the squared norm of each
+# block and is therefore SO(3)-invariant. These helpers give the block index (for the
+# `power` readout) and a real-basis rotation (for the invariance unit tests).
+
+import math
+
+
+def sh_block_index(l_max: int) -> np.ndarray:
+    """
+    Map each real-SH coefficient index to its degree l.
+
+    Returns
+    -------
+    block_index
+        Array of length (l_max + 1)^2 where entry j holds the degree l of the
+        coefficient at index j = l^2 + l + m.
+    """
+    idx = np.empty((l_max + 1) ** 2, dtype=np.int64)
+    for l in range(l_max + 1):
+        idx[l * l : (l + 1) * (l + 1)] = l
+    return idx
+
+
+def power_spectrum(coeffs: np.ndarray, l_max: int) -> np.ndarray:
+    """
+    Angular power spectrum p_l = sum_m a_{lm}^2 from real-SH coefficients.
+
+    Parameters
+    ----------
+    coeffs
+        Real-SH coefficients, shape (..., (l_max + 1)^2).
+    l_max
+        Maximum degree.
+
+    Returns
+    -------
+    power
+        Per-degree power, shape (..., l_max + 1).
+    """
+    block = sh_block_index(l_max)
+    sq = coeffs ** 2
+    out = np.zeros(coeffs.shape[:-1] + (l_max + 1,), dtype=coeffs.dtype)
+    for l in range(l_max + 1):
+        out[..., l] = sq[..., block == l].sum(axis=-1)
+    return out
+
+
+def _wigner_d_small(l: int, beta: float) -> np.ndarray:
+    """
+    Wigner (small) d-matrix d^l_{m'm}(beta) in the complex SH basis.
+
+    Rows and columns are ordered m = -l, ..., +l.
+    """
+    dim = 2 * l + 1
+    d = np.zeros((dim, dim))
+    c = math.cos(beta / 2.0)
+    s = math.sin(beta / 2.0)
+    for a, mp in enumerate(range(-l, l + 1)):
+        for b, m in enumerate(range(-l, l + 1)):
+            pref = math.sqrt(
+                math.factorial(l + mp) * math.factorial(l - mp)
+                * math.factorial(l + m) * math.factorial(l - m)
+            )
+            s_min = max(0, m - mp)
+            s_max = min(l + m, l - mp)
+            total = 0.0
+            for k in range(s_min, s_max + 1):
+                denom = (
+                    math.factorial(l + m - k) * math.factorial(k)
+                    * math.factorial(mp - m + k) * math.factorial(l - mp - k)
+                )
+                cpow = 2 * l + m - mp - 2 * k
+                spow = mp - m + 2 * k
+                total += ((-1) ** (k)) * (c ** cpow) * (s ** spow) / denom
+            d[a, b] = pref * total * ((-1) ** (mp - m))
+    return d
+
+
+def _wigner_D_complex(l: int, alpha: float, beta: float, gamma: float) -> np.ndarray:
+    """Complex Wigner-D matrix D^l_{m'm}(alpha, beta, gamma), m ordered -l..+l."""
+    d = _wigner_d_small(l, beta)
+    m = np.arange(-l, l + 1)
+    left = np.exp(-1j * m * alpha)[:, None]
+    right = np.exp(-1j * m * gamma)[None, :]
+    return left * d * right
+
+
+def _complex_to_real_block(l: int) -> np.ndarray:
+    """
+    Unitary matrix C (per degree l) mapping complex SH coefficients to the real
+    convention used by ``compute_sh_matrix``: r = C c, with c and r ordered m=-l..+l.
+
+    Convention (matching compute_sh_matrix, scipy CS phase absorbed):
+        r_m =  sqrt(2) * Re(c_m)          for m > 0
+        r_0 =  c_0
+        r_m =  sqrt(2) * Im(c_m)          for m < 0
+    """
+    dim = 2 * l + 1
+    C = np.zeros((dim, dim), dtype=complex)
+    inv_sqrt2 = 1.0 / math.sqrt(2.0)
+    for a, m in enumerate(range(-l, l + 1)):
+        pos = m + l       # column of c_{+|m|}
+        neg = -m + l      # column of c_{-|m|}
+        if m > 0:
+            # sqrt2 Re(c_m) = (1/sqrt2)(c_m + c_{-m}(-1)^m); conj(c_m)=(-1)^m c_{-m}
+            C[a, pos] = inv_sqrt2
+            C[a, neg] = inv_sqrt2 * ((-1) ** m)
+        elif m < 0:
+            # sqrt2 Im(c_m) = (1/(sqrt2 i))(c_m - (-1)^m c_{-m})
+            C[a, pos] = inv_sqrt2 / 1j
+            C[a, neg] = -inv_sqrt2 * ((-1) ** m) / 1j
+        else:
+            C[a, pos] = 1.0
+    return C
+
+
+def real_sh_rotation_matrix(l_max: int, alpha: float, beta: float, gamma: float) -> np.ndarray:
+    """
+    Block-diagonal real orthogonal matrix realising an SO(3) rotation (ZYZ Euler
+    angles) on real-SH coefficient vectors of length (l_max + 1)^2.
+
+    Applying this matrix to a coefficient vector is exactly the transform induced
+    by rotating the underlying field on the sphere: each degree l rotates within
+    its own (2l+1)-block, so the per-degree power p_l is preserved.
+    """
+    n = (l_max + 1) ** 2
+    R = np.zeros((n, n))
+    for l in range(l_max + 1):
+        Dc = _wigner_D_complex(l, alpha, beta, gamma)
+        C = _complex_to_real_block(l)
+        Dr = C @ Dc @ C.conj().T
+        blk = slice(l * l, (l + 1) * (l + 1))
+        R[blk, blk] = Dr.real
+    return R
+
+
+def random_real_sh_rotation(l_max: int, rng: np.random.Generator) -> np.ndarray:
+    """Real-SH rotation matrix for a uniformly random SO(3) rotation."""
+    alpha = rng.uniform(0, 2 * np.pi)
+    beta = math.acos(rng.uniform(-1, 1))
+    gamma = rng.uniform(0, 2 * np.pi)
+    return real_sh_rotation_matrix(l_max, alpha, beta, gamma)
+
+
+def wigner_3j(j1: int, j2: int, j3: int, m1: int, m2: int, m3: int) -> float:
+    """
+    Wigner 3-j symbol via the Racah formula. Returns 0 outside the selection rules.
+    """
+    if m1 + m2 + m3 != 0:
+        return 0.0
+    if not (abs(j1 - j2) <= j3 <= j1 + j2):
+        return 0.0
+    if any(abs(m) > j for m, j in [(m1, j1), (m2, j2), (m3, j3)]):
+        return 0.0
+
+    def f(n):
+        return math.factorial(n)
+
+    tri = (f(j1 + j2 - j3) * f(j1 - j2 + j3) * f(-j1 + j2 + j3)) / f(j1 + j2 + j3 + 1)
+    pref = math.sqrt(
+        tri
+        * f(j1 + m1) * f(j1 - m1) * f(j2 + m2) * f(j2 - m2)
+        * f(j3 + m3) * f(j3 - m3)
+    )
+    t_min = max(0, j2 - j3 - m1, j1 - j3 + m2)
+    t_max = min(j1 + j2 - j3, j1 - m1, j2 + m2)
+    total = 0.0
+    for t in range(t_min, t_max + 1):
+        denom = (
+            f(t) * f(j3 - j2 + t + m1) * f(j3 - j1 + t - m2)
+            * f(j1 + j2 - j3 - t) * f(j1 - t - m1) * f(j2 - t + m2)
+        )
+        total += ((-1) ** t) / denom
+    return ((-1) ** (j1 - j2 - m3)) * pref * total
+
+
+def bispectrum_terms(l_max: int, l_bisp: int) -> dict:
+    """
+    Precompute the real-basis trilinear terms of the SH bispectrum subset.
+
+    For each degree triple (l1 <= l2 <= l3 <= l_bisp) satisfying the triangle
+    inequality, the rotation-invariant scalar
+        B_{l1 l2 l3} = sum_{m1 m2 m3} (l1 l2 l3; m1 m2 m3) c_{l1 m1} c_{l2 m2} c_{l3 m3}
+    is expanded into the real-SH basis (c = C^H r), giving a real symmetric
+    trilinear form B = sum_k w_k r_{i_k} r_{j_k} r_{p_k}. Each feature is one
+    triple; terms are flattened for a single index_add over the batch.
+
+    Returns
+    -------
+    dict with arrays: feature (term -> feature index), i, j, p (real-coef global
+    indices), w (real weight), and n_features (number of triples kept).
+    """
+    cinv = {l: _complex_to_real_block(l).conj().T for l in range(l_bisp + 1)}  # [m, a]
+
+    feature, ii, jj, pp, ww = [], [], [], [], []
+    fidx = 0
+    for l1 in range(l_bisp + 1):
+        for l2 in range(l1, l_bisp + 1):
+            for l3 in range(l2, l_bisp + 1):
+                if not (abs(l1 - l2) <= l3 <= l1 + l2):
+                    continue
+                dim1, dim2, dim3 = 2 * l1 + 1, 2 * l2 + 1, 2 * l3 + 1
+                T = np.zeros((dim1, dim2, dim3), dtype=complex)
+                # c_{l,m} = sum_a cinv[l][m, a] r_{l,a}; substitute into the 3j
+                # contraction to get a real trilinear form in the real coefficients.
+                for a1, m1 in enumerate(range(-l1, l1 + 1)):
+                    for a2, m2 in enumerate(range(-l2, l2 + 1)):
+                        m3 = -(m1 + m2)
+                        if abs(m3) > l3:
+                            continue
+                        w3 = wigner_3j(l1, l2, l3, m1, m2, m3)
+                        if w3 == 0.0:
+                            continue
+                        a3 = m3 + l3
+                        T += w3 * np.multiply.outer(
+                            np.multiply.outer(cinv[l1][m1 + l1], cinv[l2][m2 + l2]),
+                            cinv[l3][a3],
+                        )
+                Tr = T.real
+                base1, base2, base3 = l1 * l1, l2 * l2, l3 * l3
+                nz = np.argwhere(np.abs(Tr) > 1e-8)
+                if len(nz) == 0:
+                    continue
+                for b1, b2, b3 in nz:
+                    feature.append(fidx)
+                    ii.append(base1 + b1)
+                    jj.append(base2 + b2)
+                    pp.append(base3 + b3)
+                    ww.append(float(Tr[b1, b2, b3]))
+                fidx += 1
+
+    return {
+        "feature": np.array(feature, dtype=np.int64),
+        "i": np.array(ii, dtype=np.int64),
+        "j": np.array(jj, dtype=np.int64),
+        "p": np.array(pp, dtype=np.int64),
+        "w": np.array(ww, dtype=np.float32),
+        "n_features": fidx,
+    }
 
 
 # ============================================================================================

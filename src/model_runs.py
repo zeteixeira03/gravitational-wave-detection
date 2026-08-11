@@ -11,6 +11,7 @@ Training cycle using preprocessed PyTorch tensor shards:
 import copy
 import sys
 import json
+import random
 import time
 from pathlib import Path
 from datetime import datetime
@@ -19,6 +20,7 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.swa_utils import AveragedModel, SWALR
 from torch.utils.data import Dataset, DataLoader
@@ -30,7 +32,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from data.g2net import is_kaggle, get_output_dir
-from models.diy_model import DIYModel
+from models.diy_model import DIYModel, SkyHeadModel
 from sky_feasibility import SkyGeometry
 from evaluation import (
     compute_confusion_values,
@@ -53,6 +55,67 @@ from visualization import (
 SEED = 426425
 torch.manual_seed(SEED)
 np.random.seed(SEED)
+
+
+def set_seed(seed: int) -> None:
+    """
+    Seed every RNG a run depends on and put cuDNN in deterministic mode.
+
+    Covers Python ``random``, NumPy, and torch (CPU + all CUDA devices). cuDNN
+    is set deterministic with autotuning off so convolutions pick a fixed
+    algorithm. ``torch.use_deterministic_algorithms(True)`` is deliberately not
+    set: several 1-D pooling/conv backward kernels lack deterministic CUDA
+    implementations and would raise on the P100. cuDNN-determinism plus full
+    seeding leaves only sub-ULP atomic-add nondeterminism, far below the
+    seed-to-seed AUC variance the analysis plan measures.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _seed_worker(worker_id: int) -> None:
+    """DataLoader worker init: seed NumPy/random from the per-worker torch seed
+    so on-the-fly augmentation is reproducible across runs."""
+    worker_seed = torch.initial_seed() % 2 ** 32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def build_model(hyperparameters: dict, n_sky_features: int, device) -> nn.Module:
+    """
+    Construct the model for a run from its config flags.
+
+    ``sky_head_only`` builds the CNN-free SkyHeadModel (sweep config 5).
+    Otherwise a DIYModel is built with the sky readout, H1/L1 merge, and
+    parameter-matching selected by config.
+    """
+    if hyperparameters.get('sky_head_only', False):
+        model = SkyHeadModel(
+            n_sky_features,
+            hidden_dim=hyperparameters.get('sky_head_hidden', 128),
+            dropout_rate=hyperparameters.get('dropout_rate', 0.5),
+        )
+    else:
+        seed = hyperparameters.get('seed', 0)
+        model = DIYModel(
+            n_channels=hyperparameters.get('n_channels', 16),
+            dropout_rate=hyperparameters.get('dropout_rate', 0.5),
+            drop_path_rate=hyperparameters.get('drop_path_rate', 0.0),
+            n_sky_features=n_sky_features,
+            sky_readout=hyperparameters.get('sky_readout', 'mlp121'),
+            h1l1_merge=hyperparameters.get('h1l1_merge', 'concat'),
+            h1l1_pool=hyperparameters.get('h1l1_pool', 'mean'),
+            match_params=hyperparameters.get('match_params', False),
+            l_max=hyperparameters.get('sky_l_max', 10),
+            l_bisp=hyperparameters.get('sky_l_bisp', 4),
+            scramble_seed=hyperparameters.get('scramble_seed', seed),
+        )
+    return model.to(device)
 
 
 # =====================================================================
@@ -287,6 +350,7 @@ def fit(
     aug_config=None,
     label_smoothing=0.0,
     checkpoint_dir=None,
+    seed=426425,
 ):
     """
     Train model by streaming shards from disk. Sky features are computed
@@ -419,9 +483,14 @@ def fit(
             data = torch.load(str(shard_path), weights_only=True)
             precomputed_sh = data.get('sh_coeffs', None)
             shard_dataset = GWTensorDataset(data['signals'], data['labels'], augment=True, sky_geometry=sky_geometry, precomputed_sh=precomputed_sh, aug_config=aug_config)
+            # reproducible-but-varying shuffle: generator seed depends on the run
+            # seed, epoch, and shard so each pass differs yet repeats across runs.
+            loader_gen = torch.Generator()
+            loader_gen.manual_seed(seed * 100003 + epoch * 997 + shard_idx)
             shard_loader = DataLoader(
                 shard_dataset, batch_size=batch_size, shuffle=True,
-                num_workers=2, pin_memory=(device.type == 'cuda')
+                num_workers=2, pin_memory=(device.type == 'cuda'),
+                worker_init_fn=_seed_worker, generator=loader_gen,
             )
 
             desc = f"Epoch {epoch+1}/{epochs}"
@@ -843,6 +912,9 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2, chec
     print("INITIALIZING 1D CNN MODEL (TENSOR MODE)")
     print("="*60)
 
+    seed = hyperparameters.get('seed', 0)
+    set_seed(seed)
+
     n_samples_config = hyperparameters.get('n_samples', 4096)
     learning_rate = hyperparameters.get('learning_rate', 0.0001)
     dropout_rate = hyperparameters.get('dropout_rate', 0.5)
@@ -855,8 +927,13 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2, chec
     drop_path_rate = hyperparameters.get('drop_path_rate', 0.0)
     sky_n_pix = hyperparameters.get('sky_n_pix', 192)
     sky_l_max = hyperparameters.get('sky_l_max', 10)
+    sky_readout = hyperparameters.get('sky_readout', 'mlp121')
+    h1l1_merge = hyperparameters.get('h1l1_merge', 'concat')
+    sky_head_only = hyperparameters.get('sky_head_only', False)
     use_mixup = hyperparameters.get('use_mixup', True)
     use_manifold_mixup = hyperparameters.get('use_manifold_mixup', False)
+    if sky_head_only and use_manifold_mixup:
+        raise ValueError("sky_head_only has no CNN pathway; disable use_manifold_mixup for this config")
     use_swa = hyperparameters.get('use_swa', False)
     swa_start_epoch = hyperparameters.get('swa_start_epoch', None)
     label_smoothing = hyperparameters.get('label_smoothing', 0.0)
@@ -880,6 +957,9 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2, chec
     print(f"Drop path rate: {drop_path_rate}")
     print(f"Label smoothing: {label_smoothing}")
     print(f"Sky: n_pix={sky_n_pix}, l_max={sky_l_max}")
+    print(f"Seed: {seed}")
+    print(f"Sky readout: {sky_readout}  H1/L1 merge: {h1l1_merge}  "
+          f"match_params: {hyperparameters.get('match_params', False)}  sky_head_only: {sky_head_only}")
     print(f"Mixup: {use_mixup}")
     print(f"Manifold mixup: {use_manifold_mixup}")
     print(f"SWA: {use_swa} (start epoch: {swa_start_epoch})")
@@ -985,11 +1065,12 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2, chec
         num_workers=0, pin_memory=(device.type == 'cuda')
     )
 
-    # initialize model
-    n_channels = hyperparameters.get('n_channels', 16)
-    model = DIYModel(n_channels=n_channels, dropout_rate=dropout_rate, drop_path_rate=drop_path_rate, n_sky_features=n_sky_features).to(device)
+    # initialize model (readout / merge / match_params selected from config)
+    model = build_model(hyperparameters, n_sky_features, device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: DIYModel ({n_params:,} parameters)")
+    cond_params = model.conditioning_param_count() if hasattr(model, 'conditioning_param_count') else 0
+    print(f"Model: {type(model).__name__} ({n_params:,} parameters, "
+          f"conditioning path {cond_params:,})")
 
     # split params: decay 2D+ weights (conv/linear matmul), skip biases,
     # norms, and any 1-D scalar (which includes GeM's learnable p).
@@ -1046,6 +1127,7 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2, chec
         aug_config=aug_config,
         label_smoothing=label_smoothing,
         checkpoint_dir=checkpoint_dir,
+        seed=seed,
     )
 
     print("\nTraining complete.")
