@@ -1048,6 +1048,18 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2, chec
         n_val = len(val_labels)
         n_train = n_samples - n_val
 
+        # optional train subsample: keep the first N shards. mmap avoids
+        # pulling ~2.5 GB per shard off disk just to count labels.
+        max_train_shards = hyperparameters.get('max_train_shards', None)
+        if max_train_shards is not None and max_train_shards < len(train_shard_paths):
+            train_shard_paths = train_shard_paths[:max_train_shards]
+            n_train = 0
+            for f in train_shard_paths:
+                data = torch.load(str(f), weights_only=True, mmap=True)
+                n_train += len(data['labels'])
+                del data
+            print(f"Train subsampled to {len(train_shard_paths)} shards ({n_train} samples)")
+
     print(f"Training shards: {len(train_shard_paths)} (streamed from disk)")
     print(f"Train samples: {n_train}")
     print(f"Val samples: {n_val}")
@@ -1388,21 +1400,26 @@ SWEEP_BASE = {
     'learning_rate': 2e-3,
     'dropout_rate': 0.5,
     'weight_decay': 1e-3,
-    'epochs': 50,
-    'early_stopping_patience': 10,
-    'warmup_epochs': 7,
+    'epochs': 20,
+    'early_stopping_patience': 4,
+    'warmup_epochs': 3,
     'aux_loss_weight': 0.0,
     'use_amp': True,
     'clip_grad_norm': 1.0,
     'drop_path_rate': 0.3,
-    'max_train_hours': 8.0,
+    'max_train_hours': 2.5,
+    # 2 shards = 100k train samples out of 410k. The sweep measures a
+    # difference between readouts, not an absolute AUC, so every config pays
+    # the same subsampling cost. Full-data runs cost ~8h each and 21 of them
+    # do not fit the GPU quota before the deadline.
+    'max_train_shards': 2,
     'sky_n_pix': 192,
     'sky_l_max': 10,
     'label_smoothing': 0.0,
     'use_mixup': False,
     'use_manifold_mixup': False,
     'use_swa': True,
-    'swa_start_epoch': 15,
+    'swa_start_epoch': 14,
     'aug_time_shift': False,
     'aug_noise': True,
     'aug_spectral_dropout': False,
@@ -1429,6 +1446,14 @@ SWEEP_CONFIGS = {
     7: ('power_symmetric_match',   {'sky_readout': 'power',      'h1l1_merge': 'symmetric', 'match_params': True}),
     8: ('bispectrum_concat_match', {'sky_readout': 'bispectrum', 'h1l1_merge': 'concat',    'match_params': True}),
 }
+
+# Config 4 is deliberately absent: its parameter count was measured identical
+# to config 2 (147,954 both), so running it would spend GPU quota reproducing
+# config 2 under a different label. The comparator reads as config 3 (power,
+# matched) vs config 2 (mlp121). Tiers run in order; Tier 1 gates the rest.
+TIER1_RUNS = [(c, s) for s in (0, 1, 2) for c in (1, 2, 3, 5)]
+TIER2_RUNS = [(c, s) for s in (0, 1, 2) for c in (6, 7)]
+TIER3_RUNS = [(c, s) for s in (0, 1, 2) for c in (8,)]
 
 
 def read_git_hash() -> str:
@@ -1497,6 +1522,12 @@ def build_run_log_row(config_id, seed, hyperparameters, results, wall_clock_s, g
     total_params = sum(p.numel() for p in model.parameters())
     cond_fn = getattr(model, 'conditioning_param_count', None)
     cond_params = cond_fn() if callable(cond_fn) else 0
+    # 'auc' is the final (SWA-averaged) model. Runs can be cut short by the
+    # wall-clock guard, which makes that number partly a function of how much
+    # GPU time the run got -- log the best epoch too so the comparison rests
+    # on a quantity the clock can't move.
+    val_auc_hist = [float(a) for a in results['history']['val_auc']]
+    best_epoch = max(range(len(val_auc_hist)), key=lambda i: val_auc_hist[i])
     return {
         'timestamp': datetime.now().isoformat(timespec='seconds'),
         'config_id': config_id,
@@ -1511,6 +1542,9 @@ def build_run_log_row(config_id, seed, hyperparameters, results, wall_clock_s, g
         'total_params': total_params,
         'conditioning_params': cond_params,
         'auc': vm['auc'],
+        'best_auc': val_auc_hist[best_epoch],
+        'best_epoch': best_epoch + 1,
+        'epochs_run': len(val_auc_hist),
         'accuracy': vm['accuracy'],
         'precision': prec,
         'recall': rec,
@@ -1561,9 +1595,14 @@ def run_sweep(run_list, log_path=None, kernel_budget_hours=8.5):
     for config_id, seed in run_list:
         elapsed_h = (time.time() - start) / 3600
         remaining = kernel_budget_hours - elapsed_h
-        if remaining < 0.75:
-            print(f"Kernel budget spent ({elapsed_h:.2f}h); leaving config {config_id} "
-                  f"seed {seed} for a later kernel.")
+        # a run must fit its full training budget plus data loading, or not
+        # start at all. Starting one that the clock will cut short produces a
+        # row whose AUC reflects the queue rather than the config.
+        needed = SWEEP_BASE['max_train_hours'] + 0.35
+        if remaining < needed:
+            print(f"Kernel budget spent ({elapsed_h:.2f}h used, {remaining:.2f}h left, "
+                  f"{needed:.2f}h needed); leaving config {config_id} seed {seed} "
+                  f"for a later kernel.")
             break
 
         name, overrides = SWEEP_CONFIGS[config_id]
@@ -1572,7 +1611,6 @@ def run_sweep(run_list, log_path=None, kernel_budget_hours=8.5):
         hp['seed'] = seed
         hp['scramble_seed'] = seed
         hp['batch_size'] = 64 if has_gpu else 32
-        hp['max_train_hours'] = min(SWEEP_BASE['max_train_hours'], remaining - 0.25)
         config_label = f"{config_id}_{name}"
 
         print("\n" + "#"*60)
@@ -1588,6 +1626,7 @@ def run_sweep(run_list, log_path=None, kernel_budget_hours=8.5):
         row = build_run_log_row(config_label, seed, hp, results, wall, git_hash)
         append_run_log(log_path, row)
         print(f"Logged {config_label} seed {seed}: AUC {row['auc']:.4f}  "
+              f"best {row['best_auc']:.4f} @ epoch {row['best_epoch']}/{row['epochs_run']}  "
               f"cond_params {row['conditioning_params']}  ({wall/3600:.2f}h)")
 
     print(f"\nSweep slice complete. Log: {log_path}")
