@@ -26,7 +26,7 @@ from pathlib import Path
 # ============================================================================
 
 # mode: 'train' full run | 'lr_test' LR range test | 'sweep' sky-readout sweep.
-MODE = "train"
+MODE = "sweep"
 
 # only used when MODE == 'sweep': (config_id, seed) pairs for THIS kernel.
 SWEEP_RUN_LIST = [(1, 0), (2, 0), (3, 0), (4, 0), (5, 0)]
