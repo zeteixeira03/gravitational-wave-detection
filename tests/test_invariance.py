@@ -125,6 +125,31 @@ def test_scramble_preserves_marginals():
     assert not torch.allclose(scr, sky)
 
 
+def test_scramble_is_fixed_across_calls_and_per_sample():
+    # the control is a per-sample permutation fixed across epochs (not a
+    # per-forward re-draw, and not a single global permutation the linear
+    # readout could absorb). two calls on the same input must match exactly;
+    # different samples must get different permutations; a different
+    # scramble_seed must give a different permutation.
+    rng = np.random.default_rng(2)
+    sky = torch.tensor(rng.standard_normal((BATCH, N_SKY)), dtype=torch.float64)
+    m = _readout("scramble", scramble_seed=0)
+    with torch.no_grad():
+        a = m._scramble(sky)
+        b = m._scramble(sky)
+    assert torch.equal(a, b), "scramble is not deterministic across calls"
+
+    # per-sample: at least two rows must carry different permutations, so the
+    # scramble is not one global permutation shared by every sample
+    order = a.argsort(dim=1)
+    assert not torch.equal(order[0], order[1]), "same permutation reused across samples"
+
+    m2 = _readout("scramble", scramble_seed=1)
+    with torch.no_grad():
+        c = m2._scramble(sky)
+    assert not torch.equal(a, c), "scramble_seed does not change the permutation"
+
+
 # ------------------------------------------------------------------ H1<->L1 swap (Z2)
 
 def _pooled(model, X):

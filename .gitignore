@@ -1,3 +1,6 @@
+# build-time provenance stamp, written just before Kaggle upload
+src/_version.txt
+
 # Virtual environments
 .venv/
 venv/

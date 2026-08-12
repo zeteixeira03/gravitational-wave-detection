@@ -1373,6 +1373,226 @@ def check_gpu():
     return torch.cuda.is_available()
 
 
+# =====================================================================
+#                         SWEEP + RUN LOGGING
+# =====================================================================
+
+# Fixed base for the NeurReps sky-readout sweep. Identical for every config;
+# only the sky-readout flags below are overridden per config. Manifold mixup is
+# OFF for the whole sweep: it cannot run on the sky-head-only config (no pooled
+# CNN features to mix), and keeping the recipe identical across all configs is
+# the integrity constraint from ANALYSIS_PLAN. See PHASE2_HANDOFF.md.
+SWEEP_BASE = {
+    'n_channels': 16,
+    'n_samples': 4096,
+    'learning_rate': 2e-3,
+    'dropout_rate': 0.5,
+    'weight_decay': 1e-3,
+    'epochs': 50,
+    'early_stopping_patience': 10,
+    'warmup_epochs': 7,
+    'aux_loss_weight': 0.0,
+    'use_amp': True,
+    'clip_grad_norm': 1.0,
+    'drop_path_rate': 0.3,
+    'max_train_hours': 8.0,
+    'sky_n_pix': 192,
+    'sky_l_max': 10,
+    'label_smoothing': 0.0,
+    'use_mixup': False,
+    'use_manifold_mixup': False,
+    'use_swa': True,
+    'swa_start_epoch': 15,
+    'aug_time_shift': False,
+    'aug_noise': True,
+    'aug_spectral_dropout': False,
+    'aug_channel_shuffle': True,
+    'aug_amplitude_scale': False,
+    'sky_readout': 'none',
+    'h1l1_merge': 'concat',
+    'h1l1_pool': 'mean',
+    'match_params': False,
+    'sky_head_only': False,
+}
+
+# Pre-registered configs (ANALYSIS_PLAN section 2). Tier 1: 1-5, Tier 2: 6-7,
+# Tier 3: 8. Config 4 is bit-identical to config 2 by construction (match_params
+# targets mlp121 @ hidden=128, so matching mlp121 to itself is a no-op) -- the
+# logged param counts make the identity explicit.
+SWEEP_CONFIGS = {
+    1: ('none_concat',             {'sky_readout': 'none',       'h1l1_merge': 'concat',    'match_params': False}),
+    2: ('mlp121_concat',           {'sky_readout': 'mlp121',     'h1l1_merge': 'concat',    'match_params': False}),
+    3: ('power_concat_match',      {'sky_readout': 'power',      'h1l1_merge': 'concat',    'match_params': True}),
+    4: ('mlp121_concat_match',     {'sky_readout': 'mlp121',     'h1l1_merge': 'concat',    'match_params': True}),
+    5: ('sky_head_only',           {'sky_head_only': True}),
+    6: ('scramble_concat',         {'sky_readout': 'scramble',   'h1l1_merge': 'concat',    'match_params': False}),
+    7: ('power_symmetric_match',   {'sky_readout': 'power',      'h1l1_merge': 'symmetric', 'match_params': True}),
+    8: ('bispectrum_concat_match', {'sky_readout': 'bispectrum', 'h1l1_merge': 'concat',    'match_params': True}),
+}
+
+
+def read_git_hash() -> str:
+    """
+    Commit hash for run provenance.
+
+    On Kaggle the code runs from the uploaded dataset with no ``.git``, so the
+    hash is stamped into ``src/_version.txt`` before upload. Locally, fall back
+    to ``git rev-parse``. Returns ``"unknown"`` if neither is available.
+    """
+    version_file = Path(__file__).parent / "_version.txt"
+    if version_file.exists():
+        return version_file.read_text().strip()
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(Path(__file__).parent),
+            stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def find_tensor_data_dir(output_dir):
+    """Locate the directory holding shard_*.pt or train.pt."""
+    candidates = [
+        Path("D:/Programming/g2net-preprocessed"),
+        output_dir / "tensors",
+        Path("/kaggle/input/g2net-preprocessed-tfrecords"),
+    ]
+    for c in candidates:
+        if c.exists() and (list(c.glob("shard_*.pt")) or (c / "train.pt").exists()):
+            return c
+    raise FileNotFoundError(
+        "Tensor data not found. Expected shard_*.pt or train.pt in one of:\n" +
+        "\n".join(f"  - {p}" for p in candidates)
+    )
+
+
+def load_n_samples(data_dir):
+    """Read sample count from metadata.json, else fall back to an estimate."""
+    metadata_path = data_dir / "metadata.json"
+    if metadata_path.exists():
+        with open(metadata_path) as f:
+            return json.load(f)['n_samples']
+    return 560000
+
+
+def append_run_log(log_path, row: dict):
+    """
+    Append one run's record as a JSONL line. Never overwrites or drops rows;
+    tables and figures are generated from this file, never hand-transcribed.
+    """
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, 'a') as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def build_run_log_row(config_id, seed, hyperparameters, results, wall_clock_s, git_hash):
+    """Assemble one sweep-log row from a finished run's results."""
+    model = results['model']
+    vm = results['val_metrics']
+    prec, rec = vm['precision'], vm['recall']
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    total_params = sum(p.numel() for p in model.parameters())
+    cond_fn = getattr(model, 'conditioning_param_count', None)
+    cond_params = cond_fn() if callable(cond_fn) else 0
+    return {
+        'timestamp': datetime.now().isoformat(timespec='seconds'),
+        'config_id': config_id,
+        'seed': seed,
+        'git_hash': git_hash,
+        'sky_readout': hyperparameters.get('sky_readout'),
+        'h1l1_merge': hyperparameters.get('h1l1_merge'),
+        'match_params': hyperparameters.get('match_params'),
+        'sky_head_only': hyperparameters.get('sky_head_only', False),
+        'sky_l_max': hyperparameters.get('sky_l_max'),
+        'scramble_seed': hyperparameters.get('scramble_seed'),
+        'total_params': total_params,
+        'conditioning_params': cond_params,
+        'auc': vm['auc'],
+        'accuracy': vm['accuracy'],
+        'precision': prec,
+        'recall': rec,
+        'specificity': vm['specificity'],
+        'f1': f1,
+        'final_train_loss': float(results['history']['train_loss'][-1]),
+        'final_val_loss': float(results['history']['val_loss'][-1]),
+        'n_train': results['n_train'],
+        'n_val': results['n_val'],
+        'wall_clock_s': round(wall_clock_s, 1),
+        'hyperparameters': hyperparameters,
+    }
+
+
+def run_sweep(run_list, log_path=None, kernel_budget_hours=8.5):
+    """
+    Run a slice of the pre-registered sweep: each (config_id, seed) pair, in order.
+
+    One row per completed run is appended to the JSONL log. Runs are never
+    dropped or selected post hoc; a run that would not finish within the
+    remaining kernel budget is left unrun (not logged) for a later kernel, so
+    two concurrent Kaggle sessions can split the work by passing disjoint lists.
+
+    Parameters
+    ----------
+    run_list : list[tuple[int, int]]
+        (config_id, seed) pairs to run in this kernel.
+    log_path : str | Path | None
+        JSONL destination. Defaults to ``<output>/sweep_results.jsonl``.
+    kernel_budget_hours : float
+        Wall-clock ceiling for the whole kernel, below Kaggle's 9h hard limit.
+    """
+    has_gpu = check_gpu()
+    output_dir = get_output_dir()
+    data_dir = find_tensor_data_dir(output_dir)
+    n_samples = load_n_samples(data_dir)
+    if log_path is None:
+        log_path = output_dir / "sweep_results.jsonl"
+    git_hash = read_git_hash()
+    models_dir = output_dir / "models" / "saved"
+
+    print(f"Data directory: {data_dir}")
+    print(f"Log: {log_path}")
+    print(f"Git hash: {git_hash}")
+    print(f"Runs this kernel: {run_list}")
+
+    start = time.time()
+    for config_id, seed in run_list:
+        elapsed_h = (time.time() - start) / 3600
+        remaining = kernel_budget_hours - elapsed_h
+        if remaining < 0.75:
+            print(f"Kernel budget spent ({elapsed_h:.2f}h); leaving config {config_id} "
+                  f"seed {seed} for a later kernel.")
+            break
+
+        name, overrides = SWEEP_CONFIGS[config_id]
+        hp = dict(SWEEP_BASE)
+        hp.update(overrides)
+        hp['seed'] = seed
+        hp['scramble_seed'] = seed
+        hp['batch_size'] = 64 if has_gpu else 32
+        hp['max_train_hours'] = min(SWEEP_BASE['max_train_hours'], remaining - 0.25)
+        config_label = f"{config_id}_{name}"
+
+        print("\n" + "#"*60)
+        print(f"SWEEP RUN  config {config_label}  seed {seed}  (budget left {remaining:.2f}h)")
+        print("#"*60)
+
+        run_start = time.time()
+        results = train_from_tensors(
+            data_dir, n_samples, hyperparameters=hp, val_split=0.2, checkpoint_dir=models_dir,
+        )
+        wall = time.time() - run_start
+
+        row = build_run_log_row(config_label, seed, hp, results, wall, git_hash)
+        append_run_log(log_path, row)
+        print(f"Logged {config_label} seed {seed}: AUC {row['auc']:.4f}  "
+              f"cond_params {row['conditioning_params']}  ({wall/3600:.2f}h)")
+
+    print(f"\nSweep slice complete. Log: {log_path}")
+
+
 def main(mode='train'):
     """
     Main execution flow for training or LR range test.
@@ -1434,38 +1654,10 @@ def main(mode='train'):
     print(f"Environment: {'Kaggle' if is_kaggle() else 'Local'}")
     print("Mode: TENSOR (preprocessed data)")
 
-    # find data directory containing shards or train.pt
-    data_dir_candidates = [
-        Path("D:/Programming/g2net-preprocessed"),
-        output_dir / "tensors",
-        Path("/kaggle/input/g2net-preprocessed-tfrecords"),
-    ]
-
-    data_dir = None
-    for candidate in data_dir_candidates:
-        if candidate.exists() and (
-            list(candidate.glob("shard_*.pt")) or (candidate / "train.pt").exists()
-        ):
-            data_dir = candidate
-            break
-
-    if data_dir is None:
-        raise FileNotFoundError(
-            "Tensor data not found. Expected shard_*.pt or train.pt in one of:\n" +
-            "\n".join(f"  - {p}" for p in data_dir_candidates)
-        )
-
+    data_dir = find_tensor_data_dir(output_dir)
     print(f"Data directory: {data_dir}")
 
-    # load metadata to get sample count
-    metadata_path = data_dir / "metadata.json"
-    if metadata_path.exists():
-        with open(metadata_path) as f:
-            metadata = json.load(f)
-        n_samples = metadata['n_samples']
-    else:
-        n_samples = 560000  # approximate if metadata missing
-
+    n_samples = load_n_samples(data_dir)
     print(f"Total samples: {n_samples}")
 
     # ========== LR RANGE TEST MODE ==========
@@ -1480,12 +1672,23 @@ def main(mode='train'):
     # checkpoint_dir is /kaggle/working/models/saved on kaggle; the kernel
     # runner commits this directory to the output bundle even when the
     # script exits with an error, so best.pt survives a late-stage crash.
+    run_start = time.time()
     results = train_from_tensors(
         data_dir,
         n_samples,
         hyperparameters=HYPERPARAMETERS,
         val_split=0.2,
         checkpoint_dir=models_dir,
+    )
+
+    # log this run to the same JSONL the sweep uses, so single runs and sweep
+    # runs share one results table
+    append_run_log(
+        output_dir / "sweep_results.jsonl",
+        build_run_log_row(
+            'single', HYPERPARAMETERS.get('seed', 0), HYPERPARAMETERS,
+            results, time.time() - run_start, read_git_hash(),
+        ),
     )
 
     # ========== SAVE RESULTS ==========

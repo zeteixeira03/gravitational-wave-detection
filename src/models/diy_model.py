@@ -175,7 +175,6 @@ class SkyReadout(nn.Module):
         self.feat_dim = feat_dim
         self.l_max = l_max
         self.scramble_seed = scramble_seed
-        self._generators: dict = {}
 
         if mode in ("power", "bispectrum"):
             self.register_buffer("block_index", torch.tensor(sh_block_index(l_max)))
@@ -215,19 +214,22 @@ class SkyReadout(nn.Module):
         return b.index_add_(1, self.bispec_feature, contrib)
 
     def _scramble(self, sky: torch.Tensor) -> torch.Tensor:
-        # independent random permutation of the coefficient vector per sample.
-        # preserves each sample's coefficient multiset (marginals) but destroys
-        # the fixed index -> (l, m) correspondence the physical structure lives in.
-        # a per-device generator seeded once keeps runs reproducible given the
-        # (seeded) data order.
-        dev = sky.device
-        if dev not in self._generators:
-            g = torch.Generator(device=dev)
-            g.manual_seed(self.scramble_seed)
-            self._generators[dev] = g
-        g = self._generators[dev]
-        noise = torch.rand(sky.shape, generator=g, device=dev)
-        perm = noise.argsort(dim=1)
+        # per-sample permutation, fixed across epochs. each sample's permutation
+        # is a deterministic hash of its own coefficient bytes and scramble_seed,
+        # so the same sample scrambles identically every epoch (unlike a
+        # per-forward re-draw), while different samples get different
+        # permutations (unlike a single global permutation, which the linear
+        # readout would absorb into fc1's weights and leave the control a no-op).
+        # preserves each sample's coefficient multiset; destroys the fixed
+        # index -> (l, m) map the physical structure lives in.
+        bits = sky.detach().float().contiguous().view(torch.int32).to(torch.int64)
+        s = torch.full((sky.shape[0],), self.scramble_seed, dtype=torch.int64, device=sky.device)
+        for d in range(bits.shape[1]):
+            s = (s ^ bits[:, d]) * 1099511628211  # FNV-1a mix, wraps in int64
+        cols = torch.arange(sky.shape[1], dtype=torch.int64, device=sky.device)
+        key = (s.unsqueeze(1) ^ cols.unsqueeze(0)) * 1099511628211
+        key = key ^ (key >> 29)
+        perm = key.argsort(dim=1)
         return torch.gather(sky, 1, perm)
 
     def _reduce(self, sky: torch.Tensor) -> torch.Tensor:
