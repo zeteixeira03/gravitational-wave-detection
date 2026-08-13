@@ -31,7 +31,7 @@ MODE = "sweep"
 # only used when MODE == 'sweep': (config_id, seed) pairs for THIS kernel.
 # measured ~1.1h per run against an 8.5h kernel budget, so 6 pairs fit and a
 # 7th is left for the next kernel. See TIER1_RUNS in model_runs.py.
-SWEEP_RUN_LIST = [(2, 2), (3, 2), (5, 2), (4, 0), (4, 1), (4, 2)]
+SWEEP_RUN_LIST = [(6, 0), (7, 0), (6, 1), (7, 1), (6, 2), (7, 2)]
 
 # find src path (handles both /gw-src-code/src and /gw-src-code layouts)
 for candidate in ["/kaggle/input/gw-src-code/src", "/kaggle/input/gw-src-code"]:
