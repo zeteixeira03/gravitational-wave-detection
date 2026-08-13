@@ -1407,7 +1407,7 @@ SWEEP_BASE = {
     'use_amp': True,
     'clip_grad_norm': 1.0,
     'drop_path_rate': 0.3,
-    'max_train_hours': 2.5,
+    'max_train_hours': 2.0,
     # 2 shards = 100k train samples out of 410k. The sweep measures a
     # difference between readouts, not an absolute AUC, so every config pays
     # the same subsampling cost. Full-data runs cost ~8h each and 21 of them

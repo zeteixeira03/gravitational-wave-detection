@@ -29,10 +29,10 @@ from pathlib import Path
 MODE = "sweep"
 
 # only used when MODE == 'sweep': (config_id, seed) pairs for THIS kernel.
-# ~2h per run against an 8.5h kernel budget, so 3 pairs fit with margin and a
-# 4th only starts if the earlier ones finish early. Config 4 is dropped
-# (identical params to config 2); see TIER1_RUNS in model_runs.py.
-SWEEP_RUN_LIST = [(1, 0), (2, 0), (3, 0)]
+# measured ~1.1h per run against an 8.5h kernel budget, so 6 pairs fit and a
+# 7th is left for the next kernel. Config 4 is dropped (identical params to
+# config 2); see TIER1_RUNS in model_runs.py.
+SWEEP_RUN_LIST = [(5, 0), (1, 1), (2, 1), (3, 1), (5, 1), (1, 2)]
 
 # find src path (handles both /gw-src-code/src and /gw-src-code layouts)
 for candidate in ["/kaggle/input/gw-src-code/src", "/kaggle/input/gw-src-code"]:
