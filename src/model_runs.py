@@ -1447,11 +1447,13 @@ SWEEP_CONFIGS = {
     8: ('bispectrum_concat_match', {'sky_readout': 'bispectrum', 'h1l1_merge': 'concat',    'match_params': True}),
 }
 
-# Config 4 is deliberately absent: its parameter count was measured identical
-# to config 2 (147,954 both), so running it would spend GPU quota reproducing
-# config 2 under a different label. The comparator reads as config 3 (power,
-# matched) vs config 2 (mlp121). Tiers run in order; Tier 1 gates the rest.
-TIER1_RUNS = [(c, s) for s in (0, 1, 2) for c in (1, 2, 3, 5)]
+# Config 4 stays in: ANALYSIS_PLAN section 2 pins the decision rule to
+# config 3 vs config 4, and 3 vs 2 is explicitly only a supporting comparison.
+# Its params are identical to config 2 by construction (147,954 both, measured
+# before any run), so each config-4 seed doubles as a determinism check on the
+# harness -- it must reproduce the config-2 row at the same seed.
+# Tiers run in order; Tier 1 gates the rest.
+TIER1_RUNS = [(c, s) for s in (0, 1, 2) for c in (1, 2, 3, 4, 5)]
 TIER2_RUNS = [(c, s) for s in (0, 1, 2) for c in (6, 7)]
 TIER3_RUNS = [(c, s) for s in (0, 1, 2) for c in (8,)]
 
