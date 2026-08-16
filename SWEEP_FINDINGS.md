@@ -103,7 +103,12 @@ tested directly. Competing explanations that were not ruled out:
 **How to challenge:** the direct test of redundancy is a probe. Train a linear readout
 on the CNN's pooled features to predict the SH coefficients. High R^2 supports
 redundancy; low R^2 kills the interpretation while leaving the empirical result intact.
-This is cheap and should be done before the interpretation appears in a paper.
+This should be done before the interpretation appears in a paper.
+
+**No sweep checkpoint survives to probe.** See section 4a. The probe needs a trained
+model per config, and the sweep kept none, so it now costs a fresh training run rather
+than being cheap. One run of config 1 at the sweep recipe (about 1 hour) is enough,
+since the question is about the CNN pathway and config 1 has no sky pathway at all.
 
 ### F3. Config 7 (Z2-symmetric H1/L1 merge) is the one positive signal, and it is confounded.
 
@@ -155,9 +160,13 @@ Every conclusion in this document holds under both metrics.
 **Confidence: 0.85** that the fragility is an artifact of checkpoint selection rather
 than a property of any config.
 
-**How to challenge:** re-derive the table from the saved per-epoch histories with a
+**How to challenge:** re-derive the table from the per-epoch histories under a
 different selection rule. If a rule exists under which the sign of F1 flips, that must
 be reported.
+
+**This challenge cannot be run on the existing data.** See section 4a. The rows carry
+`best_auc`, `best_epoch` and `epochs_run`, but not the curves. Curves survive for 2 of
+the 24 runs. Any re-analysis under a different selection rule requires re-running.
 
 ### F6. The recipe was cut mid-project for cost reasons, and the results are conditional on it.
 
@@ -215,6 +224,38 @@ that no other field is stored. It was never verified by loading a shard and prin
 
 **How to challenge:** one line in a scratch kernel. Worth doing before the paper.
 
+## 4a. Data that was lost, and what it costs
+
+Two artifacts were written to a single path per kernel and overwritten by every
+subsequent run in that kernel. `kaggle kernels output` returns only the latest kernel
+version, so earlier kernels' copies are unreachable from the CLI.
+
+**Per-epoch curves.** `history.pt` survives for 2 of 24 runs: config 3 seed 0 (last run
+of v65) and config 8 seed 2 (last run of v69). The excluded v64 run also has one. Every
+other run's curve is gone. The JSONL rows never carried the curves, only the three
+summary fields. Consequence: F5's challenge is not executable, and no alternative
+checkpoint-selection rule can be tested against the sweep as it stands.
+
+**Checkpoints.** `checkpoint_best.pt` has the same overwrite pattern, so no per-config
+trained model survives. Consequence: F2's redundancy probe cannot use sweep models.
+
+Both were fixed after the sweep finished, for future runs only:
+
+- `build_run_log_row` now embeds the full `train_loss`, `train_acc`, `val_loss`,
+  `val_acc` and `val_auc` curves in the row. Rows are append-only, so nothing can
+  overwrite them, and the JSONL becomes self-contained. Cost is about 2 KB per row.
+- `run_sweep` now writes each run to `models/saved/<config>_seed<n>/`, so checkpoints
+  and histories no longer collide.
+
+Neither fix recovers the missing 22 curves. It may be worth checking whether the Kaggle
+web UI exposes per-version output for v66, v67 and v68, which would recover 3 more
+curves (one per kernel, the last run of each). That was not attempted.
+
+**This is the main methodological weakness of the sweep.** The conclusions rest on
+summary statistics that cannot be re-derived, audited, or re-cut. A reviewer asking
+"what did the training curves look like for config 3 seed 2, the run that stopped at
+epoch 5" cannot be answered from the archive.
+
 ## 4. Process notes worth keeping
 
 - **Each kernel writes its own `sweep_results.jsonl` to `/kaggle/working`, and
@@ -243,8 +284,10 @@ both.
 
 ## 6. What a later session should do first
 
-1. The redundancy probe in F2. It is cheap and it decides whether the paper's central
-   interpretation survives.
+0. Confirm the logger fixes in section 4a are in place before launching anything. Any
+   run started under the old logger loses its curves permanently.
+1. The redundancy probe in F2. It decides whether the paper's central interpretation
+   survives, and now needs one fresh training run to produce a model to probe.
 2. The capacity-matched control in F3. Without it, config 7's story cannot be told.
 3. The l_max verification in F9. One line.
 4. More seeds on configs 3 and 4 (F1), if compute allows.
@@ -262,3 +305,9 @@ that explains them is not yet tested.
 **Critical uncertainties:** whether the redundancy interpretation is correct (F2),
 whether config 7's gain is symmetry or capacity (F3), whether any of this survives at
 full data (F6), and whether effects of 0.0005 are resolvable at n=3 seeds (F1).
+
+**Auditability:** limited. Per-epoch curves and trained checkpoints were lost for 22 of
+24 runs (section 4a), so the summary statistics in section 2 cannot be re-derived from
+anything more primitive than themselves. Two of the challenge paths written into F2 and
+F5 require new runs rather than re-analysis. The logger has been fixed, which helps only
+future work.

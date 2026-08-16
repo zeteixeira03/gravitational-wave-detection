@@ -1554,6 +1554,12 @@ def build_run_log_row(config_id, seed, hyperparameters, results, wall_clock_s, g
         'f1': f1,
         'final_train_loss': float(results['history']['train_loss'][-1]),
         'final_val_loss': float(results['history']['val_loss'][-1]),
+        # full per-epoch curves live in the row, not in history.pt: that file is
+        # written to one path per kernel and every run overwrites the previous
+        # one, so only a kernel's last run survives. Without these, re-analysis
+        # under a different checkpoint-selection rule is impossible after the fact.
+        'history': {k: [float(v) for v in results['history'][k]]
+                    for k in ('train_loss', 'train_acc', 'val_loss', 'val_acc', 'val_auc')},
         'n_train': results['n_train'],
         'n_val': results['n_val'],
         'wall_clock_s': round(wall_clock_s, 1),
@@ -1619,9 +1625,15 @@ def run_sweep(run_list, log_path=None, kernel_budget_hours=8.5):
         print(f"SWEEP RUN  config {config_label}  seed {seed}  (budget left {remaining:.2f}h)")
         print("#"*60)
 
+        # one directory per run. A shared directory means checkpoint_best.pt and
+        # history.pt are overwritten by every subsequent run, leaving only the
+        # kernel's last run recoverable -- which also makes any probe that needs
+        # a trained model impossible for every other config.
+        run_ckpt_dir = models_dir / f"{config_label}_seed{seed}"
+
         run_start = time.time()
         results = train_from_tensors(
-            data_dir, n_samples, hyperparameters=hp, val_split=0.2, checkpoint_dir=models_dir,
+            data_dir, n_samples, hyperparameters=hp, val_split=0.2, checkpoint_dir=run_ckpt_dir,
         )
         wall = time.time() - run_start
 
