@@ -48,7 +48,7 @@ of each phase. The old pipeline (`src/`, `kaggle/`) stays frozen as the baseline
    `train_<c>.npy/.csv`. Fetch with
    `kaggle kernels output zeteixeira/gwsciml-pack-subset -p data/g2net/packed`.
    Load with `gwsciml.data.io.load_packed`.
-5. Begin P0 (section 2). The first concrete task list is in section 5.
+5. Read section 5 (status and results), then continue with section 6 (next tasks).
 
 ## 1. Foundation (why the design is what it is)
 
@@ -97,19 +97,82 @@ of each phase. The old pipeline (`src/`, `kaggle/`) stays frozen as the baseline
 | 2026-10-17 | Template duration capped at 1.5 s (start frequency from the Newtonian chirp time). | A template longer than the 2 s segment wraps in the circular filter. |
 | 2026-10-17 | Orchestrator/writer split not used this session; code written and reviewed in one context. | Tool policy: subagents only on explicit user request. |
 
-## 5. P0 task list (next session)
+## 5. Status (end of session 2026-10-17)
 
-1. Confirm Kaggle access (section "Start here", step 3).
-2. Download a small, class-balanced subset of raw G2Net train files (a few thousand
-   `.npy` files plus `training_labels.csv`) to `data/` (git-ignored).
-3. `gwsciml/data/`: loader for raw samples, per-sample and average PSD (Welch),
-   whitening. Unit tests: whitened Gaussian noise has unit variance and a flat PSD.
-4. Audit notebook or script, results to `reports/P0_audit.md`:
-   per-sample PSD spread per detector; kurtosis and outlier counts (glitches);
-   class balance; signal visibility after whitening for a few positives.
-5. Record the frozen baseline: old best AUC 0.874 (no sky), sweep band 0.860-0.864
-   at the 100k recipe (`SWEEP_FINDINGS.md`). Use the same val split definition for
-   all later comparisons; write it down in this file once fixed.
-6. Then P1: template bank (`gwsciml/templates/`), with tests against analytic
-   identities (normalisation `<h|h>` = 1 after scaling; the matched-filter peak
-   recovers a template injected into white noise at the correct time and SNR).
+P0 done, P1 done, P2 (a) done; P2 (b-d) and P3 open. All numbers below come from
+`results/runs.jsonl` and the reports; nothing is hand-transcribed from elsewhere.
+
+Evaluation set for this session: the packed **val subset**, 10,000 samples
+(5,000 + 5,000, seed 0) from the fixed val split. AUC bootstrap sd ~0.004. The
+frozen baseline 0.874 was measured on the full 150k val split, so differences
+below ~0.008 are not resolved.
+
+### P0 (reports/P0_audit.md)
+- G2Net noise is **stationary Gaussian with one fixed PSD per detector**: per-bin
+  periodogram cv^2 = 1 within sampling error in all 1,961 bins (20-1000 Hz), no
+  glitches (0 of 15,000 detector-samples above 6 sigma), Gaussian kurtosis and
+  peaks, uncorrelated detectors, train and val share the noise model.
+- Lines (stationary too): 15 Hz (all), 60 Hz and 306 Hz (H1, L1), 438 Hz (V1).
+- V1 is ~1.5x less sensitive in ASD than H1/L1 above 50 Hz.
+- Consequence: the Gaussian likelihood of section 1 is *exact* for the noise; the
+  only unknowns are the signal population and waveform family.
+
+### P1 (classical detector, non-spinning IMRPhenomD bank, 944 templates, MM 0.97)
+| statistic | val AUC |
+|---|---|
+| max over (template, time) of coincident incoherent SNR^2 | 0.8167 |
+| log-sum-exp of the same (flat prior over bank and time) | 0.8224 |
+| coherent SNR^2 (sky search on top-16 templates) | 0.8215 |
+| chi-squared reweighted network SNR^2 | 0.8004 |
+
+Coherence and chi-squared do not help here: the noise is Gaussian (nothing for
+chi-squared to reject), and H1/L1 are nearly co-aligned with V1 weak, so the
+coherent projection removes little noise.
+
+### P2 (a): empirical-Bayes prior (reports/P2_report.md)
+MAP-EM on 5,000 train positives fits weights over templates (pi_j) and H1 merger-time
+bins of 50 ms (tau_b); val is scored with log sum pi_j tau_b exp(L_jb).
+
+| prior | val AUC |
+|---|---|
+| uniform | 0.8228 |
+| template only | 0.8364 |
+| time only | 0.8532 |
+| template x time | **0.8727 +- 0.0036** |
+| joint (template, time), see results/runs.jsonl | run in progress at commit time |
+
+- **A fully classical, interpretable detector (fixed GR filters + ~1k prior weights
+  fitted without labels) matches the frozen CNN (0.874).**
+- Time prior: 97.6 % of the weight at H1 merger times 1.45-1.80 s (the injection
+  window, smeared by inter-detector delays). Template prior: chirp mass ~10-35 Msun,
+  weighted median 17.3 vs 10.7 for the bank.
+- Missing-physics signal: Allen chi2_r of positives grows with SNR (1.0 at rho 8-12,
+  1.5 at 16-24, 4.2 at rho > 40), null energy too. Implied mismatch ~2-3 %, the same
+  size as the bank spacing, so discreteness and missing physics (spin, precession)
+  are not yet separated.
+
+## 6. Next tasks (in order)
+
+1. **Bigger prior fit.** The prior uses 5k train positives from a 10k subset. Run
+   P1 over a large train slice in a Kaggle CPU kernel (0.2 s/sample/2 threads; GPU
+   front end `gwsciml/models/frontend.py` is far faster) and refit pi, tau. Store
+   likelihood maps (T x 36 float32 per sample) as a private Kaggle dataset; dataset
+   downloads work through `api.kaggle.com`.
+2. **Full-val evaluation** of the P2 statistic on all 150k val samples (same kernel),
+   so the comparison with 0.874 is on the identical set.
+3. **Separate discreteness from missing physics** (P2 d): refine templates around
+   loud positives (local MM 0.995 sub-bank) and repeat the chi2-vs-rho table. If
+   chi2 stays high, add aligned spins (bank ~3,000 templates, measured) and test
+   IMRPhenomPv2/XPHM on the loudest positives.
+4. **P3 network on the likelihood map.** Input: L[j, b] (and per-detector / coherent
+   channels) from the fixed front end. The EM prior is the linear-in-exp special case
+   of the readout, so initialise the network to reproduce log sum pi tau exp(L) and
+   let it learn (i) the amplitude nonlinearity (exp(rho^2/2) assumes a flat SNR
+   prior), (ii) smooth priors over the template manifold (graph convolution on the
+   Fisher-metric kNN graph), (iii) finer time structure. Target: beat 0.874 by more
+   than the seed sd. Compute: full-bank front end ~1 s per 64-sample batch on a P100
+   (1.8 h per 410k epoch); precomputed maps avoid that cost.
+5. Kernel outputs cannot be fetched with `kaggle kernels output` from the cloud
+   session (`www.kaggleusercontent.com` is not on the network allowlist). This
+   session used the SDK's `DownloadKernelOutputZip` on the allowed `api.kaggle.com`
+   host with the kernel session id. Adding the host to the allowlist is cleaner.
