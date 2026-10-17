@@ -11,6 +11,6 @@
     "zeteixeira/g2net-preprocessed-tfrecords"
   ],
   "docker_image": "gcr.io/kaggle-private-byod/python@sha256:58f63ed194fa7d5c55181f1e8ec0be141e9211efa23bc7501c1c865f7e00057d",
-  "machine_shape": "NvidiaTeslaP100",
+  "machine_shape": "NvidiaTeslaT4",
   "enable_internet": "true"
 }

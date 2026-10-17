@@ -29,19 +29,18 @@ from pathlib import Path
 MODE = "sweep"
 
 # only used when MODE == 'sweep': (config_id, seed) pairs for THIS kernel.
-# measured ~1.1h per run against an 8.5h kernel budget, so 6 pairs fit and a
-# 7th is left for the next kernel. These are the F3 controls; see
-# F3_CONTROL_RUNS in model_runs.py and ANALYSIS_PLAN section 8.3. The weekly GPU
-# quota is 6h, so config 10 runs first (week 1) and config 9 next week.
-SWEEP_RUN_LIST = [(10, 0), (10, 1), (10, 2)]
+# With 2 GPUs the list is split round-robin, one process per GPU; a T4 run takes
+# ~0.75h. F10 moved the project to T4, so configs 3 and 7 are re-run there
+# before any F3 contrast (ANALYSIS_PLAN 8.1). Week of 2026-10-17, ~2h quota left:
+# config 7 seeds 0 and 1, one parallel round.
+SWEEP_RUN_LIST = [(7, 0), (7, 1)]
 
-# find src path (handles both /gw-src-code/src and /gw-src-code layouts)
-for candidate in ["/kaggle/input/gw-src-code/src", "/kaggle/input/gw-src-code"]:
-    if Path(candidate).exists() and (Path(candidate) / "data").exists():
-        src_path = Path(candidate)
-        break
-else:
-    raise FileNotFoundError("Cannot find src code in /kaggle/input/gw-src-code")
+# find src path by its files: kernels created after 2026-08 mount inputs below
+# /kaggle/input/datasets/..., older ones at /kaggle/input/<slug>
+hits = sorted(Path("/kaggle/input").rglob("model_runs.py"))
+if not hits:
+    raise FileNotFoundError("Cannot find model_runs.py under /kaggle/input")
+src_path = hits[0].parent
 
 print(f"Using src path: {src_path}")
 print(f"Mode: {MODE}")
@@ -52,8 +51,15 @@ sys.path.insert(0, str(src_path))
 # ============================================================================
 
 if MODE == "sweep":
-    from model_runs import run_sweep
-    run_sweep(SWEEP_RUN_LIST)
+    import torch
+    # one training process per GPU: the quota counts session hours, so two T4s
+    # halve the cost of each run (see src/parallel_sweep.py)
+    if torch.cuda.device_count() >= 2 and len(SWEEP_RUN_LIST) > 1:
+        from parallel_sweep import run_parallel
+        run_parallel(SWEEP_RUN_LIST, "/kaggle/working", n_gpu=2)
+    else:
+        from model_runs import run_sweep
+        run_sweep(SWEEP_RUN_LIST)
 else:
     from model_runs import main
     main(mode=MODE)

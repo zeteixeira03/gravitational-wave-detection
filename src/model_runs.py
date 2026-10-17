@@ -1014,20 +1014,23 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2, chec
         for f in shard_files:
             if val_count < n_val_target:
                 val_shard_paths.append(f)
-                data = torch.load(str(f), weights_only=True)
+                data = torch.load(str(f), weights_only=True, mmap=True)
                 val_count += len(data['labels'])
                 del data
             else:
                 train_shard_paths.append(f)
 
-        # load val shards into memory (small enough: ~2-3 shards = 5-7 GB)
+        # load val shards into memory (small enough: ~2-3 shards = 5-7 GB).
+        # mmap keeps the per-shard tensors in reclaimable page cache, so the
+        # concatenation below is the only anonymous copy: peak RAM is ~7.4 GB
+        # instead of ~14.8 GB, which lets two runs share one machine.
         print(f"\nLoading {len(val_shard_paths)} validation shards into memory...")
         val_signals_list = []
         val_labels_list = []
         val_sh_list = []
         for f in val_shard_paths:
             print(f"  {f.name}")
-            data = torch.load(str(f), weights_only=True)
+            data = torch.load(str(f), weights_only=True, mmap=True)
             val_signals_list.append(data['signals'])
             val_labels_list.append(data['labels'])
             if 'sh_coeffs' in data:

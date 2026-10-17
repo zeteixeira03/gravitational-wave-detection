@@ -81,7 +81,8 @@ def rows_from_log(text: str, device: str | None = None) -> list[dict]:
     'Logged' summary line; every value is then rounded to 4 decimals, which
     the row records in 'precision'.
     """
-    exact = [json.loads(line[len("ROW_JSON "):]) for line in text.splitlines() if line.startswith("ROW_JSON ")]
+    # parallel kernels prefix each child's lines with "[gpuK] "
+    exact = [json.loads(line.split("ROW_JSON ", 1)[1]) for line in text.splitlines() if "ROW_JSON " in line]
     if exact:
         return exact
     dev = device or (m.group(1) if (m := _DEVICE.search(text)) else None)
