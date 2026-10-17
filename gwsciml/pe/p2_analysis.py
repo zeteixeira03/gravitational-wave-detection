@@ -56,13 +56,13 @@ def main():
 
     # ------------------------------------------------------------- (a) empirical prior
     pos = tr.target.values == 1
-    log_pi, log_tau, trace = fit_prior(np.asarray(ltr[pos], dtype=np.float64), verbose=True)
+    log_pi, log_tau, trace = fit_prior(ltr[np.nonzero(pos)[0]], verbose=True)
     J, B = ltr.shape[1:]
     uni = (np.full(J, -np.log(J)), np.full(B, -np.log(B)))
     rows = {}
     for name, lp, lt in [("uniform", *uni), ("template prior", log_pi, uni[1]), ("time prior", uni[0], log_tau),
                          ("template x time prior", log_pi, log_tau)]:
-        s_va = log_lambda(np.asarray(lva, dtype=np.float64), lp, lt)
+        s_va = log_lambda(lva, lp, lt)
         rows[name] = auc_with_ci(va.target.values, s_va)
         if name == "template x time prior":
             va["lse_prior"] = s_va

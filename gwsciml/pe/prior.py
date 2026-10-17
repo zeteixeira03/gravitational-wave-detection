@@ -21,27 +21,44 @@ import numpy as np
 from scipy.special import logsumexp
 
 
-def log_lambda(lmap: np.ndarray, log_pi: np.ndarray, log_tau: np.ndarray) -> np.ndarray:
-    """log Lambda for maps (n, J, B)."""
-    return logsumexp(lmap + log_pi[None, :, None] + log_tau[None, None, :], axis=(1, 2))
+def log_lambda(lmap: np.ndarray, log_pi: np.ndarray, log_tau: np.ndarray, chunk: int = 1000) -> np.ndarray:
+    """log Lambda for maps (n, J, B), computed in chunks of samples."""
+    out = []
+    for s in range(0, len(lmap), chunk):
+        L = np.asarray(lmap[s:s + chunk], dtype=np.float64)
+        out.append(logsumexp(L + log_pi[None, :, None] + log_tau[None, None, :], axis=(1, 2)))
+    return np.concatenate(out)
 
 
-def fit_prior(lmap: np.ndarray, n_iter: int = 200, alpha: float = 0.1, tol: float = 1e-7, verbose: bool = False):
-    """MAP-EM for (pi, tau) on maps of positives (n, J, B). Returns log_pi, log_tau, objective trace."""
+def fit_prior(lmap: np.ndarray, n_iter: int = 500, alpha: float = 0.1, tol: float = 1e-7, verbose: bool = False):
+    """MAP-EM for (pi, tau) on maps of positives (n, J, B). Returns log_pi, log_tau, objective trace.
+
+    Implementation: A_ijb = exp(L_ijb - m_i) with m_i = max_jb L_ijb is formed once
+    (float32, values in [0, 1]). Then Lambda_i = exp(m_i) pi^T A_i tau and the EM
+    sufficient statistics are contractions of A:
+        sum_b r_ijb = pi_j (A_i tau)_j / (pi^T A_i tau),
+        sum_j r_ijb = tau_b (pi^T A_i)_b / (pi^T A_i tau).
+    """
     n, J, B = lmap.shape
-    log_pi = np.full(J, -np.log(J))
-    log_tau = np.full(B, -np.log(B))
+    m = np.empty(n)
+    A = np.empty((n, J, B), dtype=np.float32)
+    for s in range(0, n, 500):
+        L = np.asarray(lmap[s:s + 500], dtype=np.float64)
+        m[s:s + 500] = L.max(axis=(1, 2))
+        A[s:s + 500] = np.exp(L - m[s:s + 500, None, None])
+    pi = np.full(J, 1.0 / J)
+    tau = np.full(B, 1.0 / B)
     trace = []
     for it in range(n_iter):
-        lr = lmap + log_pi[None, :, None] + log_tau[None, None, :]
-        ll = logsumexp(lr, axis=(1, 2))                                   # (n,)
-        r = np.exp(lr - ll[:, None, None])                                # responsibilities
-        trace.append(float(ll.mean()))
-        pi = r.sum(axis=(0, 2)) + alpha
-        tau = r.sum(axis=(0, 1)) + alpha
-        log_pi, log_tau = np.log(pi / pi.sum()), np.log(tau / tau.sum())
-        if verbose and it % 20 == 0:
-            print(f"  EM {it}: mean log Lambda {trace[-1]:.5f}")
+        At = A @ tau.astype(np.float32)                                   # (n, J)
+        lam = At @ pi                                                     # (n,)
+        trace.append(float(np.mean(np.log(lam) + m)))
+        pA = np.einsum("j,njb->nb", pi.astype(np.float32), A)            # (n, B)
+        new_pi = pi * (At / lam[:, None]).sum(axis=0) + alpha
+        new_tau = tau * (pA / lam[:, None]).sum(axis=0) + alpha
+        pi, tau = new_pi / new_pi.sum(), new_tau / new_tau.sum()
+        if verbose and it % 50 == 0:
+            print(f"  EM {it}: mean log Lambda {trace[-1]:.5f}", flush=True)
         if it > 2 and abs(trace[-1] - trace[-2]) < tol:
             break
-    return log_pi, log_tau, trace
+    return np.log(pi), np.log(tau), trace
