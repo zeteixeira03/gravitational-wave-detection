@@ -154,6 +154,27 @@ that injection time is independent of the source, and wins. P3 should keep it.
   size as the bank spacing, so discreteness and missing physics (spin, precession)
   are not yet separated.
 
+### P3 prototype: learned readout on the likelihood map (CPU, this session)
+`gwsciml/models/readout.py`: logit = w0 + w1 LSE_jb(g(L_jb) + a_j + c_b), g monotone
+piecewise linear, initialised at the EM solution. Trained with BCE on 8k of the 10k
+train subset, early-stopped on the other 2k (train holdout), val scored once.
+
+| readout | val AUC |
+|---|---|
+| EM statistic (reference, P2) | 0.8727 +- 0.0036 |
+| learned g, EM prior frozen (11 parameters) | 0.8715 +- 0.0036 |
+| learned g + a_j + c_b (~990 parameters) | 0.8751 +- 0.0036 |
+
+- Not a resolved gain: +0.0024 is below one bootstrap sd, one seed, 10k subset.
+- Learned g has slope ~0 below L ~ 10 (the level of pure-noise cells) and rises to
+  2-2.7 above L ~ 32: BCE suppresses noise-level cells and sharpens loud ones, i.e.
+  moves the log-sum-exp towards a max. Physically: the flat-SNR-prior term
+  exp(rho^2/2) over-weights the many noise-level cells.
+- Caveat: the train holdout overlaps the positives the EM prior was fitted on.
+- Method note: an exploratory scan of fixed time windows was run on val by hand
+  (0.852-0.854 for windows inside 1.45-1.85 s). It was not logged as a result and no
+  reported number depends on it.
+
 ## 6. Next tasks (in order)
 
 1. **Bigger prior fit.** The prior uses 5k train positives from a 10k subset. Run
