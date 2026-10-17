@@ -61,7 +61,8 @@ def load_rows(log_dir) -> list[dict]:
 _EPOCH = re.compile(r"Epoch (\d+)/\d+ - Loss: ([\d.]+) - Val Loss: ([\d.]+) - Val Acc: ([\d.]+) - Val AUC: ([\d.]+)")
 _LOGGED = re.compile(r"Logged (\S+) seed (\d+): AUC ([\d.]+)\s+best ([\d.]+) @ epoch (\d+)/(\d+)\s+cond_params (\d+)\s+\(([\d.]+)h\)")
 _MODEL = re.compile(r"Model: \w+ \(([\d,]+) parameters")
-_DEVICE = re.compile(r'"device": "([^"]+)"')
+# the probe's stack report, else check_gpu's first listed GPU
+_DEVICE = re.compile(r'"device": "([^"]+)"|GPU\(s\) detected: \d+\n\s+- ([^\n]+)')
 _GIT = re.compile(r"Git hash: (\w+)|\"git_hash\": \"(\w+)\"")
 
 
@@ -85,7 +86,7 @@ def rows_from_log(text: str, device: str | None = None) -> list[dict]:
     exact = [json.loads(line.split("ROW_JSON ", 1)[1]) for line in text.splitlines() if "ROW_JSON " in line]
     if exact:
         return exact
-    dev = device or (m.group(1) if (m := _DEVICE.search(text)) else None)
+    dev = device or (next(g for g in m.groups() if g) if (m := _DEVICE.search(text)) else None)
     git = next((g for m in _GIT.finditer(text) for g in m.groups() if g), None)
     rows, curve, params = [], [], None
     for line in text.splitlines():

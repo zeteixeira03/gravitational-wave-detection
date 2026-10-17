@@ -89,6 +89,9 @@ def test_rows_from_log_fallback_and_exact():
     # a ROW_JSON line wins and is taken verbatim
     exact = {'config_id': '10_x', 'seed': 2, 'auc': 0.86123456789, 'best_auc': 0.8621}
     assert rows_from_log(text + "\nROW_JSON " + json.dumps(exact)) == [exact]
+    # logs from before the stack report name the GPU only in check_gpu's output
+    old_log = text.replace(' "device": "Tesla T4",', 'GPU(s) detected: 2\n  - Tesla T4\n  - Tesla T4')
+    assert rows_from_log(old_log)[0]['device'] == 'Tesla T4'
 
 
 def test_stacks_are_not_pooled(tmp_path):
