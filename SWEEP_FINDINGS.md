@@ -277,6 +277,19 @@ epoch 5" cannot be answered from the archive.
   `c703ac6`.
 - **`max_train_hours` 8.0 inside an 8.5h kernel budget** meant one run per kernel and
   four silent skips. The guard behaved correctly; the two constants were incompatible.
+- **(2026-10-17) The GPU quota is 6 hours per week**, read from the Kaggle quota API,
+  not 30. Each running session also *reserves* time against it. Plan each week's runs
+  against 6 hours, with margin.
+- **(2026-10-17) Pin the docker image.** Kaggle's current default image reportedly has
+  no P100 (sm_60) support. Both kernels now pin `gw-training` v69's image digest and
+  the P100 shape, so new rows share the sweep's stack. The config 1 seed 0 re-run in
+  the probe kernel tests that (ANALYSIS_PLAN 8.1).
+- **(2026-10-17) New kernels mount inputs deeper than `/kaggle/input/<slug>`.** The
+  first `gw-probe` run failed at import because of this. Source and shard discovery now
+  search `/kaggle/input` for `model_runs.py` and `shard_00.pt`.
+- **One slug per concurrent batch.** `kaggle kernels output` returns only the latest
+  version of a slug, so two batches on one slug lose the first batch's output. The
+  probe runs as `gw-probe`, the F3 controls as `gw-training`.
 
 ## 5. A correction made during the session
 
