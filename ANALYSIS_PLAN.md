@@ -254,6 +254,12 @@ use the power readout with `match_params`.
 Configs 9 and 10 run at seeds {0, 1, 2}. Configs 3 and 7 come from the existing log,
 or from re-runs if section 8.1 finds a changed stack.
 
+**Run order.** The Kaggle GPU quota is 6 hours per week (measured 2026-10-17), which
+does not fit the probe and both new configs. Week 1: the probe kernel and config 10 at
+all three seeds. These give S_4n and W_ord, which are all the "capacity, not symmetry"
+rule needs. Week 2: config 9 at all three seeds, which adds S_8n and W_inv. The
+"symmetry helps" rule is not evaluated until week 2.
+
 **Metric.** `best_auc` is primary for this section, because F5 showed that the
 val-loss-selected `auc` carries 3x to 20x more seed variance from checkpoint selection.
 `auc` is reported beside it. A claim needs the same sign on both.
