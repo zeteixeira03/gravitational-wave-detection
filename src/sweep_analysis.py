@@ -204,8 +204,9 @@ def f3_verdict(c: dict) -> str:
     def below(name):
         return all(get(name, m) and get(name, m)['mean'] < -get(name, m)['pooled_sd'] for m in METRICS)
 
-    if any(get(n, m) is None for n in ('S_4n (7 - 10)', 'W_ord (3 - 10)') for m in METRICS):
-        return "not evaluable: config 10 rows missing"
+    missing = sorted({n for n in ('S_4n (7 - 10)', 'W_ord (3 - 10)') for m in METRICS if get(n, m) is None})
+    if missing:
+        return f"not evaluable: {', '.join(missing)} need at least 2 shared seeds"
     if within('S_4n (7 - 10)') and below('W_ord (3 - 10)'):
         return "config 7's gain over 3 is capacity, not symmetry (rule fires)"
     if any(get('S_8n (9 - 3)', m) is None for m in METRICS):

@@ -55,6 +55,16 @@ def test_symmetry_waits_for_config_9(tmp_path):
     assert "config 9" in v
 
 
+def test_verdict_names_missing_contrast(tmp_path):
+    # config 3 at one seed only: W_ord cannot be formed, S_4n can
+    v = _verdict(tmp_path, {
+        3: [(0.860, 0.858)],
+        7: [(0.864, 0.863), (0.865, 0.864), (0.866, 0.865)],
+        10: [(0.8645, 0.8632), (0.8645, 0.8642), (0.8655, 0.8648)],
+    })
+    assert v.startswith("not evaluable") and "W_ord" in v and "S_4n" not in v
+
+
 def test_conflicting_duplicates_are_reported(tmp_path):
     _write(tmp_path, _rows(1, [(0.8, 0.8)]), "a.jsonl")
     _write(tmp_path, _rows(1, [(0.8, 0.7)]), "b.jsonl")
