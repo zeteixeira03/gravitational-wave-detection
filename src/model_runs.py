@@ -1093,7 +1093,10 @@ def train_from_tensors(data_dir, n_samples, hyperparameters, val_split=0.2, chec
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim <= 1 or name.endswith('.bias'):
+        # the proj H1/L1 merge is initialized to the mean and must stay free of
+        # decay, or decay alone would pull it off the symmetric starting point
+        # and confound the symmetric-vs-proj contrast.
+        if param.ndim <= 1 or name.endswith('.bias') or name.startswith('h1l1_proj'):
             no_decay_params.append(param)
         else:
             decay_params.append(param)
@@ -1445,6 +1448,13 @@ SWEEP_CONFIGS = {
     6: ('scramble_concat',         {'sky_readout': 'scramble',   'h1l1_merge': 'concat',    'match_params': False}),
     7: ('power_symmetric_match',   {'sky_readout': 'power',      'h1l1_merge': 'symmetric', 'match_params': True}),
     8: ('bispectrum_concat_match', {'sky_readout': 'bispectrum', 'h1l1_merge': 'concat',    'match_params': True}),
+    # F3 controls (SWEEP_FINDINGS F3, ANALYSIS_PLAN section 8). With configs 3
+    # and 7 they form a 2x2 over pair width (8n / 4n) and swap symmetry:
+    # 3 concat (8n, ordered), 9 sort (8n, invariant), 10 proj (4n, ordered),
+    # 7 symmetric (4n, invariant). 9 has config 3's parameter count exactly;
+    # 10 starts as the same function as 7 and may learn to break the symmetry.
+    9: ('power_sort_match',        {'sky_readout': 'power',      'h1l1_merge': 'sort',      'match_params': True}),
+    10: ('power_proj_match',       {'sky_readout': 'power',      'h1l1_merge': 'proj',      'match_params': True}),
 }
 
 # Config 4 stays in: ANALYSIS_PLAN section 2 pins the decision rule to
@@ -1456,6 +1466,7 @@ SWEEP_CONFIGS = {
 TIER1_RUNS = [(c, s) for s in (0, 1, 2) for c in (1, 2, 3, 4, 5)]
 TIER2_RUNS = [(c, s) for s in (0, 1, 2) for c in (6, 7)]
 TIER3_RUNS = [(c, s) for s in (0, 1, 2) for c in (8,)]
+F3_CONTROL_RUNS = [(c, s) for s in (0, 1, 2) for c in (9, 10)]
 
 
 def read_git_hash() -> str:
@@ -1567,6 +1578,52 @@ def build_run_log_row(config_id, seed, hyperparameters, results, wall_clock_s, g
     }
 
 
+def sweep_hyperparameters(config_id, seed, has_gpu):
+    """Full hyperparameter dict for one (config_id, seed) pair, and its label."""
+    name, overrides = SWEEP_CONFIGS[config_id]
+    hp = dict(SWEEP_BASE)
+    hp.update(overrides)
+    hp['seed'] = seed
+    hp['scramble_seed'] = seed
+    hp['batch_size'] = 64 if has_gpu else 32
+    return hp, f"{config_id}_{name}"
+
+
+def run_one(config_id, seed, data_dir, n_samples, log_path, models_dir, git_hash, has_gpu):
+    """
+    Train one (config_id, seed) pair, save its weights, and append its log row.
+
+    Returns ``(row, results)``. ``results`` holds the trained model and the
+    validation loader, for callers that probe the model after training.
+    """
+    hp, config_label = sweep_hyperparameters(config_id, seed, has_gpu)
+
+    # one directory per run. A shared directory means checkpoint_best.pt and
+    # history.pt are overwritten by every subsequent run, leaving only the
+    # kernel's last run recoverable -- which also makes any probe that needs
+    # a trained model impossible for every other config.
+    run_ckpt_dir = Path(models_dir) / f"{config_label}_seed{seed}"
+
+    run_start = time.time()
+    results = train_from_tensors(
+        data_dir, n_samples, hyperparameters=hp, val_split=0.2, checkpoint_dir=run_ckpt_dir,
+    )
+    wall = time.time() - run_start
+
+    # the final (SWA) model is the one the 'auc' column scores, and
+    # checkpoint_best.pt is the pre-SWA val-loss best, so keep the final
+    # weights too. Probes of what the pooled features encode need them.
+    run_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(results['model'].state_dict(), str(run_ckpt_dir / "final_model.pt"))
+
+    row = build_run_log_row(config_label, seed, hp, results, wall, git_hash)
+    append_run_log(log_path, row)
+    print(f"Logged {config_label} seed {seed}: AUC {row['auc']:.4f}  "
+          f"best {row['best_auc']:.4f} @ epoch {row['best_epoch']}/{row['epochs_run']}  "
+          f"cond_params {row['conditioning_params']}  ({wall/3600:.2f}h)")
+    return row, results
+
+
 def run_sweep(run_list, log_path=None, kernel_budget_hours=8.5):
     """
     Run a slice of the pre-registered sweep: each (config_id, seed) pair, in order.
@@ -1613,35 +1670,11 @@ def run_sweep(run_list, log_path=None, kernel_budget_hours=8.5):
                   f"for a later kernel.")
             break
 
-        name, overrides = SWEEP_CONFIGS[config_id]
-        hp = dict(SWEEP_BASE)
-        hp.update(overrides)
-        hp['seed'] = seed
-        hp['scramble_seed'] = seed
-        hp['batch_size'] = 64 if has_gpu else 32
-        config_label = f"{config_id}_{name}"
-
         print("\n" + "#"*60)
-        print(f"SWEEP RUN  config {config_label}  seed {seed}  (budget left {remaining:.2f}h)")
+        print(f"SWEEP RUN  config {config_id}  seed {seed}  (budget left {remaining:.2f}h)")
         print("#"*60)
-
-        # one directory per run. A shared directory means checkpoint_best.pt and
-        # history.pt are overwritten by every subsequent run, leaving only the
-        # kernel's last run recoverable -- which also makes any probe that needs
-        # a trained model impossible for every other config.
-        run_ckpt_dir = models_dir / f"{config_label}_seed{seed}"
-
-        run_start = time.time()
-        results = train_from_tensors(
-            data_dir, n_samples, hyperparameters=hp, val_split=0.2, checkpoint_dir=run_ckpt_dir,
-        )
-        wall = time.time() - run_start
-
-        row = build_run_log_row(config_label, seed, hp, results, wall, git_hash)
-        append_run_log(log_path, row)
-        print(f"Logged {config_label} seed {seed}: AUC {row['auc']:.4f}  "
-              f"best {row['best_auc']:.4f} @ epoch {row['best_epoch']}/{row['epochs_run']}  "
-              f"cond_params {row['conditioning_params']}  ({wall/3600:.2f}h)")
+        # drop the results (model + in-memory val loader) before the next run
+        run_one(config_id, seed, data_dir, n_samples, log_path, models_dir, git_hash, has_gpu)
 
     print(f"\nSweep slice complete. Log: {log_path}")
 

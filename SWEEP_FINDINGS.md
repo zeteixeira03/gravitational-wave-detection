@@ -135,6 +135,15 @@ discarding information (SO(3) via power spectrum). It is an appealing story and 
 weight-shared variant. Either isolates the factor. Until then the narrative should be
 labelled speculative in any write-up.
 
+**Correction (2026-10-17).** The confound paragraph above names the wrong mechanism.
+H1 and L1 already share extractor, backbone and branch weights in every config, so the
+symmetric merge shares nothing new. The 36% reduction comes from fusion width: concat
+stacks four 4n paths (16n channels), symmetric stacks three (12n), and the four fusion
+ResBlocks scale with the square of the width. The mean merge also discards h1 - l1. So
+config 7 differs from config 3 in symmetry, width, and information. Both suggested
+controls are now built as configs 9 (sort) and 10 (proj), forming a 2x2 with configs 3
+and 7. Design and decision rules: `ANALYSIS_PLAN.md` section 8.3.
+
 ### F4. The first kernel's config-1 row is not comparable and was discarded.
 
 Kernel v64 ran config 1 seed 0 on 410k samples for 23 epochs and reported AUC 0.8669

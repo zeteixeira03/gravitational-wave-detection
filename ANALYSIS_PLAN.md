@@ -167,3 +167,110 @@ The sky-head-alone and scramble configurations are cheap and should be run regar
 - **19 to 21 Aug:** write. Sections 3 and 4 first, since they largely exist. Introduction last.
 - **21 to 22 Aug:** external reader. Anonymise. Check the page limit against the correct definition.
 - **22 Aug:** submit. A full day early, because submission systems fall over on deadline day.
+
+---
+
+## 8. Follow-up pre-registration (2026-10-17)
+
+Written and committed before any run below started. It covers the first three items of
+SWEEP_FINDINGS section 6: the F2 redundancy probe, the F3 capacity control, and the F9
+shard check. Every run uses the sweep recipe (`SWEEP_BASE`) unchanged.
+
+### 8.1 Instrument check
+
+The 24 sweep rows ran on Kaggle P100 under one docker image. A Kaggle notebook from
+another project (October 2026) records that the current default image's torch build
+carries no sm_60 (P100) kernels. So an unpinned run would change the hardware, the
+software stack, or both. Both kernels below pin the docker image of `gw-training` v69
+(`sha256:58f63ed1...`) and the P100 machine shape.
+
+The probe kernel re-runs config 1 seed 0. The harness is deterministic (F7), so on an
+unchanged stack the row must reproduce the logged one (v65): `auc` 0.863110875492951,
+`best_auc` 0.864665029661324, best epoch 7 of 12.
+
+- **Match to 1e-8 on both metrics:** stack unchanged. New rows are compared directly
+  with the 24 logged rows.
+- **No match:** stack changed. The size of the shift is reported. No contrast between a
+  new row and an old row is reported as a finding. Configs 3 and 7 are re-run on the new
+  stack before any section 8.3 contrast is computed.
+
+### 8.2 F2 redundancy probe
+
+**Model.** Config 1 seed 0 (no sky pathway), the final SWA model.
+
+**Data.** The 150k validation split, which the model never trained on, cut into two
+fixed random halves (seed 0). Readouts are fit on the first half and scored on the
+second.
+
+**Symbols.** z: the 512-dim pooled CNN feature vector (the classifier input). a: the 121
+SH coefficients. p: the 11-value angular power spectrum of a. y: the label.
+
+**Primary measurement: redundancy for the label.** L2 logistic readouts, standardized
+inputs, C from {0.01, 0.1, 1} by 3-fold CV on the fit half (the same grid for every
+feature set). dAUC = AUC(z+a+p) - AUC(z) on the eval half, with a 95% paired bootstrap CI
+(1000 resamples).
+
+- **CI lower bound > 0:** a carries label information that z lacks. The redundancy
+  interpretation in F2 is rejected. The flat sweep is then a failure of the conditioning
+  pathway to use information that exists (F2 competing explanation 1).
+- **CI upper bound < 0.002:** redundancy supported, for linear readouts of z and a.
+- **Otherwise:** inconclusive.
+
+**Secondary measurement: encoding (descriptive, no decision rule).** Ridge R^2 of each
+standardized a_lm from z, averaged per degree l, on the eval half. Two baselines:
+z from the same network at its random initialization, and y alone. "The CNN encodes
+degree l" is stated only if the trained R^2 for l exceeds both baselines by at least 0.1.
+R^2 is also reported separately on noise-only and signal eval samples.
+
+**Limits stated in advance.** Linear readouts only, so information in a that only a
+non-linear readout can use is not tested beyond p. One model, one seed. A low R^2 does
+not by itself contradict redundancy: the CNN has no reason to encode the parts of a
+that do not predict y.
+
+### 8.3 F3 factorial: symmetry or capacity
+
+**Correction to F3 first.** F3 attributes config 7's 36% parameter reduction to weight
+sharing between H1 and L1. That is not the mechanism. H1 and L1 share the extractor,
+backbone and branch weights in every config. The reduction comes from the fusion width:
+concat stacks four 4n paths (16n = 256 channels), symmetric stacks three (12n = 192), and
+the four fusion ResBlocks scale with the square of the width. The symmetric mean also
+discards the antisymmetric part h1 - l1. So config 7 differs from config 3 in symmetry,
+in width, and in information.
+
+**Design.** Two new configs complete a 2x2 over pair width and swap symmetry. All four
+use the power readout with `match_params`.
+
+| pair width | ordered | swap-invariant |
+|---|---|---|
+| 8n (fused 16n) | 3: concat [h1, l1] | 9: sort, elementwise [min, max] |
+| 4n (fused 12n) | 10: proj, learned 1x1 conv [h1, l1] -> 4n | 7: symmetric mean |
+
+- Config 9 has exactly config 3's parameter count. min and max are symmetric functions,
+  so the merge is exactly swap-invariant, and it keeps |h1 - l1| per channel.
+- Config 10 is initialized to 0.5 (h1 + l1), registered after every shared module, and
+  kept out of weight decay. At the same seed it starts as the same function as config 7.
+  The only difference is that its merge weights may learn to break the symmetry.
+
+Configs 9 and 10 run at seeds {0, 1, 2}. Configs 3 and 7 come from the existing log,
+or from re-runs if section 8.1 finds a changed stack.
+
+**Metric.** `best_auc` is primary for this section, because F5 showed that the
+val-loss-selected `auc` carries 3x to 20x more seed variance from checkpoint selection.
+`auc` is reported beside it. A claim needs the same sign on both.
+
+**Contrasts,** paired by seed, each with pooled sd = sqrt((s_x^2 + s_y^2) / 2):
+
+- S_4n = 7 - 10: symmetry at 4n width, same starting function. **The primary F3 contrast.**
+- S_8n = 9 - 3: symmetry at 8n width, same parameter count.
+- W_ord = 3 - 10 and W_inv = 9 - 7: pair width, within each symmetry column.
+
+**Decision rules.**
+
+- **Symmetry helps:** S_4n > pooled sd and S_8n > pooled sd.
+- **Config 7's gain over 3 is capacity, not symmetry:** |S_4n| <= pooled sd and
+  W_ord < -pooled sd (config 10 beats config 3).
+- **Any other pattern:** reported as observed, with no causal reading.
+
+**Limits stated in advance.** n = 3 seeds resolves a sign, not an effect size of 0.0005
+(F1). The 8n/4n axis changes both downstream capacity and the information that reaches
+fusion, so the width contrasts do not separate those two.

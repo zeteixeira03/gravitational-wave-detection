@@ -10,8 +10,11 @@ Claims tested:
   sky map (applied as the exact real-SH block rotation), to numerical tolerance.
 - ``mlp121`` and ``scramble`` readouts DO change under the same rotation.
 - ``scramble`` preserves each sample's coefficient multiset (marginals).
-- The ``symmetric`` merge is exactly invariant under swapping the H1 and L1 input
-  channels; the ``concat`` merge is not.
+- The ``symmetric`` and ``sort`` merges are exactly invariant under swapping the
+  H1 and L1 input channels; the ``concat`` and ``proj`` merges are not (``proj``
+  only after its weights leave the mean initialization).
+- The F3 factorial is built as claimed: ``sort`` has exactly ``concat``'s
+  parameter count, and ``proj`` starts as the same function as ``symmetric``.
 - ``match_params`` equalizes the conditioning-path parameter count across readouts.
 """
 
@@ -174,6 +177,60 @@ def test_symmetric_merge_invariant_to_h1l1_swap():
         p, ps = _pooled(model, X), _pooled(model, X_swap)
         assert torch.allclose(p, ps, atol=1e-5), \
             f"symmetric/{pool} pooled features changed under H1<->L1 swap (max {abs(p - ps).max():.2e})"
+
+
+def test_sort_merge_invariant_to_h1l1_swap():
+    torch.manual_seed(0)
+    X = torch.randn(BATCH, 3, 4096)
+    model = DIYModel(n_channels=4, n_sky_features=N_SKY, sky_readout="none", h1l1_merge="sort").eval()
+    p, ps = _pooled(model, X), _pooled(model, X[:, [1, 0, 2], :])
+    assert torch.allclose(p, ps, atol=1e-5), \
+        f"sort pooled features changed under H1<->L1 swap (max {abs(p - ps).max():.2e})"
+
+
+def test_proj_merge_starts_as_symmetric_mean():
+    # same seed, same registration order for every shared module: proj at init
+    # must compute the same pooled features as symmetric/mean, so the two configs
+    # start from one point and differ only in whether the merge may move.
+    torch.manual_seed(0)
+    X = torch.randn(BATCH, 3, 4096)
+    models, next_draw = {}, {}
+    for merge in ("symmetric", "proj"):
+        torch.manual_seed(1)
+        models[merge] = DIYModel(n_channels=4, n_sky_features=N_SKY, sky_readout="none",
+                                 h1l1_merge=merge, h1l1_pool="mean").eval()
+        next_draw[merge] = torch.rand(1)
+    # building proj must not advance the global RNG, or training noise diverges
+    assert torch.equal(next_draw["symmetric"], next_draw["proj"])
+    p_sym, p_proj = _pooled(models["symmetric"], X), _pooled(models["proj"], X)
+    assert torch.allclose(p_sym, p_proj, atol=1e-5), \
+        f"proj at init differs from symmetric/mean (max {abs(p_sym - p_proj).max():.2e})"
+
+
+def test_proj_merge_can_break_swap_symmetry():
+    # with weights moved off the mean (H1 and L1 columns no longer equal) the
+    # merge is ordered, so the constraint really is lifted
+    torch.manual_seed(0)
+    X = torch.randn(BATCH, 3, 4096)
+    model = DIYModel(n_channels=4, n_sky_features=N_SKY, sky_readout="none", h1l1_merge="proj").eval()
+    with torch.no_grad():
+        for proj in (model.h1l1_proj_feat, model.h1l1_proj_branch):
+            proj.weight.add_(0.3 * torch.randn_like(proj.weight))
+    p, ps = _pooled(model, X), _pooled(model, X[:, [1, 0, 2], :])
+    assert not torch.allclose(p, ps, atol=1e-6), "proj merge stayed swap-invariant after perturbation"
+
+
+@pytest.mark.parametrize("readout", ["none", "power"])
+def test_factorial_parameter_counts(readout):
+    # sort keeps concat's channel layout, so the counts must be equal, not close;
+    # proj adds exactly two (8n -> 4n) 1x1 convs to symmetric.
+    n = 16
+    def count(merge):
+        m = DIYModel(n_channels=n, n_sky_features=N_SKY, sky_readout=readout,
+                     h1l1_merge=merge, match_params=readout != "none")
+        return sum(p.numel() for p in m.parameters())
+    assert count("sort") == count("concat")
+    assert count("proj") - count("symmetric") == 2 * (8 * n * 4 * n + 4 * n)
 
 
 def test_concat_merge_changes_under_h1l1_swap():
