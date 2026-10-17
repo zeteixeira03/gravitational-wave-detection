@@ -139,7 +139,10 @@ bins of 50 ms (tau_b); val is scored with log sum pi_j tau_b exp(L_jb).
 | template only | 0.8364 |
 | time only | 0.8532 |
 | template x time | **0.8727 +- 0.0036** |
-| joint (template, time), see results/runs.jsonl | run in progress at commit time |
+| joint pi_jb, no product form (alpha 0.1 / 1 / 10) | 0.8559 / 0.8355 / 0.8250 |
+
+The joint prior (34k weights from 5k positives) overfits; the product form encodes
+that injection time is independent of the source, and wins. P3 should keep it.
 
 - **A fully classical, interpretable detector (fixed GR filters + ~1k prior weights
   fitted without labels) matches the frozen CNN (0.874).**

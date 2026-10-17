@@ -13,6 +13,9 @@ EM: 71 iterations, mean log Lambda on train positives 63.8961 -> 65.8843.
 | log Lambda, template prior | 0.8364 | 0.0041 |
 | log Lambda, time prior | 0.8532 | 0.0039 |
 | log Lambda, template x time prior | 0.8727 | 0.0036 |
+| log Lambda, joint template-time prior, alpha 0.1 | 0.8559 | 0.0038 |
+| log Lambda, joint template-time prior, alpha 1 | 0.8355 | 0.0041 |
+| log Lambda, joint template-time prior, alpha 10 | 0.8250 | 0.0043 |
 | P1 inc_max | 0.8167 | 0.0045 |
 | P1 inc_lse | 0.8224 | 0.0043 |
 | P1 coh_max | 0.8215 | 0.0043 |
