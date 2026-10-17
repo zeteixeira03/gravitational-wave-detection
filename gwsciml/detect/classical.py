@@ -25,6 +25,8 @@ Step 5  Allen chi-squared per detector at its peak: split the template into p
 
 Returned per sample: a dict of scalar statistics and the maximum-likelihood
 point estimate (template index, H1 merger time, sky index) for P2.
+Optionally also a likelihood map L[j, b] = log mean_{t in bin b} exp(rho2_inc_j(t) / 2)
+over templates j and H1-merger-time bins b; P2 fits prior weights on it.
 """
 
 from dataclasses import dataclass
@@ -51,6 +53,7 @@ class DetectorConfig:
     n_sky: int = 1000
     chisq_bins: int = 8
     template_chunk: int = 128
+    time_bin: float = 0.05          # width of the time bins of the likelihood map [s]
 
 
 class ClassicalDetector:
@@ -141,19 +144,32 @@ class ClassicalDetector:
         return out
 
     # ------------------------------------------------------------------ per sample
+    @property
+    def n_time_bins(self) -> int:
+        return int(np.ceil((self.j_hi - self.j_lo) / (self.cfg.time_bin * FS)))
+
     @torch.no_grad()
-    def statistics(self, x: np.ndarray) -> dict:
+    def statistics(self, x: np.ndarray, return_map: bool = False):
         dw = self.whiten(x)
         T = self.hw.shape[1]
         best_inc = torch.empty(T)
         best_j = torch.empty(T, dtype=torch.long)
         lse_parts = []
+        n_b, w_b = self.n_time_bins, int(round(self.cfg.time_bin * FS))
+        lmap = torch.empty(T, n_b, dtype=torch.float32) if return_map else None
         for s in range(0, T, self.cfg.template_chunk):
             sl = slice(s, min(T, s + self.cfg.template_chunk))
             inc = self.incoherent(self.snr_series(dw, sl))                  # (t, J)
             m, j = inc.max(dim=-1)
             best_inc[sl], best_j[sl] = m, j + self.j_lo
-            lse_parts.append(torch.logsumexp(inc.double() / 2, dim=-1))
+            half = inc.double() / 2
+            lse_parts.append(torch.logsumexp(half, dim=-1))
+            if return_map:
+                pad = n_b * w_b - half.shape[-1]
+                hp = F.pad(half, (0, pad), value=-np.inf).reshape(half.shape[0], n_b, w_b)
+                counts = torch.full((n_b,), float(w_b), dtype=torch.float64)
+                counts[-1] = w_b - pad
+                lmap[sl] = (torch.logsumexp(hp, dim=-1) - torch.log(counts)).float()
         lse_t = torch.cat(lse_parts)                                        # per template, over time
         out = {
             "inc_max": float(best_inc.max()),
@@ -180,4 +196,4 @@ class ClassicalDetector:
         out.update({f"chi2r_{d}": cs[k][1] for k, d in enumerate("HLV")})
         out["rw_net2"] = sum(c[2] ** 2 for c in cs)
         out["inc_best_tmpl"] = float(best_inc[tmpl])
-        return out
+        return (out, lmap.numpy()) if return_map else out

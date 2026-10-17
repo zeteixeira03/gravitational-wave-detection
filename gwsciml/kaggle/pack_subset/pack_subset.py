@@ -9,6 +9,9 @@ train = rows 150,000..559,999. Each output chunk holds raw float64 strain with
 shape (n, 3, 4096) and a CSV with the ids and targets in the same order.
 """
 
+import glob
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +22,9 @@ N_PER_CLASS = 5000
 CHUNK = 5000
 SEED = 0
 
-root = next(p.parent for p in Path("/kaggle/input").rglob("training_labels.csv"))
+# depth-limited lookup: a recursive walk of the mount visits ~786k files
+root = Path(sorted(glob.glob("/kaggle/input/*/training_labels.csv")
+                   + glob.glob("/kaggle/input/*/*/training_labels.csv"))[0]).parent
 print("competition root:", root)
 df = pd.read_csv(root / "training_labels.csv")
 df["split"] = np.where(np.arange(len(df)) < N_VAL_ROWS, "val", "train")
@@ -35,10 +40,10 @@ for split in ("val", "train"):
     sub = pd.concat(parts).sort_values("id").reset_index(drop=True)
     for c, start in enumerate(range(0, len(sub), CHUNK)):
         rows = sub.iloc[start:start + CHUNK]
-        x = np.empty((len(rows), 3, 4096), dtype=np.float64)
-        for i, sid in enumerate(rows["id"]):
-            x[i] = np.load(root / "train" / sid[0] / sid[1] / sid[2] / f"{sid}.npy")
+        paths = [root / "train" / s[0] / s[1] / s[2] / f"{s}.npy" for s in rows["id"]]
+        with ThreadPoolExecutor(32) as ex:  # the input mount is latency-bound
+            x = np.stack(list(ex.map(np.load, paths)))
         np.save(out / f"{split}_{c}.npy", x)
         rows[["id", "target"]].to_csv(out / f"{split}_{c}.csv", index=False)
-        print(split, c, x.shape, flush=True)
+        print(time.strftime("%H:%M:%S"), split, c, x.shape, x.dtype, flush=True)
 print("done")

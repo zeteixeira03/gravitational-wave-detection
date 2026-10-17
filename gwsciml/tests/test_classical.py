@@ -90,3 +90,17 @@ def test_high_snr_timing(setup):
     true_dt = net.delays[sky] - net.delays[sky, 0]
     assert s["t_h1"] == pytest.approx(t_h1, abs=0.0015)
     assert s["dt_L"] == pytest.approx(true_dt[1], abs=0.0015)
+
+
+def test_likelihood_map_consistent_with_lse(setup):
+    # logsumexp over the map (bin widths as weights) reproduces the global inc_lse
+    det, psds_true, _ = setup
+    x = np.stack([colored_noise(p, 1, RNG)[0] for p in psds_true])
+    st, lmap = det.statistics(x, return_map=True)
+    w_b = int(round(det.cfg.time_bin * FS))
+    n_t = det.j_hi - det.j_lo
+    counts = np.full(det.n_time_bins, w_b, dtype=float)
+    counts[-1] = n_t - w_b * (det.n_time_bins - 1)
+    from scipy.special import logsumexp
+    total = logsumexp(lmap.astype(float) + np.log(counts)) - np.log(lmap.shape[0] * n_t)
+    assert total == pytest.approx(st["inc_lse"], abs=1e-3)
