@@ -22,7 +22,7 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score
 
 from gwsciml.detect.run_p1 import auc_with_ci
-from gwsciml.pe.prior import fit_prior, log_lambda
+from gwsciml.pe.prior import fit_joint_prior, fit_prior, log_lambda, log_lambda_joint
 from gwsciml.templates.waveforms import chirp_mass
 
 
@@ -66,6 +66,9 @@ def main():
         rows[name] = auc_with_ci(va.target.values, s_va)
         if name == "template x time prior":
             va["lse_prior"] = s_va
+    for a in (0.1, 1.0, 10.0):
+        log_pj, _ = fit_joint_prior(ltr[np.nonzero(pos)[0]], alpha=a)
+        rows[f"joint template-time prior, alpha {a:g}"] = auc_with_ci(va.target.values, log_lambda_joint(lva, log_pj))
     say("## (a) Empirical-Bayes prior (EM on train positives)")
     say()
     say(f"EM: {len(trace)} iterations, mean log Lambda on train positives {trace[0]:.4f} -> {trace[-1]:.4f}.")

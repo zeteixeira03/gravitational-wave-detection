@@ -16,8 +16,21 @@ def test_em_recovers_weights_and_increases_objective():
     b = rng.choice(B, n, p=tau)
     lmap[np.arange(n), j, b] += 12.0
     log_pi, log_tau, trace = fit_prior(lmap, alpha=0.0)
-    assert np.all(np.diff(trace) > -1e-9)                      # EM never decreases the objective
+    assert np.all(np.diff(trace) > -1e-6)  # EM never decreases it (up to float32 rounding of A)
     np.testing.assert_allclose(np.exp(log_pi), pi, atol=0.03)
     np.testing.assert_allclose(np.exp(log_tau), tau, atol=0.03)
     uniform = log_lambda(lmap, np.full(J, -np.log(J)), np.full(B, -np.log(B))).mean()
     assert log_lambda(lmap, log_pi, log_tau).mean() > uniform
+
+
+def test_joint_em_recovers_product_weights():
+    from gwsciml.pe.prior import fit_joint_prior
+    rng = np.random.default_rng(1)
+    J, B, n = 5, 3, 6000
+    pi = np.array([0.4, 0.3, 0.1, 0.1, 0.1])
+    tau = np.array([0.2, 0.2, 0.6])
+    lmap = rng.normal(0, 1, (n, J, B))
+    lmap[np.arange(n), rng.choice(J, n, p=pi), rng.choice(B, n, p=tau)] += 12.0
+    log_pj, trace = fit_joint_prior(lmap, alpha=0.0)
+    assert np.all(np.diff(trace) > -1e-6)  # up to float32 rounding of A
+    np.testing.assert_allclose(np.exp(log_pj), np.outer(pi, tau), atol=0.02)

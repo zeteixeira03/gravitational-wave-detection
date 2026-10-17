@@ -62,3 +62,37 @@ def fit_prior(lmap: np.ndarray, n_iter: int = 500, alpha: float = 0.1, tol: floa
         if it > 2 and abs(trace[-1] - trace[-2]) < tol:
             break
     return np.log(pi), np.log(tau), trace
+
+
+def fit_joint_prior(lmap: np.ndarray, n_iter: int = 500, alpha: float = 0.1, tol: float = 1e-7):
+    """MAP-EM for a joint weight pi_jb (no product assumption). Returns log_pi (J, B), trace.
+
+    Same one-time tensor A_ijb = exp(L_ijb - m_i) as fit_prior; the M-step is
+    pi_jb <- pi_jb sum_i A_ijb / Lambda_i + alpha, normalised. J x B parameters, so
+    alpha matters more here than for the product prior.
+    """
+    n, J, B = lmap.shape
+    m = np.empty(n)
+    A = np.empty((n, J * B), dtype=np.float32)
+    for s in range(0, n, 500):
+        L = np.asarray(lmap[s:s + 500], dtype=np.float64).reshape(-1, J * B)
+        m[s:s + 500] = L.max(axis=1)
+        A[s:s + 500] = np.exp(L - m[s:s + 500, None])
+    pi = np.full(J * B, 1.0 / (J * B))
+    trace = []
+    for _ in range(n_iter):
+        lam = A @ pi.astype(np.float32)
+        trace.append(float(np.mean(np.log(lam) + m)))
+        new = pi * ((1.0 / lam) @ A) + alpha
+        pi = new / new.sum()
+        if len(trace) > 2 and abs(trace[-1] - trace[-2]) < tol:
+            break
+    return np.log(pi).reshape(J, B), trace
+
+
+def log_lambda_joint(lmap: np.ndarray, log_pi: np.ndarray, chunk: int = 1000) -> np.ndarray:
+    out = []
+    for s in range(0, len(lmap), chunk):
+        L = np.asarray(lmap[s:s + chunk], dtype=np.float64)
+        out.append(logsumexp(L + log_pi[None], axis=(1, 2)))
+    return np.concatenate(out)
