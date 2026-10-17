@@ -1500,6 +1500,13 @@ def find_tensor_data_dir(output_dir):
     for c in candidates:
         if c.exists() and (list(c.glob("shard_*.pt")) or (c / "train.pt").exists()):
             return c
+    # kernels created after 2026-08 mount inputs below /kaggle/input at a
+    # deeper path than the fixed candidate above, so search for the shards
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.exists():
+        hits = sorted(kaggle_input.rglob("shard_00.pt"))
+        if hits:
+            return hits[0].parent
     raise FileNotFoundError(
         "Tensor data not found. Expected shard_*.pt or train.pt in one of:\n" +
         "\n".join(f"  - {p}" for p in candidates)

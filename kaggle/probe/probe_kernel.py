@@ -14,12 +14,14 @@ this row must reproduce the logged one.
 import sys
 from pathlib import Path
 
-for candidate in ["/kaggle/input/gw-src-code/src", "/kaggle/input/gw-src-code"]:
-    if Path(candidate).exists() and (Path(candidate) / "data").exists():
-        src_path = Path(candidate)
-        break
-else:
-    raise FileNotFoundError("Cannot find src code in /kaggle/input/gw-src-code")
+# new kernels mount inputs at a deeper path than gw-training's
+# /kaggle/input/gw-src-code, so find the source by its files
+hits = sorted(Path("/kaggle/input").rglob("model_runs.py"))
+if not hits:
+    for p in sorted(Path("/kaggle/input").rglob("*"))[:50]:
+        print(p)
+    raise FileNotFoundError("Cannot find model_runs.py under /kaggle/input")
+src_path = hits[0].parent
 
 print(f"Using src path: {src_path}")
 sys.path.insert(0, str(src_path))
