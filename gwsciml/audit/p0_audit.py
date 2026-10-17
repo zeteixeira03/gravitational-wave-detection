@@ -168,6 +168,38 @@ def main():
     say("![PSD spread](figures/p0_psd_spread.png)")
     say()
 
+    # per-bin test: periodogram of stationary Gaussian noise is chi2(2)/2 x S, so its squared
+    # coefficient of variation cv^2 = var/mean^2 is 1 in every bin, whatever the PSD shape.
+    from scipy.ndimage import median_filter
+    Pn = periodogram_psd(neg_tr[:3000], w)
+    cv2 = Pn.var(axis=0) / Pn.mean(axis=0) ** 2
+    sel = (f >= 20) & (f <= 1000)
+    n_cv = len(Pn)
+    say("### 3b. Per-frequency-bin test and spectral lines")
+    say()
+    say("A bin-resolved test avoids band averaging. For stationary Gaussian noise the periodogram")
+    say(f"in each bin is S_k x chi2(2)/2, so cv^2 = var/mean^2 = 1 (sampling sd sqrt(8/n) = {np.sqrt(8 / n_cv):.3f}")
+    say(f"for n = {n_cv}). Over the {sel.sum()} bins in 20-1000 Hz:")
+    say()
+    say("| detector | median cv^2 | max cv^2 | expected max (H0, approx.) |")
+    say("|---|---|---|---|")
+    for k, d in enumerate(DETECTORS):
+        say(f"| {d} | {np.median(cv2[k, sel]):.3f} | {cv2[k, sel].max():.3f} | {1 + 3.5 * np.sqrt(8 / n_cv):.3f} |")
+    say()
+    say("Spectral lines (average PSD > 3x its 20 Hz running median, 15-1000 Hz), with cv^2 in that bin:")
+    say()
+    say("| detector | lines: frequency [Hz] (height, cv^2) |")
+    say("|---|---|")
+    for k, d in enumerate(DETECTORS):
+        r = psd_avg[k] / median_filter(psd_avg[k], 41)
+        idx = np.nonzero((r > 3) & (f >= 15) & (f <= 1000))[0]
+        say(f"| {d} | " + ", ".join(f"{f[i]:g} ({r[i]:.0f}x, {cv2[k, i]:.2f})" for i in idx) + " |")
+    say()
+    say("Reading: the band-level excess in 160-320 Hz (H1, L1) in the table above comes from the")
+    say("306 Hz line dominating the Welch band average; the bin-resolved cv^2 shows no bin, line")
+    say("bins included, whose power varies more than stationary Gaussian noise allows.")
+    say()
+
     # ---------------------------------------------------------------- Gaussianity
     y = whitened_flat(neg_tr, psd_avg[None], w)
     kurt, mx = gaussianity(y)
