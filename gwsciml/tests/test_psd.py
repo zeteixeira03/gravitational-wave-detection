@@ -44,8 +44,8 @@ def test_whitened_noise_unit_variance_and_flat():
 
 
 def test_short_taper_leaks_low_frequency_power():
-    # Documents why the default window is Tukey(0.5): with alpha = 0.1 the 12 Hz bump
-    # leaks into 20-30 Hz and inflates the whitened power there by more than 20 %.
+    # With alpha = 0.1 the 12 Hz bump leaks into 20-30 Hz and inflates the whitened
+    # power there by more than 20 % (whitening with the true, leakage-free PSD).
     S = g2net_like_psd()
     x = colored_noise(S, 1000, RNG)
     w = tukey(N, 0.1)
@@ -72,3 +72,29 @@ def test_inner_product_matches_continuum_definition():
     Aw, Bw = whiten_fd(a, S, w), whiten_fd(b, S, w)
     disc = (2.0 / N) * np.real(np.sum(Aw * np.conj(Bw)))
     assert disc == pytest.approx(cont, rel=1e-12)
+
+
+def snr_efficiency(window, t_merge, noise):
+    """Matched-filter SNR at the true time / noise sd there, relative to the ideal
+    (no window, true PSD). The PSD is estimated through the same window from noise."""
+    from gwsciml.filtering.matched import band_mask, inner, whiten_template
+    from gwsciml.templates.waveforms import taylorf2
+    S = g2net_like_psd()
+    mask = band_mask(FREQS, (20.0, 1000.0))
+    h = taylorf2(FREQS, 30.0, 25.0) * mask
+    rho = np.sqrt(inner(*(2 * [whiten_template(h, S, mask, normalize=False)])))
+    sig = np.fft.irfft(h * FS * np.exp(-2j * np.pi * FREQS * t_merge), n=N) / rho  # optimal SNR 1
+    Xn = np.fft.rfft(noise * window, axis=-1)
+    norm = np.sqrt((np.abs(Xn) ** 2).mean(axis=0))  # leakage-inclusive PSD, DFT units
+    tw = np.fft.rfft(sig * window) * mask / norm
+    zs = np.abs(np.sum(np.abs(tw) ** 2))
+    zn = np.sqrt(np.mean(np.abs((Xn * mask / norm) @ np.conj(tw)) ** 2) / 2)
+    return zs / zn
+
+
+def test_window_choice_snr_efficiency():
+    noise = colored_noise(g2net_like_psd(), 600, RNG)
+    late = 1.85  # late end of the observed G2Net merger times
+    assert snr_efficiency(tukey(N, 0.1), late, noise) > 0.95
+    assert snr_efficiency(tukey(N, 0.1), 1.6, noise) > 0.95
+    assert snr_efficiency(tukey(N, 0.5), late, noise) < 0.8

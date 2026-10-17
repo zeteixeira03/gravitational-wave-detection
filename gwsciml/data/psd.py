@@ -16,6 +16,13 @@ For noise with PSD S, y has unit variance where w = 1 (the flat part of the
 window). This is the normalisation the matched filter in
 gwsciml.filtering.matched relies on.
 
+Window choice (measured, see gwsciml/tests/test_psd.py): G2Net mergers sit at
+1.5-1.85 s, so the window must stay flat to ~1.9 s; Tukey(0.1) does. Its short
+taper leaks the 8-16 Hz noise bump into 20-35 Hz, but when the PSD is
+estimated through the same window (periodogram_psd averaged over noise) the
+whitening down-weights the leaked bins and the matched-filter SNR loss is
+below 5 %. Tukey(0.5) leaks less but cuts ~30 % of the SNR of a merger at 1.85 s.
+
 Noise-weighted inner product, <a|b> = 4 Re int a~(f) b~*(f) / S(f) df, in these
 units is <a|b> = (2/N) Re sum_k Aw_k conj(Bw_k), with Aw, Bw whitened rffts.
 """
