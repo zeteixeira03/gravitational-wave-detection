@@ -30,6 +30,7 @@ def main():
     ap.add_argument("--lr", type=float, default=0.02)
     ap.add_argument("--weight-decay", type=float, default=0.0)
     ap.add_argument("--prior-l2", type=float, default=1e-3, help="L2 pull of a, c towards the EM prior")
+    ap.add_argument("--freeze-prior", action="store_true", help="keep a, c at the EM prior; learn only g and w")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--threads", type=int, default=4)
     args = ap.parse_args()
@@ -59,7 +60,11 @@ def main():
         s = chunked(model.score, Ltr[fit])
         model.w[1] = 1.0 / s.std()
         model.w[0] = -s.mean() / s.std()
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.freeze_prior:
+        model.a.requires_grad_(False)
+        model.c.requires_grad_(False)
+    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr,
+                           weight_decay=args.weight_decay)
     best = (-1.0, None, -1)
     hist = []
     t0 = time.time()
@@ -93,7 +98,7 @@ def main():
     with open("results/runs.jsonl", "a") as fh:
         fh.write(json.dumps({
             "time": time.strftime("%Y-%m-%dT%H:%M:%S"), "phase": "P3-proto", "git": git, "split": "val",
-            "n": int(len(va)), "tag": args.tag, "model": "LikelihoodMapReadout (monotone g, a_j, c_b), EM init",
+            "n": int(len(va)), "tag": args.tag, "model": "LikelihoodMapReadout (monotone g" + (", EM prior frozen)" if args.freeze_prior else ", a_j, c_b), EM init"),
             "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
             "holdout_auc_em_init": h0, "holdout_auc_best": best[0], "best_epoch": best[2],
             "auc": auc, "auc_bootstrap_sd": sd, "g_slopes": dict(zip(knots.tolist(), slopes.tolist())),
