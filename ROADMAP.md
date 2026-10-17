@@ -23,8 +23,11 @@ of each phase. The old pipeline (`src/`, `kaggle/`) stays frozen as the baseline
 1. Read this file. Then read `THE_SCIENCE.md` and `SWEEP_FINDINGS.md` for context only.
 2. Environment setup (the container is fresh each session):
    ```bash
-   pip install torch numpy scipy scikit-learn pandas matplotlib tqdm pytest kaggle
+   pip install torch numpy scipy scikit-learn pandas matplotlib tqdm pytest kaggle lalsuite
    ```
+   `lalsuite` (PyPI wheel) gives the LAL waveform models (IMRPhenomD etc.) and the
+   reference geometry that the tests compare against. Run tests with
+   `python -m pytest gwsciml/tests -q` from the repo root.
    Install torch from PyPI. `download.pytorch.org` is blocked by the network policy.
    The PyPI wheel (CUDA build) runs on CPU.
 3. Kaggle access check:
@@ -35,9 +38,16 @@ of each phase. The old pipeline (`src/`, `kaggle/`) stays frozen as the baseline
    If this fails: the environment must allow `www.kaggle.com` and `api.kaggle.com`
    (Network access, Allowed domains) and set `KAGGLE_USERNAME` / `KAGGLE_KEY`.
    Never ask the user to paste the key in chat.
-4. Disk: about 22 GB is free; the raw dataset is about 70 GB. Download a subset only
-   (single files with `kaggle competitions download -f <path>`, or one preprocessed
-   shard from the user's Kaggle dataset). Full-scale work runs in Kaggle kernels.
+   The key is a new-style token (`KGAT...`). kaggle>=2 reads it only from
+   `KAGGLE_API_TOKEN`, so run `export KAGGLE_API_TOKEN="$KAGGLE_KEY"` first.
+4. Disk: about 22 GB is free; the raw dataset is about 70 GB. Full-scale work runs in
+   Kaggle kernels. **Single-file competition downloads are rate-limited** (HTTP 429
+   after a few hundred files, still blocked 30+ min later). Use the pack kernel
+   instead: `gwsciml/kaggle/pack_subset` reads a class-balanced subset inside Kaggle
+   (5,000 + 5,000 per split, seed 0, raw float64) and writes `val_<c>.npy/.csv`,
+   `train_<c>.npy/.csv`. Fetch with
+   `kaggle kernels output zeteixeira/gwsciml-pack-subset -p data/g2net/packed`.
+   Load with `gwsciml.data.io.load_packed`.
 5. Begin P0 (section 2). The first concrete task list is in section 5.
 
 ## 1. Foundation (why the design is what it is)
@@ -81,6 +91,11 @@ of each phase. The old pipeline (`src/`, `kaggle/`) stays frozen as the baseline
 | 2026-10-17 | D1: fixed GR templates permitted as filters, not as data. | User. |
 | 2026-10-17 | Unsupervised PE (maximum likelihood over the bank) in scope. | User asked; no labels exist. |
 | 2026-10-17 | Old `CLAUDE.md` conventions not binding. | User: outdated. |
+| 2026-10-17 | Val split fixed: rows 0-149,999 of `training_labels.csv` (sorted by id); train = rows 150,000-559,999. | Same split as the frozen baseline (`src/model_runs.py` shard split: first 3 shards of 50k). |
+| 2026-10-17 | Whitening: Tukey(0.1) window, PSD = average periodogram of train negatives through the same window (leakage-inclusive). | Mergers sit at 1.5-1.85 s. Tukey(0.5) loses ~30 % SNR at 1.85 s; Tukey(0.1) loses < 5 % (measured, `test_window_choice_snr_efficiency`). Planck taper and high-pass prefilter gave no gain. |
+| 2026-10-17 | Production waveform model IMRPhenomD (LAL); own TaylorF2 kept as the analytic reference (matches LAL to 1e-5 at every PN order). | Heavy BBH merge in band; TaylorF2 stops at the ISCO. |
+| 2026-10-17 | Template duration capped at 1.5 s (start frequency from the Newtonian chirp time). | A template longer than the 2 s segment wraps in the circular filter. |
+| 2026-10-17 | Orchestrator/writer split not used this session; code written and reviewed in one context. | Tool policy: subagents only on explicit user request. |
 
 ## 5. P0 task list (next session)
 
