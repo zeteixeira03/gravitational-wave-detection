@@ -88,6 +88,32 @@ def extract(model, loader, device):
             torch.cat(ys).numpy().astype(int), torch.cat(ps).numpy())
 
 
+@torch.no_grad()
+def calibrate_batchnorm(model, loader, device, n_batches=200):
+    """
+    Replace BatchNorm running statistics with averages measured on data.
+
+    An untrained network in eval mode normalizes with the default statistics
+    (mean 0, variance 1), which the real activations do not have. The error
+    compounds over ~20 conv layers and the pooled features become so
+    heavy-tailed that a ridge fit on them extrapolates to R^2 of -1e12 (probe v2).
+    Measured statistics make the random-init features a usable baseline. The
+    weights are not changed; dropout and stochastic depth are off (eval) for
+    every module except the BatchNorm layers being measured.
+    """
+    bns = [m for m in model.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    model.eval()
+    for m in bns:
+        m.reset_running_stats()
+        m.momentum = None          # cumulative average over the batches seen
+        m.train()
+    for i, (X, _, sky) in enumerate(loader):
+        if i >= n_batches:
+            break
+        model._extract_pooled(X.to(device))
+    model.eval()
+
+
 def split_halves(n: int, seed: int):
     """Fixed random halves: readouts are fit on the first, scored on the second."""
     order = np.random.default_rng(seed).permutation(n)
@@ -235,6 +261,7 @@ def run_probe(output_dir=None, config_id=1, seed=0):
     hp, _ = sweep_hyperparameters(config_id, seed, has_gpu)
     set_seed(seed)
     rand_model = build_model(hp, A.shape[1], device)
+    calibrate_batchnorm(rand_model, loader, device)
     Z_rand, _, _, _ = extract(rand_model, loader, device)
 
     l_max = int(round(np.sqrt(A.shape[1]))) - 1

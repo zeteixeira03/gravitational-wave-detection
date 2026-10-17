@@ -1580,6 +1580,11 @@ def build_run_log_row(config_id, seed, hyperparameters, results, wall_clock_s, g
                     for k in ('train_loss', 'train_acc', 'val_loss', 'val_acc', 'val_auc')},
         'n_train': results['n_train'],
         'n_val': results['n_val'],
+        # the stack is a variable: config 1 seed 0 moved by -0.002 best_auc from
+        # P100 to T4 (SWEEP_FINDINGS F10), so rows from different stacks are
+        # never pooled. sweep_analysis groups by these two fields.
+        'device': torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu',
+        'torch': torch.__version__,
         'wall_clock_s': round(wall_clock_s, 1),
         'hyperparameters': hyperparameters,
     }
@@ -1625,6 +1630,10 @@ def run_one(config_id, seed, data_dir, n_samples, log_path, models_dir, git_hash
 
     row = build_run_log_row(config_label, seed, hp, results, wall, git_hash)
     append_run_log(log_path, row)
+    # the kernel log is the one output that is always retrievable through the
+    # Kaggle API (output files come from a separate host), so the full row goes
+    # there too, on one line, at full precision.
+    print("ROW_JSON " + json.dumps(row))
     print(f"Logged {config_label} seed {seed}: AUC {row['auc']:.4f}  "
           f"best {row['best_auc']:.4f} @ epoch {row['best_epoch']}/{row['epochs_run']}  "
           f"cond_params {row['conditioning_params']}  ({wall/3600:.2f}h)")

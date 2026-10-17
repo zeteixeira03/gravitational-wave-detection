@@ -233,6 +233,107 @@ that no other field is stored. It was never verified by loading a shard and prin
 
 **How to challenge:** one line in a scratch kernel. Worth doing before the paper.
 
+## 3a. Follow-up results (2026-10-17)
+
+Rules from `ANALYSIS_PLAN.md` section 8, committed before these runs. Sources:
+`kaggle/sweep_log/probe_v2.jsonl` (the re-run row), `kaggle/probe_log/probe_v2_probe.json`
+(the probe report) and `kaggle/probe_log/probe_v2_stdout.txt` (the kernel log). All three
+are rebuilt from the kernel log, because the host that serves Kaggle output files is
+blocked from the working environment. The row's values are therefore rounded to 4
+decimals; the probe report was printed in full and is exact.
+
+### F10. The instrument changed. Rule 8.1 fires: no cross-stack contrasts.
+
+The probe kernel asked for the P100 shape and pinned `gw-training` v69's image. Kaggle ran
+it on a Tesla T4 (sm_75), torch 2.8.0+cu126. The image's torch build still lists sm_60,
+so the hardware assignment changed, not only the software.
+
+Config 1 seed 0 on T4: `auc` 0.8617, `best_auc` 0.8626 at epoch 8 of 11, 0.73 h.
+On P100 (v65): `auc` 0.86311, `best_auc` 0.86467 at epoch 7 of 12, 1.14 h.
+Differences: -0.0014 and -0.0021. That is the size of every effect this project measures
+(F1, F3), so a P100 row and a T4 row cannot be compared.
+
+Consequences, as registered: configs 3 and 7 must be re-run on T4 before any section 8.3
+contrast is computed. The config 10 rows now running (gw-training v70) are on T4 and are
+contrasted only with T4 rows. `sweep_analysis.py` now groups rows by device and never
+pools stacks.
+
+**Confidence: 0.95** that P100 and T4 rows are not comparable. Whether the shift comes
+from hardware numerics or from some other cause is not separated, and does not need to
+be: either way the rows cannot be pooled.
+
+### F9 update. Confirmed by direct read.
+
+`shard_00.pt` holds `signals` (50000, 3, 4096) float32, `labels` (50000,) int64 and
+`sh_coeffs` (50000, 121) float32. l_max = 10. **Confidence: 0.99.**
+
+### F2 update. Redundancy for the label: supported (registered rule 8.2 fires).
+
+Config 1 seed 0 on T4, final SWA model. 150k validation samples, 75k to fit readouts,
+75k to score them.
+
+| readout input | eval AUC |
+|---|---|
+| z (512 pooled CNN features) | 0.86393 |
+| z + a (121 SH coefficients) | 0.86331 |
+| z + a + p (p = 11-value power spectrum) | 0.86328 |
+| a + p alone | 0.60413 |
+| the model's own head | 0.86286 |
+
+dAUC(z+a+p vs z) = -0.00065, 95% paired bootstrap CI [-0.00087, -0.00040]. The upper
+bound is below 0.002, so by the registered rule redundancy is supported for linear
+readouts. The CI is entirely below zero. The coefficients add no label information that
+z lacks, and the extra 132 inputs cost a little estimation accuracy. The a + p readout
+alone reproduces F8's ~0.60 on a different stack, so a is informative by itself and
+redundant given z.
+
+This rules out F2's competing explanation 1 for linear readouts: there was no extra
+label information in a for the FiLM pathway to fail to use. It does not test non-linear
+functions of a beyond p.
+
+**Confidence: 0.8** in redundancy at the level tested (linear readouts, one model, one
+seed).
+
+**Encoding (secondary).** Ridge R^2 of standardized a_lm from z, mean per degree l:
+
+| l | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| trained z | 0.898 | 0.052 | 0.343 | -0.048 | 0.084 | -0.051 | 0.003 | -0.030 | 0.031 | -0.032 | 0.026 |
+| label only | 0.008 | 0.000 | 0.003 | 0.000 | 0.001 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+
+On signal samples alone, l=0 is 0.901 and l=2 is 0.349. On noise-only samples every
+degree is negative (l=0: -0.987): z does not track the coefficients' noise-driven
+variation at all.
+
+l=0 and l=2 exceed the label-only baseline by more than 0.1. **The random-init baseline
+failed** (R^2 near -1e12): an untrained network in eval mode normalizes with default
+BatchNorm statistics, its pooled features become extremely heavy-tailed, and the ridge
+extrapolates. So the registered encoding rule can be applied only against the label
+baseline. `probe.calibrate_batchnorm` fixes this for future probes.
+
+### F11 (exploratory, not pre-registered). The CNN encodes coherence, not arrival order.
+
+In the R^2 table, every even degree exceeds its odd neighbours. A parity argument gives
+these a physical meaning. The pair delay is tau_ij(n) = -n . b_ij / c, linear in the sky
+direction n, so tau_ij(-n) = -tau_ij(n). The map is C(n) = sum_ij rho_ij(tau_ij(n))^2,
+and real spherical harmonics have parity Y_lm(-n) = (-1)^l Y_lm(n). So:
+
+- the even-l part of C is (1/2) sum_ij [rho_ij(tau)^2 + rho_ij(-tau)^2]: correlation
+  strength, independent of which detector leads;
+- the odd-l part is (1/2) sum_ij [rho_ij(tau)^2 - rho_ij(-tau)^2]: the lead/lag
+  asymmetry, i.e. arrival order.
+
+The pooled features encode the first (l=0 at 0.90, l=2 at 0.34) and almost none of the
+second. One candidate cause is in the recipe: `aug_channel_shuffle` swaps H1 and L1 on
+half the training samples, which reverses the H1-L1 lead/lag and trains the network to
+give the same answer for both orders.
+
+**Confidence: 0.4.** One model, one seed, not pre-registered.
+
+**How to challenge:** probe a config 1 model trained with `aug_channel_shuffle` off. If
+the hypothesis holds, odd-l R^2 rises (at least for the H1-L1 contribution). Cost: one
+run plus the probe, about 0.8 GPU-hours on T4.
+
 ## 4a. Data that was lost, and what it costs
 
 Two artifacts were written to a single path per kernel and overwritten by every
@@ -305,6 +406,10 @@ identical is not an argument for deleting one of them when a pre-registration na
 both.
 
 ## 6. What a later session should do first
+
+**Status 2026-10-17:** items 0, 1 (F2 update) and 3 (F9 update) are done; see section 3a.
+Item 2 is half-run: config 10 is on T4, and F10 adds the re-runs of configs 3 and 7 on T4
+that its contrasts need. Config 9 follows in the next quota week.
 
 0. Confirm the logger fixes in section 4a are in place before launching anything. Any
    run started under the old logger loses its curves permanently.

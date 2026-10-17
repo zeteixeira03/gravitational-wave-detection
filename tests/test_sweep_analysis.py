@@ -68,3 +68,31 @@ def test_instrument_check(tmp_path):
     assert instrument_check(load_rows(tmp_path))['unchanged'] is True
     _write(tmp_path, _rows(1, [(ref[0] + 1e-4, ref[1])], git="4d90382"), "c.jsonl")
     assert instrument_check(load_rows(tmp_path))['unchanged'] is False
+
+
+def test_rows_from_log_fallback_and_exact():
+    from sweep_analysis import rows_from_log
+    # lines copied from the gw-probe v2 log (no ROW_JSON yet)
+    text = "\n".join([
+        ' "device": "Tesla T4",',
+        'Git hash: b88df30693d88aeeeb0cef6678d96f24706420ed',
+        'Model: DIYModel (4,556,010 parameters, conditioning path 0)',
+        'Epoch 1/20 - Loss: 0.5299 - Val Loss: 0.5439 - Val Acc: 0.6851 - Val AUC: 0.8409 - LR: 6.67e-04 *',
+        'Epoch 2/20 - Loss: 0.4676 - Val Loss: 0.5066 - Val Acc: 0.7520 - Val AUC: 0.8563 - LR: 1.33e-03 *',
+        'Logged 1_none_concat seed 0: AUC 0.8617  best 0.8626 @ epoch 8/11  cond_params 0  (0.73h)',
+    ])
+    (row,) = rows_from_log(text)
+    assert (row['config_id'], row['seed'], row['auc'], row['best_auc']) == ('1_none_concat', 0, 0.8617, 0.8626)
+    assert row['device'] == 'Tesla T4' and row['git_hash'].startswith('b88df30')
+    assert row['history']['val_auc'] == [0.8409, 0.8563]
+    assert row['precision'] == 'log, 4 decimals' and row['total_params'] == 4556010
+    # a ROW_JSON line wins and is taken verbatim
+    exact = {'config_id': '10_x', 'seed': 2, 'auc': 0.86123456789, 'best_auc': 0.8621}
+    assert rows_from_log(text + "\nROW_JSON " + json.dumps(exact)) == [exact]
+
+
+def test_stacks_are_not_pooled(tmp_path):
+    rows = _rows(1, [(0.86, 0.86)]) + [dict(r, device='Tesla T4', best_auc=0.85) for r in _rows(1, [(0.85, 0.85)])]
+    _write(tmp_path, rows)
+    stacks = {r['_stack'] for r in load_rows(tmp_path)}
+    assert stacks == {'Tesla P100', 'Tesla T4'}

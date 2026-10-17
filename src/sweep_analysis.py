@@ -9,9 +9,20 @@ Statistics (ANALYSIS_PLAN sections 0 and 8.3):
 - a contrast x - y is the mean over seeds of the paired difference x_s - y_s
 - pooled sd = sqrt((s_x^2 + s_y^2) / 2) from the two configs' seed sds
 
-Usage: python src/sweep_analysis.py [log_dir]
+Rows are grouped by stack (GPU model). Rows from different stacks are never
+pooled or contrasted: config 1 seed 0 moved by -0.002 best_auc between P100 and
+T4 (SWEEP_FINDINGS F10), the same size as the effects being measured. The 24
+sweep rows predate the device field and all ran on P100.
+
+Usage:
+    python src/sweep_analysis.py [log_dir]
+    python src/sweep_analysis.py --from-log <kernel_log.json> <out.jsonl>
+        rebuild rows from a Kaggle kernel log (the API returns logs, while output
+        files come from a host that may be unreachable). ROW_JSON lines are
+        exact; older logs fall back to the printed 4-decimal summary and curves.
 """
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -42,7 +53,62 @@ def load_rows(log_dir) -> list[dict]:
                 row = json.loads(line)
                 row['_file'] = path.name
                 row['_config'] = int(str(row['config_id']).split('_')[0])
+                row['_stack'] = row.get('device', 'Tesla P100')
                 rows.append(row)
+    return rows
+
+
+_EPOCH = re.compile(r"Epoch (\d+)/\d+ - Loss: ([\d.]+) - Val Loss: ([\d.]+) - Val Acc: ([\d.]+) - Val AUC: ([\d.]+)")
+_LOGGED = re.compile(r"Logged (\S+) seed (\d+): AUC ([\d.]+)\s+best ([\d.]+) @ epoch (\d+)/(\d+)\s+cond_params (\d+)\s+\(([\d.]+)h\)")
+_MODEL = re.compile(r"Model: \w+ \(([\d,]+) parameters")
+_DEVICE = re.compile(r'"device": "([^"]+)"')
+_GIT = re.compile(r"Git hash: (\w+)|\"git_hash\": \"(\w+)\"")
+
+
+def log_text(path) -> str:
+    """Plain stdout text of a Kaggle kernel log (a JSON list of stream chunks)."""
+    raw = Path(path).read_text()
+    try:
+        return ''.join(e.get('data', '') for e in json.loads(raw))
+    except (json.JSONDecodeError, AttributeError):
+        return raw
+
+
+def rows_from_log(text: str, device: str | None = None) -> list[dict]:
+    """
+    Rows from a kernel log. ROW_JSON lines are the logged rows verbatim. For
+    logs without them, each run is rebuilt from its epoch lines and its
+    'Logged' summary line; every value is then rounded to 4 decimals, which
+    the row records in 'precision'.
+    """
+    exact = [json.loads(line[len("ROW_JSON "):]) for line in text.splitlines() if line.startswith("ROW_JSON ")]
+    if exact:
+        return exact
+    dev = device or (m.group(1) if (m := _DEVICE.search(text)) else None)
+    git = next((g for m in _GIT.finditer(text) for g in m.groups() if g), None)
+    rows, curve, params = [], [], None
+    for line in text.splitlines():
+        if (m := _MODEL.search(line)):
+            params = int(m.group(1).replace(',', ''))
+        elif (m := _EPOCH.search(line)):
+            if int(m.group(1)) == 1:
+                curve = []
+            curve.append([float(x) for x in m.groups()[1:]])
+        elif (m := _LOGGED.search(line)):
+            label, seed, auc, best, b_ep, n_ep, cond, hours = m.groups()
+            rows.append({
+                'config_id': label, 'seed': int(seed), 'git_hash': git,
+                'auc': float(auc), 'best_auc': float(best),
+                'best_epoch': int(b_ep), 'epochs_run': int(n_ep),
+                'total_params': params,
+                'conditioning_params': int(cond), 'wall_clock_s': round(float(hours) * 3600, 1),
+                'history': {
+                    'train_loss': [c[0] for c in curve], 'val_loss': [c[1] for c in curve],
+                    'val_acc': [c[2] for c in curve], 'val_auc': [c[3] for c in curve],
+                },
+                'device': dev, 'precision': 'log, 4 decimals',
+            })
+            curve = []
     return rows
 
 
@@ -149,9 +215,7 @@ def f3_verdict(c: dict) -> str:
 
 def main(log_dir):
     rows = load_rows(log_dir)
-    runs, conflicts = index_runs(rows)
-
-    print(f"{len(rows)} rows from {log_dir}, {len(runs)} distinct (config, seed) pairs\n")
+    print(f"{len(rows)} rows from {log_dir}\n")
     check = instrument_check(rows)
     if check is None:
         print("Instrument check: no config 1 seed 0 re-run logged yet\n")
@@ -162,6 +226,16 @@ def main(log_dir):
             print(f"  {c['file']} ({c['git_hash'][:7]}): "
                   + ", ".join(f"d{m} {d:+.3e}" for m, d in c['diffs'].items()))
         print()
+    for stack in sorted({r['_stack'] for r in rows}):
+        report_stack(stack, [r for r in rows if r['_stack'] == stack])
+
+
+def report_stack(stack, rows):
+    """Table, contrasts and verdict from the rows of one stack only."""
+    runs, conflicts = index_runs(rows)
+    print("=" * 96)
+    print(f"STACK {stack}: {len(rows)} rows, {len(runs)} distinct (config, seed) pairs")
+    print("=" * 96)
     for line in conflicts:
         print(f"CONFLICT {line}")
     if conflicts:
@@ -184,8 +258,15 @@ def main(log_dir):
                 diffs = ", ".join(f"{d:+.5f}" for d in c['diffs'])
                 print(f"  {name:<16}{m:<9} mean {c['mean']:+.5f}  pooled sd {c['pooled_sd']:.5f}  "
                       f"({c['ratio']:+.2f} sd)  per seed [{diffs}]")
-    print(f"\nF3 verdict: {f3_verdict(computed)}")
+    print(f"\nF3 verdict: {f3_verdict(computed)}\n")
 
 
 if __name__ == '__main__':
-    main(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / 'kaggle' / 'sweep_log')
+    if len(sys.argv) == 4 and sys.argv[1] == '--from-log':
+        rebuilt = rows_from_log(log_text(sys.argv[2]))
+        with open(sys.argv[3], 'w') as f:
+            for r in rebuilt:
+                f.write(json.dumps(r) + "\n")
+        print(f"{len(rebuilt)} rows written to {sys.argv[3]}")
+    else:
+        main(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / 'kaggle' / 'sweep_log')
