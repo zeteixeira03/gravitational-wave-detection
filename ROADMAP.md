@@ -79,8 +79,10 @@ of each phase. The old pipeline (`src/`, `kaggle/`) stays frozen as the baseline
 - New code lives in `gwsciml/`. Do not edit `src/`.
 - Every module has unit tests against analytic identities before it touches data.
 - One results log (JSONL), one row per run, never hand-transcribed, no row dropped.
-- Orchestrator (Opus) writes specs and reviews. Writers (Sonnet/Haiku) implement from
-  self-contained specs. Review before every commit.
+- **HARD RULE (user, 2026-10-17): orchestrator / writer split in every session.**
+  Orchestrator (Opus) writes specs and reviews. Writers (Sonnet/Haiku subagents)
+  implement all code from self-contained specs. Review before every commit. This is
+  the user's standing request to use subagents. Full rule: `CLAUDE.md`.
 
 ## 4. Decision log
 
@@ -96,6 +98,7 @@ of each phase. The old pipeline (`src/`, `kaggle/`) stays frozen as the baseline
 | 2026-10-17 | Production waveform model IMRPhenomD (LAL); own TaylorF2 kept as the analytic reference (matches LAL to 1e-5 at every PN order). | Heavy BBH merge in band; TaylorF2 stops at the ISCO. |
 | 2026-10-17 | Template duration capped at 1.5 s (start frequency from the Newtonian chirp time). | A template longer than the 2 s segment wraps in the circular filter. |
 | 2026-10-17 | Orchestrator/writer split not used this session; code written and reviewed in one context. | Tool policy: subagents only on explicit user request. |
+| 2026-10-17 | Orchestrator/writer split is a hard rule for every future session (`CLAUDE.md`). | User. |
 
 ## 5. Status (end of session 2026-10-17)
 
