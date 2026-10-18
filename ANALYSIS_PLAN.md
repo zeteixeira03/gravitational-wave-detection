@@ -280,3 +280,33 @@ val-loss-selected `auc` carries 3x to 20x more seed variance from checkpoint sel
 **Limits stated in advance.** n = 3 seeds resolves a sign, not an effect size of 0.0005
 (F1). The 8n/4n axis changes both downstream capacity and the information that reaches
 fusion, so the width contrasts do not separate those two.
+
+---
+
+## 9. Pre-registration: fusion width without the sky pathway (2026-10-18)
+
+Written and committed before any run below. Motivated by the section 8.3 result on T4
+(SWEEP_FINDINGS, F3 update): config 10 (4n pair width) beats config 3 (8n) in all three
+seeds, while lifting the symmetry constraint at 4n changes nothing. If the narrower
+fusion acts as a regularizer, its benefit should not depend on the sky pathway.
+
+**New config.** 11 = config 7 without its sky pathway: `sky_readout` none, symmetric
+mean merge, 2,911,978 parameters (config 7's 3,026,648 minus its 114,670 conditioning
+parameters).
+
+**Runs.** On T4 only, seeds {0, 1, 2}: config 11 at all three, config 1 at seeds 1 and
+2 (seed 0 exists from the probe kernel).
+
+**Metric and statistics** as in 8.3: `best_auc` primary, `auc` beside it, claims need the
+same sign on both; paired contrasts with pooled sd.
+
+**Contrasts and rules.**
+
+- W_nosky = 11 - 1 (width without sky). **"The width effect does not need the sky
+  pathway"** iff W_nosky > pooled sd on both metrics.
+- Sky_4n = 7 - 11 (sky pathway at 4n width). **"The sky pathway helps at 4n"** iff
+  Sky_4n > pooled sd on both metrics. F2's redundancy result predicts it does not.
+- Any other pattern is reported as observed, with no causal reading.
+
+**Limits stated in advance.** Same as 8.3: n = 3; 100k training samples (F6); width
+changes both capacity and the LIGO-pair information that reaches fusion.

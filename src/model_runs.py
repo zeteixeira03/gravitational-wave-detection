@@ -1458,6 +1458,9 @@ SWEEP_CONFIGS = {
     # 10 starts as the same function as 7 and may learn to break the symmetry.
     9: ('power_sort_match',        {'sky_readout': 'power',      'h1l1_merge': 'sort',      'match_params': True}),
     10: ('power_proj_match',       {'sky_readout': 'power',      'h1l1_merge': 'proj',      'match_params': True}),
+    # ANALYSIS_PLAN section 9: config 7 without its sky pathway. 11 - 1 tests the
+    # width effect without sky features; 7 - 11 tests the sky pathway at 4n.
+    11: ('none_symmetric',         {'sky_readout': 'none',       'h1l1_merge': 'symmetric', 'match_params': False}),
 }
 
 # Config 4 stays in: ANALYSIS_PLAN section 2 pins the decision rule to
@@ -1470,6 +1473,7 @@ TIER1_RUNS = [(c, s) for s in (0, 1, 2) for c in (1, 2, 3, 4, 5)]
 TIER2_RUNS = [(c, s) for s in (0, 1, 2) for c in (6, 7)]
 TIER3_RUNS = [(c, s) for s in (0, 1, 2) for c in (8,)]
 F3_CONTROL_RUNS = [(c, s) for s in (0, 1, 2) for c in (9, 10)]
+WIDTH_RUNS = [(c, s) for s in (0, 1, 2) for c in (1, 11)]
 
 
 def read_git_hash() -> str:

@@ -44,6 +44,13 @@ F3_CONTRASTS = {
 }
 
 
+# section 9 contrasts (config 11 = config 7 without its sky pathway)
+WIDTH_CONTRASTS = {
+    'W_nosky (11 - 1)': (11, 1),
+    'Sky_4n (7 - 11)': (7, 11),
+}
+
+
 def load_rows(log_dir) -> list[dict]:
     """All rows from every JSONL file in log_dir, tagged with their source file."""
     rows = []
@@ -262,6 +269,18 @@ def report_stack(stack, rows):
                 print(f"  {name:<16}{m:<9} mean {c['mean']:+.5f}  pooled sd {c['pooled_sd']:.5f}  "
                       f"({c['ratio']:+.2f} sd)  per seed [{diffs}]")
     print(f"\nF3 verdict: {f3_verdict(computed)}\n")
+
+    print("Width contrasts (ANALYSIS_PLAN 9), paired by seed")
+    for name, (x, y) in WIDTH_CONTRASTS.items():
+        for m in METRICS:
+            c = contrast(runs, x, y, m)
+            if c is None:
+                print(f"  {name:<18}{m:<9} not available")
+                continue
+            diffs = ", ".join(f"{d:+.5f}" for d in c['diffs'])
+            print(f"  {name:<18}{m:<9} mean {c['mean']:+.5f}  pooled sd {c['pooled_sd']:.5f}  "
+                  f"({c['ratio']:+.2f} sd)  per seed [{diffs}]")
+    print()
 
 
 if __name__ == '__main__':

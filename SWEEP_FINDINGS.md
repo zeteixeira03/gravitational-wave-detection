@@ -330,10 +330,26 @@ What this decides under the section 8.3 rules:
 
 - **"Symmetry helps" cannot fire.** It needs S_4n > pooled sd, and S_4n is not. Config 9
   cannot change this.
-- **"Capacity, not symmetry"** has its first condition met. Its second, W_ord = 3 - 10
-  < -pooled sd, needs config 3 at two more T4 seeds. Config 3 seed 0 on T4 has
-  `best_auc` 0.86282 against config 10 seed 0's 0.8640, a single-seed difference of
-  -0.0012. That points the way the rule needs, and is not a rule evaluation.
+- **"Capacity, not symmetry" fires** (v72 added config 3 seeds 1 and 2). W_ord = 3 - 10:
+
+  | | best_auc | auc |
+  |---|---|---|
+  | config 3 (8n, ordered) | 0.86286 +- 0.00005 | 0.86212 +- 0.00067 |
+  | W_ord = 3 - 10, paired | -0.00124 (pooled sd 0.00013, -9.8 sd) | -0.00094 (pooled sd 0.00069, -1.4 sd) |
+  | per seed | -0.00118, -0.00115, -0.00139 | -0.00120, +0.00055, -0.00217 |
+
+  |S_4n| <= pooled sd and W_ord < -pooled sd, on both metrics.
+
+  Read the -9.8 sd with care: it is large mainly because config 3's three `best_auc`
+  values happen to lie within 0.00005 of each other, and an sd from n = 3 is itself very
+  uncertain. The `auc` contrast (-1.4 sd, one seed positive) is the weaker of the two.
+
+  **The direction matters:** the narrower model wins. 4n removes about 1.66 M fusion
+  parameters. The runs stop early (epochs 9 to 13) because val loss rises while train
+  loss falls, which is the regime where fewer parameters regularize. As registered, the
+  width axis also changes how much LIGO-pair information reaches fusion, so capacity and
+  information are not separated. Section 9 of the plan tests whether the effect needs
+  the sky pathway at all.
 
 **What is not known:** whether config 10's merge weights left the symmetric
 initialization at all. If they stayed near the mean, the constraint was simply never
@@ -342,7 +358,9 @@ replaced v70's output). Rows now log `h1l1_proj_asymmetry` = ||A - B|| / ||A + B
 A and B are the merge weights applied to H1 and L1 (0 = symmetric).
 
 **Confidence: 0.75** that the symmetry constraint itself is not what separates config 7
-from config 3. **Confidence: 0.5** that width is, pending W_ord.
+from config 3. **Confidence: 0.7** that the 8n -> 4n width reduction is (at 100k samples,
+power readout). **Confidence: 0.4** that it is a regularization effect that holds
+without the sky pathway; that is the section 9 test.
 
 ### Process: the two-GPU runner works
 
@@ -450,14 +468,19 @@ both.
 **Status 2026-10-18:** items 0, 1 (F2 update) and 3 (F9 update) are done; see section 3a.
 Item 2: on T4, configs 7 and 10 are complete (S_4n evaluated) and config 3 has seed 0.
 
-**Next quota week (from 2026-10-24, 6 h), in order:**
+**Status 2026-10-18, 02:30:** W_ord done (v72); the F3 capacity rule fires.
 
-1. `gw-training`, parallel: (3,1), (3,2), (9,0), (9,1), (9,2), (10,0). Three rounds,
-   about 3 h. Completes W_ord, S_8n and W_inv. The (10,0) re-run logs the merge
-   asymmetry and, against the v70 row, checks determinism on T4 (to 4 decimals).
-2. `gw-probe`: test F11 by probing a config 1 model trained with `aug_channel_shuffle`
-   off (about 0.8 h). Exploratory.
-3. Archive each kernel's log (`sweep_analysis.py --from-log`) before pushing the next
+**Next quota week (from 2026-10-24, 6 h; a parallel round of two runs costs about
+0.9 h), in priority order:**
+
+1. `gw-training`, parallel: (11,0), (11,1), (11,2), (1,1), (1,2), (9,0). Section 9 in
+   full plus the first config 9 seed. Three rounds, about 2.7 h.
+2. `gw-training`, parallel: (9,1), (9,2), then (10,0). Completes the registered 8.3
+   design (S_8n, W_inv). The (10,0) re-run logs the merge asymmetry and checks T4
+   determinism against the v70 row (to 4 decimals). About 1.8 h.
+3. `gw-probe`: F11, a config 1 model trained with `aug_channel_shuffle` off (about
+   0.8 h). Exploratory; defer if the quota is short.
+4. Archive each kernel's log (`sweep_analysis.py --from-log`) before pushing the next
    version of the same slug.
 
 0. Confirm the logger fixes in section 4a are in place before launching anything. Any
