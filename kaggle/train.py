@@ -31,9 +31,10 @@ MODE = "sweep"
 # only used when MODE == 'sweep': (config_id, seed) pairs for THIS kernel.
 # With 2 GPUs the list is split round-robin, one process per GPU; a T4 run takes
 # ~0.75h. F10 moved the project to T4, so configs 3 and 7 are re-run there
-# before any F3 contrast (ANALYSIS_PLAN 8.1). Week of 2026-10-17, 3.08h quota
-# left: two parallel rounds, gpu0 (7,0),(7,2) and gpu1 (7,1),(3,0).
-SWEEP_RUN_LIST = [(7, 0), (7, 1), (7, 2), (3, 0)]
+# before any F3 contrast (ANALYSIS_PLAN 8.1). v71 ran config 7 x3 and (3,0).
+# 1.45h quota left this week: one parallel round of config 3 seeds 1-2 (all 29
+# CNN runs so far stopped by epoch 13, ~1.05h for config 3 on T4).
+SWEEP_RUN_LIST = [(3, 1), (3, 2)]
 
 # find src path by its files: kernels created after 2026-08 mount inputs below
 # /kaggle/input/datasets/..., older ones at /kaggle/input/<slug>
