@@ -1445,6 +1445,10 @@ SWEEP_CONFIGS = {
     6: ('scramble_concat',         {'sky_readout': 'scramble',   'h1l1_merge': 'concat',    'match_params': False}),
     7: ('power_symmetric_match',   {'sky_readout': 'power',      'h1l1_merge': 'symmetric', 'match_params': True}),
     8: ('bispectrum_concat_match', {'sky_readout': 'bispectrum', 'h1l1_merge': 'concat',    'match_params': True}),
+    # follow-up, not in ANALYSIS_PLAN: registered in FOLLOWUP_PLAN.md P2 before any
+    # run. Capacity control for config 7 -- same topology and width, LIGO pair
+    # merged by a learned ordered projection instead of the symmetric mean.
+    9: ('power_project_match',     {'sky_readout': 'power',      'h1l1_merge': 'project',   'match_params': True}),
 }
 
 # Config 4 stays in: ANALYSIS_PLAN section 2 pins the decision rule to
@@ -1456,6 +1460,11 @@ SWEEP_CONFIGS = {
 TIER1_RUNS = [(c, s) for s in (0, 1, 2) for c in (1, 2, 3, 4, 5)]
 TIER2_RUNS = [(c, s) for s in (0, 1, 2) for c in (6, 7)]
 TIER3_RUNS = [(c, s) for s in (0, 1, 2) for c in (8,)]
+FOLLOWUP_P2_RUNS = [(9, s) for s in (0, 1, 2)]
+
+# the model probe P1 retrains this config/seed: config 1 has no sky pathway, so
+# its pooled features are purely the CNN's, and seed 0 reproduces a logged row.
+PROBE_CONFIG = (1, 0)
 
 
 def read_git_hash() -> str:
@@ -1515,6 +1524,23 @@ def append_run_log(log_path, row: dict):
         f.write(json.dumps(row) + "\n")
 
 
+def runtime_env() -> dict:
+    """
+    Library and device versions for the row. Kaggle updates its image over time,
+    and a cuDNN change alone can break bit-identical reproduction of an older row;
+    without these fields a failed reproduction cannot be attributed.
+    """
+    has_cuda = torch.cuda.is_available()
+    return {
+        'torch': torch.__version__,
+        'cuda': torch.version.cuda,
+        'cudnn': torch.backends.cudnn.version() if has_cuda else None,
+        'gpu': torch.cuda.get_device_name(0) if has_cuda else None,
+        'numpy': np.__version__,
+        'python': sys.version.split()[0],
+    }
+
+
 def build_run_log_row(config_id, seed, hyperparameters, results, wall_clock_s, git_hash):
     """Assemble one sweep-log row from a finished run's results."""
     model = results['model']
@@ -1563,6 +1589,7 @@ def build_run_log_row(config_id, seed, hyperparameters, results, wall_clock_s, g
         'n_train': results['n_train'],
         'n_val': results['n_val'],
         'wall_clock_s': round(wall_clock_s, 1),
+        'env': runtime_env(),
         'hyperparameters': hyperparameters,
     }
 
@@ -1644,6 +1671,82 @@ def run_sweep(run_list, log_path=None, kernel_budget_hours=8.5):
               f"cond_params {row['conditioning_params']}  ({wall/3600:.2f}h)")
 
     print(f"\nSweep slice complete. Log: {log_path}")
+
+
+def run_probe_job(probe_log_path=None, sweep_log_path=None):
+    """
+    Follow-up P1 (FOLLOWUP_PLAN.md): retrain PROBE_CONFIG and probe its CNN features.
+
+    The training run is logged to the sweep JSONL under the label
+    ``probe_<config>``, not ``<config>``, so it never enters the sweep table.
+    At the same seed it must reproduce the logged sweep row for that config
+    (SWEEP_FINDINGS F7), which also checks that nothing since that kernel changed
+    the training path. The probe record goes to its own JSONL.
+
+    Returns
+    -------
+    float
+        Wall-clock hours used, so the caller can budget the rest of the kernel.
+    """
+    from probe import run_probe
+
+    start = time.time()
+    has_gpu = check_gpu()
+    output_dir = get_output_dir()
+    data_dir = find_tensor_data_dir(output_dir)
+    n_samples = load_n_samples(data_dir)
+    if sweep_log_path is None:
+        sweep_log_path = output_dir / "sweep_results.jsonl"
+    if probe_log_path is None:
+        probe_log_path = output_dir / "probe_results.jsonl"
+    git_hash = read_git_hash()
+
+    config_id, seed = PROBE_CONFIG
+    name, overrides = SWEEP_CONFIGS[config_id]
+    hp = dict(SWEEP_BASE)
+    hp.update(overrides)
+    hp['seed'] = seed
+    hp['scramble_seed'] = seed
+    hp['batch_size'] = 64 if has_gpu else 32
+    config_label = f"probe_{config_id}_{name}"
+    run_ckpt_dir = output_dir / "models" / "saved" / f"{config_label}_seed{seed}"
+
+    print("\n" + "#"*60)
+    print(f"PROBE JOB  config {config_label}  seed {seed}")
+    print("#"*60)
+
+    results = train_from_tensors(
+        data_dir, n_samples, hyperparameters=hp, val_split=0.2, checkpoint_dir=run_ckpt_dir,
+    )
+    train_wall = time.time() - start
+    row = build_run_log_row(config_label, seed, hp, results, train_wall, git_hash)
+    append_run_log(sweep_log_path, row)
+    print(f"Logged {config_label} seed {seed}: AUC {row['auc']:.6f}  best {row['best_auc']:.6f} "
+          f"@ epoch {row['best_epoch']}/{row['epochs_run']}")
+
+    # the untrained baseline starts from the trained model's own init
+    set_seed(seed)
+    sky_geo = SkyGeometry(n_pix=hp['sky_n_pix'], l_max=hp['sky_l_max'])
+    rand_model = build_model(hp, sky_geo.n_coeffs, results['device'])
+
+    val_ds = results['val_loader'].dataset
+    probe = run_probe(
+        results['model'], rand_model, val_ds.signals, val_ds.labels, val_ds.precomputed_sh,
+        sky_geo, results['device'], l_max=hp['sky_l_max'], batch_size=hp['batch_size'] * 4, seed=0,
+    )
+    append_run_log(probe_log_path, {
+        'timestamp': datetime.now().isoformat(timespec='seconds'),
+        'git_hash': git_hash,
+        'config_id': config_label,
+        'seed': seed,
+        'train_auc': row['auc'],
+        'train_best_auc': row['best_auc'],
+        'probe_wall_clock_s': round(time.time() - start - train_wall, 1),
+        'env': runtime_env(),
+        **probe,
+    })
+    print(f"Probe outcome: {probe['outcome']}  (log: {probe_log_path})")
+    return (time.time() - start) / 3600
 
 
 def main(mode='train'):

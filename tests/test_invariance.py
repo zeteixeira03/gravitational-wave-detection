@@ -12,6 +12,9 @@ Claims tested:
 - ``scramble`` preserves each sample's coefficient multiset (marginals).
 - The ``symmetric`` merge is exactly invariant under swapping the H1 and L1 input
   channels; the ``concat`` merge is not.
+- The ``project`` merge (capacity control for ``symmetric``) computes the same
+  function as ``symmetric`` at init and stops being swap-invariant once its two
+  halves differ.
 - ``match_params`` equalizes the conditioning-path parameter count across readouts.
 """
 
@@ -186,6 +189,61 @@ def test_concat_merge_changes_under_h1l1_swap():
     p, ps = _pooled(model, X), _pooled(model, X_swap)
     assert not torch.allclose(p, ps, atol=1e-6), \
         "concat pooled features were unexpectedly invariant to H1<->L1 swap"
+
+
+def test_project_merge_equals_symmetric_at_init():
+    # the capacity control for config 7. Same seed -> every shared weight is drawn
+    # identically (the projections are registered last), and the projections start
+    # at [I/2, I/2], so the two models must compute the same function at step 0.
+    # Any later difference is caused by the constraint being lifted, nothing else.
+    X = torch.randn(BATCH, 3, 4096, generator=torch.Generator().manual_seed(1))
+    torch.manual_seed(0)
+    sym = DIYModel(n_channels=4, n_sky_features=N_SKY, sky_readout="none", h1l1_merge="symmetric").eval()
+    torch.manual_seed(0)
+    proj = DIYModel(n_channels=4, n_sky_features=N_SKY, sky_readout="none", h1l1_merge="project").eval()
+    sym_sd, proj_sd = sym.state_dict(), proj.state_dict()
+    extra = set(proj_sd) - set(sym_sd)
+    assert extra == {"ligo_merge_feat.weight", "ligo_merge_branch.weight"}, extra
+    for k, v in sym_sd.items():
+        assert torch.equal(v, proj_sd[k]), f"shared weight {k} differs between symmetric and project"
+    assert torch.allclose(_pooled(sym, X), _pooled(proj, X), atol=1e-5)
+    # the global RNG must also be left in the same state, or dropout and drop-path
+    # masks would differ from the first training step
+    torch.manual_seed(0)
+    DIYModel(n_channels=4, n_sky_features=N_SKY, sky_readout="none", h1l1_merge="symmetric")
+    after_sym = torch.get_rng_state()
+    torch.manual_seed(0)
+    DIYModel(n_channels=4, n_sky_features=N_SKY, sky_readout="none", h1l1_merge="project")
+    assert torch.equal(after_sym, torch.get_rng_state()), "project model consumed extra RNG draws"
+
+
+def test_project_merge_breaks_swap_invariance_once_asymmetric():
+    torch.manual_seed(0)
+    X = torch.randn(BATCH, 3, 4096)
+    X_swap = X[:, [1, 0, 2], :]
+    model = DIYModel(n_channels=4, n_sky_features=N_SKY, sky_readout="none", h1l1_merge="project").eval()
+    # at init it is the symmetric mean, so swap-invariant
+    assert torch.allclose(_pooled(model, X), _pooled(model, X_swap), atol=1e-5)
+    # move the H1 half away from the L1 half: the merge is now ordered
+    with torch.no_grad():
+        model.ligo_merge_branch.weight[:, :16] *= 1.5
+    assert not torch.allclose(_pooled(model, X), _pooled(model, X_swap), atol=1e-5), \
+        "project merge stayed swap-invariant with unequal H1/L1 weights"
+
+
+def test_project_merge_param_overhead():
+    # the control must sit at config 7's capacity, not config 3's. Overhead is two
+    # bias-free 1x1 convs of 8n -> 4n.
+    n = 16
+    counts = {
+        merge: sum(p.numel() for p in DIYModel(
+            n_channels=n, n_sky_features=N_SKY, sky_readout="power", h1l1_merge=merge, match_params=True,
+        ).parameters())
+        for merge in ("concat", "symmetric", "project")
+    }
+    assert counts["project"] - counts["symmetric"] == 2 * (8 * n) * (4 * n)
+    assert (counts["project"] - counts["symmetric"]) / counts["symmetric"] < 0.006
+    assert counts["concat"] - counts["project"] > 1_500_000
 
 
 # ------------------------------------------------------------------ parameter matching

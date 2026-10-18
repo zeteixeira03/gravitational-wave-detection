@@ -382,8 +382,12 @@ class DIYModel(nn.Module):
             sky pathway (FiLM bypassed). See SkyReadout for the rest.
         h1l1_merge : str
             ``concat`` for the ordered four-path fusion (breaks the H1<->L1 swap
-            symmetry) or ``symmetric`` for swap-invariant pooling of the two
-            LIGO branches before fusion.
+            symmetry), ``symmetric`` for swap-invariant pooling of the two
+            LIGO branches before fusion, or ``project`` for the capacity control
+            of ``symmetric``: same three-path topology and width, but the LIGO
+            pair is merged by a learned ordered 1x1 projection instead of the
+            fixed symmetric pool. It starts at the symmetric mean and is free to
+            leave it, so it differs from ``symmetric`` only in the constraint.
         h1l1_pool : str
             Symmetric pooling op when h1l1_merge=='symmetric': ``mean`` or ``max``.
         match_params : bool
@@ -401,8 +405,8 @@ class DIYModel(nn.Module):
         n = n_channels
         if sky_readout not in SKY_READOUTS:
             raise ValueError(f"sky_readout must be one of {SKY_READOUTS}, got {sky_readout!r}")
-        if h1l1_merge not in ("concat", "symmetric"):
-            raise ValueError(f"h1l1_merge must be 'concat' or 'symmetric', got {h1l1_merge!r}")
+        if h1l1_merge not in ("concat", "symmetric", "project"):
+            raise ValueError(f"h1l1_merge must be 'concat', 'symmetric' or 'project', got {h1l1_merge!r}")
         if sky_readout in ("power", "bispectrum", "mlp121", "scramble") and n_sky_features != (l_max + 1) ** 2:
             raise ValueError(
                 f"n_sky_features ({n_sky_features}) must equal (l_max+1)^2 ({(l_max + 1) ** 2})"
@@ -469,8 +473,8 @@ class DIYModel(nn.Module):
 
         # ---- V2 two-stage fusion: joint branch ----
         # detector backbone outputs concatenated on channels -> project down -> 2 ResBlocks.
-        # concat feeds all 3 (12n); symmetric feeds the swap-pooled LIGO pair + Virgo (8n).
-        # fused-channel count: concat = 4 paths x 4n = 16n; symmetric = 3 paths x 4n = 12n.
+        # concat feeds all 3 (12n); symmetric/project feed the merged LIGO pair + Virgo (8n).
+        # fused-channel count: concat = 4 paths x 4n = 16n; symmetric/project = 3 paths x 4n = 12n.
         if h1l1_merge == "concat":
             joint_in_ch = 3 * 4 * n
             fused_ch = 16 * n
@@ -532,12 +536,38 @@ class DIYModel(nn.Module):
             nn.Linear(64, 1),
         )
 
+        # ---- ordered LIGO-pair merge (h1l1_merge='project' only) ----
+        # built without touching the global RNG and skipped by _init_weights, so
+        # every other weight, and every later dropout / drop-path mask, is drawn
+        # exactly as in the symmetric model at the same seed. The weights are set
+        # deterministically by reset_merge_to_symmetric below.
+        if h1l1_merge == "project":
+            with torch.random.fork_rng(devices=[]):
+                self.ligo_merge_feat = nn.Conv1d(8 * n, 4 * n, 1, bias=False)
+                self.ligo_merge_branch = nn.Conv1d(8 * n, 4 * n, 1, bias=False)
+
         self._init_weights()
         # restore identity init for the FiLM output projection so the sky path
         # starts as a no-op (gamma=0, beta=0); _init_weights has just
         # overwritten it with Kaiming above.
         if self.sky_readout is not None:
             self.sky_readout.reset_to_identity()
+        if h1l1_merge == "project":
+            self.reset_merge_to_symmetric()
+
+    def reset_merge_to_symmetric(self):
+        """
+        Set the ordered LIGO-pair projections to [I/2, I/2], the symmetric mean.
+
+        At this point the ``project`` model computes the same function as the
+        ``symmetric``/``mean`` model with the same other weights. Training can
+        then move the two halves apart; nothing else distinguishes the models.
+        """
+        for conv in (self.ligo_merge_feat, self.ligo_merge_branch):
+            c_out = conv.weight.shape[0]
+            eye = torch.eye(c_out, dtype=conv.weight.dtype)
+            with torch.no_grad():
+                conv.weight.copy_(0.5 * torch.cat([eye, eye], dim=1).unsqueeze(-1))
 
     def conditioning_param_count(self) -> int:
         """Learnable parameters in the sky conditioning path (0 if disabled)."""
@@ -549,9 +579,18 @@ class DIYModel(nn.Module):
             return 0.5 * (a + b)
         return torch.maximum(a, b)
 
+    def _merge_pair(self, a: torch.Tensor, b: torch.Tensor, proj: str) -> torch.Tensor:
+        """Merge the H1 (a) and L1 (b) tensors: symmetric pool, or ordered projection."""
+        if self.h1l1_merge == "symmetric":
+            return self._sym_pool(a, b)
+        return getattr(self, proj)(torch.cat([a, b], dim=1))
+
     def _init_weights(self):
         """Apply Kaiming normal initialization to conv and linear layers."""
+        merge = {getattr(self, k, None) for k in ("ligo_merge_feat", "ligo_merge_branch")}
         for m in self.modules():
+            if m in merge:
+                continue  # set by reset_merge_to_symmetric; must not consume RNG
             if isinstance(m, (nn.Conv1d, nn.Linear)):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
@@ -590,9 +629,11 @@ class DIYModel(nn.Module):
             # symmetric merge: swap-invariant pooling of the LIGO pair before fusion.
             # both the joint-branch input and the fused stack use the pooled pair, so
             # exchanging the H1/L1 input channels leaves the pooled features unchanged.
-            joint_in = torch.cat([self._sym_pool(h1_feat, l1_feat), v1_feat], dim=1)
+            # project merge: the same two merge points, through learned ordered maps.
+            joint_in = torch.cat([self._merge_pair(h1_feat, l1_feat, "ligo_merge_feat"), v1_feat], dim=1)
             joint_branch = self.joint_branch(self.joint_project(joint_in))
-            fused = torch.cat([self._sym_pool(h1_branch, l1_branch), v1_branch, joint_branch], dim=1)
+            fused = torch.cat([self._merge_pair(h1_branch, l1_branch, "ligo_merge_branch"),
+                               v1_branch, joint_branch], dim=1)
 
         fused = self.fusion(fused)
         pooled = self.global_pool(fused).squeeze(-1)

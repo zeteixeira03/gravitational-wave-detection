@@ -8,6 +8,9 @@ confidence scores as the author's estimate at the time of writing, not as measur
 quantities. A later session should attack the low-confidence items first, and should
 feel free to overturn the high-confidence ones given evidence.
 
+A second session (2026-10-18) added F10 and F11, corrected section 2, and wrote
+`FOLLOWUP_PLAN.md` for the open items. Its additions are marked *[2026-10-18]*.
+
 Raw data: `kaggle/sweep_log/v65-v69.jsonl`, 24 rows, one per (config, seed). Every
 number quoted here is recomputable from those files. Nothing was hand-transcribed and
 no row was excluded.
@@ -30,7 +33,8 @@ and is **excluded from all analysis**. It is not in `sweep_log/`. See finding F4
 ## 2. Result table
 
 Recipe shared by all 24 runs: 100k train samples, 150k val, 20 epochs max, warmup 3,
-early stopping patience 4, SWA from epoch 14, mixup off, n_channels 16, AMP on.
+early stopping patience 4, SWA from epoch 14 (never reached, see F10), mixup off,
+channel-shuffle augmentation on (see F11), n_channels 16, AMP on.
 
 | config | auc mean | sd | best_auc mean | sd | params | cond. params |
 |---|---|---|---|---|---|---|
@@ -43,8 +47,9 @@ early stopping patience 4, SWA from epoch 14, mixup off, n_channels 16, AMP on.
 | 6 scramble | 0.86065 | 0.00172 | 0.86272 | 0.00046 | 4,703,964 | 147,954 |
 | 5 sky-head-only | 0.60166 | 0.00161 | 0.60469 | 0.00050 | 24,563 | 24,563 |
 
-`auc` is the final SWA-averaged model, selected by val_loss. `best_auc` is the best
-epoch's val AUC. See F5 for why both are reported.
+`auc` is the best-val-loss checkpoint. *[2026-10-18] An earlier version of this line
+said "SWA-averaged". That was wrong: SWA never activated in any of the 24 runs (F10).*
+`best_auc` is the best epoch's val AUC. See F5 for why both are reported.
 
 ## 3. Findings
 
@@ -99,11 +104,20 @@ tested directly. Competing explanations that were not ruled out:
 3. 100k training samples may be too few for the network to exploit a weak second
    pathway, and the result may not transfer to the full 410k regime. See F6.
 4. l_max=10 may be the wrong resolution, in either direction.
+5. *[2026-10-18]* The channel-shuffle augmentation (F11) trains the CNN toward
+   H1<->L1 swap invariance, which stops it from representing the swap-odd part of
+   the sky geometry. This argues *against* redundancy: the CNN is structurally
+   denied part of what the SH vector encodes. If the sky features still add
+   nothing, either that part carries no label information or fusion failed.
 
 **How to challenge:** the direct test of redundancy is a probe. Train a linear readout
 on the CNN's pooled features to predict the SH coefficients. High R^2 supports
 redundancy; low R^2 kills the interpretation while leaving the empirical result intact.
 This should be done before the interpretation appears in a paper.
+
+*[2026-10-18] The probe is implemented (`src/probe.py`) and registered as P1 in
+`FOLLOWUP_PLAN.md`, with a pre-stated rule that separates redundancy from fusion
+failure (explanation 1) and predictions that test explanation 5.*
 
 **No sweep checkpoint survives to probe.** See section 4a. The probe needs a trained
 model per config, and the sweep kept none, so it now costs a fresh training run rather
@@ -134,6 +148,13 @@ discarding information (SO(3) via power spectrum). It is an appealing story and 
 **How to challenge:** run a capacity-matched symmetric variant, or a non-symmetric
 weight-shared variant. Either isolates the factor. Until then the narrative should be
 labelled speculative in any write-up.
+
+*[2026-10-18] Two additions. First, the comparison is not "symmetry versus none":
+the channel-shuffle augmentation (F11) already pushes config 3 toward swap
+invariance, so 3 versus 7 is soft symmetry versus hard symmetry. Second, the
+non-symmetric control is implemented as config 9 (`h1l1_merge='project'`): config
+7's topology and width, with the mean replaced by a learned ordered projection
+that starts at the mean. Registered as P2 in `FOLLOWUP_PLAN.md`.*
 
 ### F4. The first kernel's config-1 row is not comparable and was discarded.
 
@@ -224,6 +245,50 @@ that no other field is stored. It was never verified by loading a shard and prin
 
 **How to challenge:** one line in a scratch kernel. Worth doing before the paper.
 
+*[2026-10-18] Folded into the probe job as P3: it recomputes the coefficients for all
+150,000 validation samples and compares them to the stored ones.*
+
+### F10. SWA never activated. *[2026-10-18]*
+
+`fit` starts weight averaging when the 0-indexed epoch reaches `swa_start_epoch`
+(14), which is the 15th epoch. `epochs_run` across the 24 rows ranges from 5 to 13.
+No run reached the 15th epoch, so no run averaged weights, and every `auc` is the
+best-val-loss checkpoint restored at the end of `fit`.
+
+This does not change any number in the table. It changes the description of the
+recipe, and it removes SWA as an explanation for anything in F5.
+
+**Confidence: 0.95.** Derived from the code path and the logged `epochs_run`.
+
+**How to challenge:** read `fit` in `src/model_runs.py`, the SWA branch at the end.
+
+### F11. The channel-shuffle augmentation is on for every config, and it interacts with the sky features. *[2026-10-18]*
+
+`aug_channel_shuffle=True` swaps the H1 and L1 channels of a training sample with
+probability 0.5. The SH coefficients are computed from the unswapped signal and are
+not recomputed. Three consequences:
+
+1. **Every concat model is trained toward H1<->L1 swap invariance.** The Z2
+   symmetry that config 7 imposes exactly is already imposed softly, by data, on
+   every other config. This bears on F3.
+2. **A swap-invariant CNN cannot represent the swap-odd part of the geometry**: the
+   sign of the H1-L1 delay, and which LIGO detector pairs with which Virgo delay.
+   This bears on F2 (explanation 5).
+3. **Some swapped samples are not physical.** For an isotropic source population,
+   16.3% of swapped signal samples have a delay triplet that no sky direction can
+   produce, and 9.3% stay unphysical with a one-sample (0.49 ms) tolerance. Computed
+   from the detector positions in `sky_feasibility.py` over 200,000 random
+   directions. So about 8% of signal samples seen in training (half are swapped)
+   have geometrically impossible timing.
+
+**Confidence: 0.95** in the mechanism (read from the code). **Confidence: 0.4** that it
+matters for any result. It is constant across configs, so it cannot bias a contrast
+by itself. But it changes what the contrasts mean, in F2 and F3.
+
+**How to challenge:** P1 in `FOLLOWUP_PLAN.md` measures the swap-odd fraction of the
+CNN's feature variance and the label information in the swap-odd part of the SH
+vector (predictions Q1-Q3). Those decide whether a no-shuffle run is worth its cost.
+
 ## 4a. Data that was lost, and what it costs
 
 Two artifacts were written to a single path per kernel and overwritten by every
@@ -283,6 +348,10 @@ identical is not an argument for deleting one of them when a pre-registration na
 both.
 
 ## 6. What a later session should do first
+
+*[2026-10-18] Items 0-3 are now implemented and registered in `FOLLOWUP_PLAN.md`,
+which runs them in one kernel (`MODE = "followup"`). Item 0 was confirmed in the
+code. Items 4 and 5 remain open.*
 
 0. Confirm the logger fixes in section 4a are in place before launching anything. Any
    run started under the old logger loses its curves permanently.
