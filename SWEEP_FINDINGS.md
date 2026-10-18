@@ -311,6 +311,46 @@ BatchNorm statistics, its pooled features become extremely heavy-tailed, and the
 extrapolates. So the registered encoding rule can be applied only against the label
 baseline. `probe.calibrate_batchnorm` fixes this for future probes.
 
+### F3 update. Lifting the symmetry constraint at 4n width changes nothing measurable.
+
+T4 rows: config 10 x 3 seeds (`v70.jsonl`, rebuilt from the log at 4 decimals) and
+config 7 x 3 seeds (`v71.jsonl`, exact). Both 4n-wide, same starting function per seed.
+
+| | best_auc | auc |
+|---|---|---|
+| config 7 (symmetric) | 0.86429 +- 0.00044 | 0.86349 +- 0.00079 |
+| config 10 (proj, free to break symmetry) | 0.86410 +- 0.00017 | 0.86307 +- 0.00071 |
+| S_4n = 7 - 10, paired | +0.00019 (pooled sd 0.00033) | +0.00043 (pooled sd 0.00075) |
+| per seed | +0.00072, -0.00015, +0.00001 | -0.00045, +0.00112, +0.00061 |
+
+|S_4n| <= pooled sd on both metrics, with mixed signs across seeds. The 4-decimal
+rounding of the config 10 values moves each contrast by at most 0.00005.
+
+What this decides under the section 8.3 rules:
+
+- **"Symmetry helps" cannot fire.** It needs S_4n > pooled sd, and S_4n is not. Config 9
+  cannot change this.
+- **"Capacity, not symmetry"** has its first condition met. Its second, W_ord = 3 - 10
+  < -pooled sd, needs config 3 at two more T4 seeds. Config 3 seed 0 on T4 has
+  `best_auc` 0.86282 against config 10 seed 0's 0.8640, a single-seed difference of
+  -0.0012. That points the way the rule needs, and is not a rule evaluation.
+
+**What is not known:** whether config 10's merge weights left the symmetric
+initialization at all. If they stayed near the mean, the constraint was simply never
+binding. The checkpoints that would say so are unreachable (output host blocked, and v71
+replaced v70's output). Rows now log `h1l1_proj_asymmetry` = ||A - B|| / ||A + B||, where
+A and B are the merge weights applied to H1 and L1 (0 = symmetric).
+
+**Confidence: 0.75** that the symmetry constraint itself is not what separates config 7
+from config 3. **Confidence: 0.5** that width is, pending W_ord.
+
+### Process: the two-GPU runner works
+
+v71 ran 4 runs as two parallel rounds in 1 h 41 min of session time, against about
+3.2 h one at a time. Both children exited 0, every row arrived at full precision through
+`ROW_JSON` lines in the kernel log, and no memory failure occurred with the mmap
+validation load.
+
 ### F11 (exploratory, not pre-registered). The CNN encodes coherence, not arrival order.
 
 In the R^2 table, every even degree exceeds its odd neighbours. A parity argument gives
@@ -407,9 +447,18 @@ both.
 
 ## 6. What a later session should do first
 
-**Status 2026-10-17:** items 0, 1 (F2 update) and 3 (F9 update) are done; see section 3a.
-Item 2 is half-run: config 10 is on T4, and F10 adds the re-runs of configs 3 and 7 on T4
-that its contrasts need. Config 9 follows in the next quota week.
+**Status 2026-10-18:** items 0, 1 (F2 update) and 3 (F9 update) are done; see section 3a.
+Item 2: on T4, configs 7 and 10 are complete (S_4n evaluated) and config 3 has seed 0.
+
+**Next quota week (from 2026-10-24, 6 h), in order:**
+
+1. `gw-training`, parallel: (3,1), (3,2), (9,0), (9,1), (9,2), (10,0). Three rounds,
+   about 3 h. Completes W_ord, S_8n and W_inv. The (10,0) re-run logs the merge
+   asymmetry and, against the v70 row, checks determinism on T4 (to 4 decimals).
+2. `gw-probe`: test F11 by probing a config 1 model trained with `aug_channel_shuffle`
+   off (about 0.8 h). Exploratory.
+3. Archive each kernel's log (`sweep_analysis.py --from-log`) before pushing the next
+   version of the same slug.
 
 0. Confirm the logger fixes in section 4a are in place before launching anything. Any
    run started under the old logger loses its curves permanently.

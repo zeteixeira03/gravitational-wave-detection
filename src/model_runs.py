@@ -1536,6 +1536,25 @@ def append_run_log(log_path, row: dict):
         f.write(json.dumps(row) + "\n")
 
 
+def h1l1_proj_asymmetry(model) -> dict | None:
+    """
+    How far each learned proj merge moved from swap symmetry.
+
+    The merge weight W (c x 2c) splits into A (applied to H1) and B (applied to
+    L1). The merge is swap-invariant exactly when A == B, which is where it is
+    initialized. Returns ||A - B|| / ||A + B|| (Frobenius) per merge: 0 means
+    still symmetric. None for models without a proj merge.
+    """
+    if not hasattr(model, 'h1l1_proj_feat'):
+        return None
+    out = {}
+    for name in ('h1l1_proj_feat', 'h1l1_proj_branch'):
+        w = getattr(model, name).weight.detach().float().squeeze(-1)
+        a, b = w.chunk(2, dim=1)
+        out[name] = float((a - b).norm() / (a + b).norm())
+    return out
+
+
 def build_run_log_row(config_id, seed, hyperparameters, results, wall_clock_s, git_hash):
     """Assemble one sweep-log row from a finished run's results."""
     model = results['model']
@@ -1586,6 +1605,8 @@ def build_run_log_row(config_id, seed, hyperparameters, results, wall_clock_s, g
         # the stack is a variable: config 1 seed 0 moved by -0.002 best_auc from
         # P100 to T4 (SWEEP_FINDINGS F10), so rows from different stacks are
         # never pooled. sweep_analysis groups by these two fields.
+        # whether config 10's merge actually left the symmetric init (F3)
+        'h1l1_proj_asymmetry': h1l1_proj_asymmetry(model),
         'device': torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu',
         'torch': torch.__version__,
         'wall_clock_s': round(wall_clock_s, 1),

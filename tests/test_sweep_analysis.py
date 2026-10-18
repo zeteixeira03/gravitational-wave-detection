@@ -95,7 +95,7 @@ def test_rows_from_log_fallback_and_exact():
     assert (row['config_id'], row['seed'], row['auc'], row['best_auc']) == ('1_none_concat', 0, 0.8617, 0.8626)
     assert row['device'] == 'Tesla T4' and row['git_hash'].startswith('b88df30')
     assert row['history']['val_auc'] == [0.8409, 0.8563]
-    assert row['precision'] == 'log, 4 decimals' and row['total_params'] == 4556010
+    assert row['value_precision'] == 'log, 4 decimals' and row['total_params'] == 4556010
     # a ROW_JSON line wins and is taken verbatim
     exact = {'config_id': '10_x', 'seed': 2, 'auc': 0.86123456789, 'best_auc': 0.8621}
     assert rows_from_log(text + "\nROW_JSON " + json.dumps(exact)) == [exact]

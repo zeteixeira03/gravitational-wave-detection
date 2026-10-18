@@ -263,3 +263,14 @@ def test_match_params_changes_hidden_for_power():
     unmatched = DIYModel(n_channels=16, n_sky_features=N_SKY, sky_readout="power").conditioning_param_count()
     matched = DIYModel(n_channels=16, n_sky_features=N_SKY, sky_readout="power", match_params=True).conditioning_param_count()
     assert matched > unmatched, "match_params should widen the power readout's hidden layer"
+
+
+def test_proj_asymmetry_metric():
+    from model_runs import h1l1_proj_asymmetry
+    model = DIYModel(n_channels=4, n_sky_features=N_SKY, sky_readout="none", h1l1_merge="proj")
+    asym = h1l1_proj_asymmetry(model)
+    assert asym == {"h1l1_proj_feat": 0.0, "h1l1_proj_branch": 0.0}
+    with torch.no_grad():
+        model.h1l1_proj_feat.weight.add_(0.1 * torch.randn_like(model.h1l1_proj_feat.weight))
+    assert h1l1_proj_asymmetry(model)["h1l1_proj_feat"] > 0
+    assert h1l1_proj_asymmetry(DIYModel(n_channels=4, n_sky_features=N_SKY, sky_readout="none")) is None

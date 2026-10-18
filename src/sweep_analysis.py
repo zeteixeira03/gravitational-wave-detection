@@ -80,7 +80,7 @@ def rows_from_log(text: str, device: str | None = None) -> list[dict]:
     Rows from a kernel log. ROW_JSON lines are the logged rows verbatim. For
     logs without them, each run is rebuilt from its epoch lines and its
     'Logged' summary line; every value is then rounded to 4 decimals, which
-    the row records in 'precision'.
+    the row records in 'value_precision' ('precision' is the metric).
     """
     # parallel kernels prefix each child's lines with "[gpuK] "
     exact = [json.loads(line.split("ROW_JSON ", 1)[1]) for line in text.splitlines() if "ROW_JSON " in line]
@@ -108,7 +108,7 @@ def rows_from_log(text: str, device: str | None = None) -> list[dict]:
                     'train_loss': [c[0] for c in curve], 'val_loss': [c[1] for c in curve],
                     'val_acc': [c[2] for c in curve], 'val_auc': [c[3] for c in curve],
                 },
-                'device': dev, 'precision': 'log, 4 decimals',
+                'device': dev, 'value_precision': 'log, 4 decimals',
             })
             curve = []
     return rows
