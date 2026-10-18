@@ -436,13 +436,14 @@ epoch 5" cannot be answered from the archive.
   `c703ac6`.
 - **`max_train_hours` 8.0 inside an 8.5h kernel budget** meant one run per kernel and
   four silent skips. The guard behaved correctly; the two constants were incompatible.
-- **(2026-10-17) The GPU quota is 6 hours per week**, read from the Kaggle quota API,
-  not 30. Each running session also *reserves* time against it. Plan each week's runs
-  against 6 hours, with margin.
-- **(2026-10-17) Pin the docker image.** Kaggle's current default image reportedly has
-  no P100 (sm_60) support. Both kernels now pin `gw-training` v69's image digest and
-  the P100 shape, so new rows share the sweep's stack. The config 1 seed 0 re-run in
-  the probe kernel tests that (ANALYSIS_PLAN 8.1).
+- **GPU quota: 30 hours per week** (stated by the account owner, 2026-10-18). The quota
+  API (`KaggleApi().quota_view()`) returned `totalTimeAllowed: 21600s` (6 h) on
+  2026-10-17/18, and the 2026-10-17 session planned against that figure, wrongly. Read
+  `timeUsed` from the API to track consumption, but do not take its `totalTimeAllowed`
+  as the allowance. Each running session also reserves time.
+- **(2026-10-17) Pin the docker image.** Both kernels pin `gw-training` v69's image
+  digest. The P100 machine-shape request was not honoured: Kaggle assigned 2x T4 (F10),
+  and both kernels now request T4.
 - **(2026-10-17) New kernels mount inputs deeper than `/kaggle/input/<slug>`.** The
   first `gw-probe` run failed at import because of this. Source and shard discovery now
   search `/kaggle/input` for `model_runs.py` and `shard_00.pt`.
@@ -470,8 +471,9 @@ Item 2: on T4, configs 7 and 10 are complete (S_4n evaluated) and config 3 has s
 
 **Status 2026-10-18, 02:30:** W_ord done (v72); the F3 capacity rule fires.
 
-**Next quota week (from 2026-10-24, 6 h; a parallel round of two runs costs about
-0.9 h), in priority order:**
+**Next batches** (a parallel round of two runs costs about 0.9 h of session time; with a
+30 h weekly quota all of this fits now, without waiting for the 2026-10-24 refresh), in
+priority order:
 
 1. `gw-training`, parallel: (11,0), (11,1), (11,2), (1,1), (1,2), (9,0). Section 9 in
    full plus the first config 9 seed. Three rounds, about 2.7 h.

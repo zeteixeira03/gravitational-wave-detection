@@ -260,6 +260,10 @@ all three seeds. These give S_4n and W_ord, which are all the "capacity, not sym
 rule needs. Week 2: config 9 at all three seeds, which adds S_8n and W_inv. The
 "symmetry helps" rule is not evaluated until week 2.
 
+*Correction (2026-10-18):* the account's quota is 30 hours per week; the 6 h figure was
+the quota API's `totalTimeAllowed`. The run order above changed only scheduling. No rule,
+metric or contrast in this section depends on it.
+
 **Metric.** `best_auc` is primary for this section, because F5 showed that the
 val-loss-selected `auc` carries 3x to 20x more seed variance from checkpoint selection.
 `auc` is reported beside it. A claim needs the same sign on both.
